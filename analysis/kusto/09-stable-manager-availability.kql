@@ -1,0 +1,71 @@
+// =============================================================================
+// MANAGER_REGISTRATION.FAILED — Total Failures by Manager × Extension Version (stable >= 1.24.0)
+// Total failure count per manager per version, regardless of error type.
+// MachinePct = % of machines on that version that had any registration failure for this manager.
+// Same manager name appears in consecutive rows, sorted by version ascending.
+// materialize() is used only for the lean denominator (VSCodeMachineId + ExtVersion, no Properties)
+// to stay within the cluster's materialize cache limit. Failures are scanned separately since
+// manager_registration.failed events are a tiny fraction of total events.
+// =============================================================================
+let stableVersions = materialize(
+    RawEventsVSCodeExt
+    | where ServerTimestamp > ago(28d)
+    | where ExtensionName == "ms-python.vscode-python-envs"
+    | extend ExtVersion = tostring(Properties["common.extversion"])
+    | where isnotempty(ExtVersion)
+    | extend _minor = toint(extract("^1\\.(\\d+)", 1, ExtVersion))
+    | where _minor >= 24 and (_minor % 2) == 0
+    | project VSCodeMachineId, ExtVersion
+);
+let totalByVersion = stableVersions
+    | summarize TotalMachines = dcount(VSCodeMachineId) by ExtVersion;
+RawEventsVSCodeExt
+| where ServerTimestamp > ago(28d)
+| where EventName == "ms-python.vscode-python-envs/manager_registration.failed"
+| extend ExtVersion = tostring(Properties["common.extversion"])
+| extend _minor = toint(extract("^1\\.(\\d+)", 1, ExtVersion))
+| where _minor >= 24 and (_minor % 2) == 0
+| summarize
+    EventCount = count(),
+    UniqueMachines = dcount(VSCodeMachineId)
+    by ManagerName = tostring(Properties.managername), ExtVersion
+| join kind=inner totalByVersion on ExtVersion
+| extend MachinePct = round(todouble(UniqueMachines) / todouble(TotalMachines) * 100, 2)
+| project ManagerName, ExtVersion, EventCount, UniqueMachines, TotalMachines, MachinePct
+| order by ManagerName asc, ExtVersion asc
+
+
+// =============================================================================
+// SPAWN_TIMEOUT / PROCESS_CRASH / UNKNOWN Failures by Manager × Version (stable >= 1.24.0)
+// Merged from three separate queries into one to reduce table scans.
+// ErrorType column distinguishes the three categories — filter on it to reproduce the old views.
+// Note: versions with zero failures for a given error type are omitted (no row = no failures).
+// materialize() used only for the lean denominator; failures scanned separately.
+// =============================================================================
+let stableVersions = materialize(
+    RawEventsVSCodeExt
+    | where ServerTimestamp > ago(28d)
+    | where ExtensionName == "ms-python.vscode-python-envs"
+    | extend ExtVersion = tostring(Properties["common.extversion"])
+    | where isnotempty(ExtVersion)
+    | extend _minor = toint(extract("^1\\.(\\d+)", 1, ExtVersion))
+    | where _minor >= 24 and (_minor % 2) == 0
+    | project VSCodeMachineId, ExtVersion
+);
+let totalByVersion = stableVersions
+    | summarize TotalMachines = dcount(VSCodeMachineId) by ExtVersion;
+RawEventsVSCodeExt
+| where ServerTimestamp > ago(28d)
+| where EventName == "ms-python.vscode-python-envs/manager_registration.failed"
+| where tostring(Properties.errortype) in ("spawn_timeout", "process_crash", "unknown")
+| extend ExtVersion = tostring(Properties["common.extversion"])
+| extend _minor = toint(extract("^1\\.(\\d+)", 1, ExtVersion))
+| where _minor >= 24 and (_minor % 2) == 0
+| summarize EventCount = count(), UniqueMachines = dcount(VSCodeMachineId)
+    by ManagerName = tostring(Properties.managername),
+       ErrorType = tostring(Properties.errortype),
+       ExtVersion
+| join kind=inner totalByVersion on ExtVersion
+| extend MachinePct = round(todouble(UniqueMachines) / todouble(TotalMachines) * 100, 2)
+| project ManagerName, ErrorType, ExtVersion, EventCount, UniqueMachines, TotalMachines, MachinePct
+| order by ManagerName asc, ErrorType asc, ExtVersion asc

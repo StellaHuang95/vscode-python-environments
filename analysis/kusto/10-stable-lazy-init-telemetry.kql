@@ -1,0 +1,51 @@
+// =============================================================================
+// MANAGER.LAZY_INIT — Error Type Breakdown by Manager × Version (stable >= 1.28.0)
+// Replaces MANAGER_REGISTRATION.FAILED for pipenv, poetry, and pyenv after PR #1423.
+// From 1.28.0 onward these managers register unconditionally at startup and defer all tool
+// detection to first use, so spawn_timeout / process_crash / unknown etc. are no longer
+// reported in MANAGER_REGISTRATION.FAILED — they appear here instead.
+//
+// Denominator: machines that sent ANY MANAGER.LAZY_INIT event for that manager+version
+// (success + tool_not_found + error combined). This gives:
+//   MachinePct = errors / machines_that_engaged_with_manager * 100
+// which is much closer to the pre-1.28.0 MANAGER_REGISTRATION.FAILED rate than using
+// all active machines as the denominator. Remaining caveat: pre-1.28.0 registration ran
+// on every VS Code launch for all machines; post-1.28.0 only machines where the user
+// actually opened the environment picker contribute, so rates are still not identical.
+//
+// Columns:
+//   ManagerName    — pipenv | poetry | pyenv
+//   ErrorType      — spawn_timeout | process_crash | unknown | spawn_enoent | ...
+//   ExtVersion     — stable extension version (even minor >= 28)
+//   EventCount     — total error events (one machine can contribute multiple across sessions)
+//   Machines       — distinct machines that hit this manager+errorType on this version
+//   TotalByManager — distinct machines that sent any MANAGER.LAZY_INIT for this manager+version
+//   TotalMachines  — distinct machines that sent any MANAGER.LAZY_INIT (any manager) on this version
+//   MachinePct     — Machines / TotalByManager * 100
+// =============================================================================
+let lazyInitBase = materialize(
+    RawEventsVSCodeExt
+    | where ServerTimestamp > ago(28d)
+    | where EventName == "ms-python.vscode-python-envs/manager.lazy_init"
+    | extend ExtVersion = tostring(Properties["common.extversion"])
+    | where isnotempty(ExtVersion)
+    | extend _minor = toint(extract("^1\\.(\\d+)", 1, ExtVersion))
+    | where _minor >= 28 and (_minor % 2) == 0
+    | project VSCodeMachineId, ExtVersion,
+              ManagerName = tostring(Properties.managername),
+              Result = tostring(Properties.result),
+              ErrorType = tostring(Properties.errortype)
+);
+let totalMachines = lazyInitBase
+    | summarize TotalMachines = dcount(VSCodeMachineId) by ExtVersion;
+let totalByManager = lazyInitBase
+    | summarize TotalByManager = dcount(VSCodeMachineId) by ManagerName, ExtVersion;
+lazyInitBase
+| where Result == "error"
+| summarize EventCount = count(), Machines = dcount(VSCodeMachineId)
+    by ManagerName, ErrorType, ExtVersion
+| join kind=inner totalByManager on ManagerName, ExtVersion
+| join kind=inner totalMachines on ExtVersion
+| extend MachinePct = round(todouble(Machines) / todouble(TotalByManager) * 100, 2)
+| project ManagerName, ErrorType, ExtVersion, EventCount, Machines, TotalByManager, TotalMachines, MachinePct
+| order by ManagerName asc, ErrorType asc, ExtVersion asc
