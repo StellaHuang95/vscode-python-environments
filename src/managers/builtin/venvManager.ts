@@ -613,8 +613,11 @@ export class VenvManager implements EnvironmentManager {
                         this.addEnvironment(resolved, false);
                         foundEnv = resolved;
                     } else {
+                        // Skip this project; do not abort the loop or remaining projects in a
+                        // multi-root workspace would silently lose their mappings and queued
+                        // change events would never fire.
                         this.log.error(`Failed to resolve python environment: ${env}`);
-                        return;
+                        continue;
                     }
                 }
                 // Given found env, add it to the map and fire the event if needed.
