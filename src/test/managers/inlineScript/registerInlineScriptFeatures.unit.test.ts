@@ -7,7 +7,7 @@ import { Disposable, LogOutputChannel } from 'vscode';
 import { PythonEnvironmentApi } from '../../../api';
 import * as pythonApi from '../../../features/pythonApi';
 import * as helpers from '../../../helpers';
-import { registerInlineScriptFeatures } from '../../../managers/builtin/inlineScriptMain';
+import { registerInlineScriptFeatures } from '../../../managers/inlineScript/main';
 
 function makeFakeLog(): LogOutputChannel {
     return {

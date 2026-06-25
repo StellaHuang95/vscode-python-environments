@@ -98,7 +98,7 @@ import { ProjectItem, PythonEnvTreeItem } from './features/views/treeViewItems';
 import { collectEnvironmentInfo, getEnvManagerAndPackageManagerConfigLevels, runPetInTerminalImpl } from './helpers';
 import { EnvironmentManagers, ProjectCreators, PythonProjectManager } from './internal.api';
 import { registerSystemPythonFeatures } from './managers/builtin/main';
-import { registerInlineScriptFeatures } from './managers/builtin/inlineScriptMain';
+import { registerInlineScriptFeatures } from './managers/inlineScript/main';
 import { SysPythonManager } from './managers/builtin/sysPythonManager';
 import {
     createNativePythonFinder,

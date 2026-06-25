@@ -6,7 +6,7 @@ import { PythonEnvironmentApi } from '../../api';
 import { traceInfo, traceVerbose } from '../../common/logging';
 import { getPythonApi } from '../../features/pythonApi';
 import { isInlineScriptsFeatureEnabled } from '../../helpers';
-import { InlineScriptEnvManager } from './inlineScriptEnvManager';
+import { InlineScriptManager } from './inlineScriptManager';
 
 /**
  * Register the inline-script env manager when the internal
@@ -20,7 +20,7 @@ export async function registerInlineScriptFeatures(disposables: Disposable[], lo
     }
 
     const api: PythonEnvironmentApi = await getPythonApi();
-    const mgr = new InlineScriptEnvManager(log);
+    const mgr = new InlineScriptManager(log);
     disposables.push(mgr, api.registerEnvironmentManager(mgr));
     traceInfo('Inline-script env manager: registered (internal flag is on)');
 }
