@@ -63,6 +63,7 @@ import {
     setEnvironmentCommand,
     setEnvManagerCommand,
     setPackageManagerCommand,
+    setupInlineScriptEnvironmentCommand,
 } from './features/envCommands';
 import { PythonEnvironmentManagers } from './features/envManagers';
 import { EnvVarManager, PythonEnvVariableManager } from './features/execution/envVariableManager';
@@ -324,6 +325,9 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
                     );
                 },
             );
+        }),
+        commands.registerCommand('python-envs.setupInlineScriptEnvironment', async (item) => {
+            return setupInlineScriptEnvironmentCommand(item, envManagers);
         }),
         commands.registerCommand('python-envs.remove', async (item) => {
             await removeEnvironmentCommand(item, envManagers);
