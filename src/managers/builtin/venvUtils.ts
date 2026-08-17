@@ -507,7 +507,7 @@ export async function createPythonVenv(
     return createStepBasedVenvFlow(nativeFinder, api, log, manager, basePythons, venvRoot, options);
 }
 
-export function isDriveRoot(fsPath: string): boolean {
+function isDriveRoot(fsPath: string): boolean {
     const normalized = path.normalize(fsPath);
     if (os.platform() === 'win32') {
         return /^[a-zA-Z]:[\\/]?$/.test(normalized);
@@ -515,7 +515,7 @@ export function isDriveRoot(fsPath: string): boolean {
     return normalized === '/';
 }
 
-export function hasMinimumPathDepth(fsPath: string, minDepth: number = 2): boolean {
+function hasMinimumPathDepth(fsPath: string, minDepth: number = 2): boolean {
     const normalized = path.normalize(fsPath);
     const parts = normalized.split(path.sep).filter((p) => p.length > 0 && p !== '.');
 

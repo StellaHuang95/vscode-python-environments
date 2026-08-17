@@ -246,10 +246,11 @@
                 "icon": "$(trash)"
             },
             {
-                "command": "python-envs.clearScriptEnvCache",
-                "title": "%python-envs.clearScriptEnvCache.title%",
+                "command": "python-envs.clearInlineScriptCache",
+                "title": "%python-envs.clearInlineScriptCache.title%",
                 "category": "Python",
-                "icon": "$(trash)"
+                "icon": "$(trash)",
+                "enablement": "config.python.useEnvironmentsExtension != false && config.python-envs.inlineScripts.enabled == true"
             },
             {
                 "command": "python-envs.runInTerminal",
@@ -421,6 +422,10 @@
                     "when": "config.python.useEnvironmentsExtension != false"
                 },
                 {
+                    "command": "python-envs.clearInlineScriptCache",
+                    "when": "config.python.useEnvironmentsExtension != false && config.python-envs.inlineScripts.enabled == true"
+                },
+                {
                     "command": "python-envs.terminal.activate",
                     "when": "pythonTerminalActivation"
                 },
@@ -471,10 +476,6 @@
                 {
                     "command": "python-envs.reportIssue",
                     "when": "config.python.useEnvironmentsExtension != false"
-                },
-                {
-                    "command": "python-envs.clearScriptEnvCache",
-                    "when": "config.python.useEnvironmentsExtension != false && config.python-envs.inlineScripts.enabled == true"
                 }
             ],
             "view/item/context": [
