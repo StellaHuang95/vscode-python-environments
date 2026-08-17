@@ -22,6 +22,8 @@ export const META_JSON_FILENAME = '.meta.json';
  * Schema version embedded in every {@link InlineScriptEnvMeta}.
  */
 export const META_SCHEMA_VERSION = 1 as const;
+export const SOURCE_METADATA_IDENTITY_HASH_HEX_LENGTH = 64;
+export const MAX_SOURCE_METADATA_IDENTITY_HASHES = 8;
 
 const MAX_META_JSON_BYTES = 1024 * 1024;
 
@@ -38,11 +40,13 @@ export interface InlineScriptEnvMeta {
     readonly baseInterpreterVersion: string;
     /** Last successful use as a canonical UTC string produced by `Date.toISOString()`. */
     readonly lastUsedAt: string;
+    /** Bounded SHA-256 hashes of metadata identities proven for this cache entry. */
+    readonly sourceMetadataIdentityHashes?: readonly string[];
 }
 
 export type InlineScriptMetaReadResult =
     | { readonly kind: 'valid'; readonly metadata: InlineScriptEnvMeta }
-    | { readonly kind: 'missing' | 'invalid' | 'unavailable' };
+    | { readonly kind: 'missing' | 'invalid' | 'unsupported' | 'unavailable' };
 
 export type BaseInterpreterStatus = 'available' | 'missing' | 'unavailable';
 export type CacheEnvironmentInspection = 'expected' | 'stale' | 'uncertain';
@@ -160,6 +164,10 @@ export async function inspectMetaJson(envDir: Uri): Promise<InlineScriptMetaRead
     }
 
     const validated = validateMeta(parsed);
+    if (validated === 'unsupported') {
+        traceWarn(`inline-script meta: unsupported schema in ${metaPath}`);
+        return { kind: 'unsupported' };
+    }
     if (!validated) {
         traceWarn(`inline-script meta: invalid shape in ${metaPath}`);
         return { kind: 'invalid' };
@@ -178,11 +186,38 @@ export async function writeMetaJson(envDir: Uri, meta: InlineScriptEnvMeta): Pro
     const payload = JSON.stringify(meta, undefined, 2);
     try {
         await fsapi.writeFile(tmpPath, payload, 'utf8');
-        await fsapi.rename(tmpPath, finalPath);
+        try {
+            await fsapi.move(tmpPath, finalPath, { overwrite: true });
+        } catch (err) {
+            const code = (err as NodeJS.ErrnoException | undefined)?.code;
+            if (!['EPERM', 'EEXIST', 'EBUSY'].includes(code ?? '')) {
+                throw err;
+            }
+            await fsapi.remove(finalPath).catch(() => undefined);
+            await fsapi.move(tmpPath, finalPath, { overwrite: true });
+        }
     } catch (err) {
         await fsapi.remove(tmpPath).catch(() => undefined);
         throw err;
     }
+}
+
+export function hashSourceMetadataIdentity(identity: string): string {
+    return crypto.createHash('sha256').update(identity, 'utf8').digest('hex');
+}
+
+export function mergeSourceMetadataIdentityHashes(
+    existing: readonly string[] | undefined,
+    current: string | undefined,
+): readonly string[] | undefined {
+    const ordered = [...(existing ?? [])];
+    if (current && !ordered.includes(current)) {
+        ordered.push(current);
+    }
+    if (ordered.length === 0) {
+        return undefined;
+    }
+    return Object.freeze(ordered.slice(-MAX_SOURCE_METADATA_IDENTITY_HASHES));
 }
 
 /**
@@ -290,11 +325,17 @@ function isNonEmptyTrimmedString(value: unknown): value is string {
     return typeof value === 'string' && value.length > 0 && value.trim() === value;
 }
 
-function validateMeta(value: unknown): InlineScriptEnvMeta | undefined {
+function validateMeta(value: unknown): InlineScriptEnvMeta | 'unsupported' | undefined {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
         return undefined;
     }
     const obj = value as Record<string, unknown>;
+    if (typeof obj.schemaVersion !== 'number') {
+        return undefined;
+    }
+    if (obj.schemaVersion > META_SCHEMA_VERSION) {
+        return 'unsupported';
+    }
     if (obj.schemaVersion !== META_SCHEMA_VERSION) {
         return undefined;
     }
@@ -307,13 +348,42 @@ function validateMeta(value: unknown): InlineScriptEnvMeta | undefined {
     if (!isCanonicalIsoTimestamp(obj.lastUsedAt)) {
         return undefined;
     }
+    const sourceMetadataIdentityHashes = validateSourceMetadataIdentityHashes(obj.sourceMetadataIdentityHashes);
+    if (obj.sourceMetadataIdentityHashes !== undefined && sourceMetadataIdentityHashes === undefined) {
+        return undefined;
+    }
 
     return {
         schemaVersion: META_SCHEMA_VERSION,
         baseInterpreterPath: obj.baseInterpreterPath,
         baseInterpreterVersion: obj.baseInterpreterVersion,
         lastUsedAt: obj.lastUsedAt,
+        ...(sourceMetadataIdentityHashes ? { sourceMetadataIdentityHashes } : {}),
     };
+}
+
+function validateSourceMetadataIdentityHashes(value: unknown): readonly string[] | undefined {
+    if (value === undefined) {
+        return undefined;
+    }
+    if (!Array.isArray(value) || value.length === 0 || value.length > MAX_SOURCE_METADATA_IDENTITY_HASHES) {
+        return undefined;
+    }
+    const hashes: string[] = [];
+    const seen = new Set<string>();
+    for (const item of value) {
+        if (
+            typeof item !== 'string' ||
+            item.length !== SOURCE_METADATA_IDENTITY_HASH_HEX_LENGTH ||
+            !/^[0-9a-f]+$/.test(item) ||
+            seen.has(item)
+        ) {
+            return undefined;
+        }
+        seen.add(item);
+        hashes.push(item);
+    }
+    return Object.freeze(hashes);
 }
 
 function isCanonicalIsoTimestamp(value: unknown): value is string {

@@ -19,7 +19,6 @@ import {
     PythonProjectCreatorOptions,
 } from '../api';
 import { traceError, traceInfo, traceVerbose } from '../common/logging';
-import { INLINE_SCRIPT_MANAGER_ID } from '../common/constants';
 import {
     EnvironmentManagers,
     InternalEnvironmentManager,
@@ -37,7 +36,6 @@ import {
 import { valid as pep440Valid } from '@renovatebot/pep440';
 import { executeCommand } from '../common/command.api';
 import { clipboardWriteText } from '../common/env.apis';
-import { readInlineScriptMetadataFromFile } from '../common/inlineScript/metadata';
 import { Pickers } from '../common/localize';
 import { pickEnvironment } from '../common/pickers/environments';
 import {
@@ -49,7 +47,6 @@ import {
 } from '../common/pickers/managers';
 import { pickProject, pickProjectMany } from '../common/pickers/projects';
 import { isWindows } from '../common/utils/platformUtils';
-import { normalizePath } from '../common/utils/pathUtils';
 import { handlePythonPath } from '../common/utils/pythonPath';
 import {
     activeTextEditor,
@@ -62,9 +59,7 @@ import {
     withProgress,
 } from '../common/window.apis';
 import { INLINE_SCRIPT_MANAGER_ID } from '../common/constants';
-import { getOpenTextDocuments } from '../common/workspace.apis';
 import { runAsTask } from './execution/runAsTask';
-import { waitForEnvManagerId } from './common/managerReady';
 import { runInTerminal } from './terminal/runInTerminal';
 import { TerminalManager } from './terminal/terminalManager';
 import { EnvManagerView } from './views/envManagersView';
@@ -78,7 +73,6 @@ import {
     ProjectPackage,
     PythonEnvTreeItem,
 } from './views/treeViewItems';
-import { isInlineScriptsFeatureEnabled } from '../helpers';
 
 /**
  * Opens a file dialog to browse for a Python interpreter and resolves it using available managers.
@@ -296,92 +290,6 @@ export async function createAnyEnvironmentCommand(
             }
         }
     }
-}
-
-function isLocalPythonFile(uri: Uri): boolean {
-    return uri.scheme === 'file' && path.extname(uri.fsPath).toLowerCase() === '.py';
-}
-
-function hasSameIdentity(left: Uri, right: Uri): boolean {
-    if (left.scheme !== right.scheme) {
-        return false;
-    }
-
-    if (left.scheme === 'file') {
-        return normalizePath(left.fsPath) === normalizePath(right.fsPath);
-    }
-
-    return left.toString() === right.toString();
-}
-
-export async function setupInlineScriptEnvironmentCommand(
-    context: unknown,
-    em: EnvironmentManagers,
-): Promise<PythonEnvironment | undefined> {
-    if (context !== undefined && !(context instanceof Uri)) {
-        showErrorMessage(l10n.t('Inline script environment setup requires a local .py file.'));
-        return undefined;
-    }
-
-    const document =
-        context instanceof Uri
-            ? getOpenTextDocuments().find((openDocument) => hasSameIdentity(openDocument.uri, context))
-            : activeTextEditor()?.document;
-    const uri = context instanceof Uri ? context : document?.uri;
-    if (!uri) {
-        showErrorMessage(
-            l10n.t('Open or select a saved local .py file with valid PEP 723 inline script metadata to continue.'),
-        );
-        return undefined;
-    }
-
-    if (!isLocalPythonFile(uri)) {
-        showErrorMessage(l10n.t('Inline script environment setup requires a local .py file.'));
-        return undefined;
-    }
-
-    const inlineScriptsFeatureEnabled = isInlineScriptsFeatureEnabled();
-    if (!inlineScriptsFeatureEnabled) {
-        showErrorMessage(
-            l10n.t(
-                'Inline script environment setup is disabled. Add "python-envs.inlineScripts.enabled": true to your settings and reload the window to use this command.',
-            ),
-        );
-        return undefined;
-    }
-
-    if (document?.isDirty) {
-        showErrorMessage(l10n.t('Save the file before setting up an inline script environment.'));
-        return undefined;
-    }
-
-    if ((await readInlineScriptMetadataFromFile(uri)) === undefined) {
-        showErrorMessage(
-            l10n.t(
-                'Save a local .py file with valid PEP 723 inline script metadata before setting up an environment.',
-            ),
-        );
-        return undefined;
-    }
-
-    await waitForEnvManagerId([INLINE_SCRIPT_MANAGER_ID]);
-    const inlineManager = em.getEnvironmentManager(INLINE_SCRIPT_MANAGER_ID);
-    if (!inlineManager) {
-        showErrorMessage(
-            l10n.t(
-                'Inline script environment setup is unavailable because the preview manager is not registered. Reload the window and try again.',
-            ),
-        );
-        return undefined;
-    }
-
-    const environment = await inlineManager.create(uri, undefined);
-    if (!environment) {
-        return undefined;
-    }
-
-    await em.setEnvironment(uri, environment, false);
-    return environment;
 }
 
 export async function removeEnvironmentCommand(context: unknown, managers: EnvironmentManagers): Promise<void> {

@@ -63,11 +63,11 @@ import {
     setEnvironmentCommand,
     setEnvManagerCommand,
     setPackageManagerCommand,
-    setupInlineScriptEnvironmentCommand,
 } from './features/envCommands';
 import { PythonEnvironmentManagers } from './features/envManagers';
 import { EnvVarManager, PythonEnvVariableManager } from './features/execution/envVariableManager';
 import { InlineScriptLazyDetector } from './features/inlineScript/lazyDetector';
+import { InlineScriptRoutingRegistry } from './common/inlineScript/routingRegistry';
 import {
     applyInitialEnvironmentSelection,
     registerInterpreterSettingsChangeListener,
@@ -188,10 +188,13 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
     const projectManager: PythonProjectManager = new PythonProjectManagerImpl();
     context.subscriptions.push(projectManager);
 
+    const inlineScriptRouting = new InlineScriptRoutingRegistry();
+    context.subscriptions.push(inlineScriptRouting);
+
     const envVarManager: EnvVarManager = new PythonEnvVariableManager(projectManager);
     context.subscriptions.push(envVarManager);
 
-    const envManagers: EnvironmentManagers = new PythonEnvironmentManagers(projectManager);
+    const envManagers: EnvironmentManagers = new PythonEnvironmentManagers(projectManager, inlineScriptRouting);
     createManagerReady(envManagers, projectManager, context.subscriptions);
     context.subscriptions.push(envManagers);
 
@@ -218,7 +221,7 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
     // Silent observer for `.py` files that declare PEP 723 inline
     // script metadata. Emits anonymized telemetry (inlineScript.detected /
     // inlineScript.edited) but does not register projects or surface any UI.
-    const inlineScriptLazyDetector = new InlineScriptLazyDetector();
+    const inlineScriptLazyDetector = new InlineScriptLazyDetector(inlineScriptRouting);
     inlineScriptLazyDetector.activate();
     context.subscriptions.push(inlineScriptLazyDetector);
 
@@ -325,9 +328,6 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
                     );
                 },
             );
-        }),
-        commands.registerCommand('python-envs.setupInlineScriptEnvironment', async (item) => {
-            return setupInlineScriptEnvironmentCommand(item, envManagers);
         }),
         commands.registerCommand('python-envs.remove', async (item) => {
             await removeEnvironmentCommand(item, envManagers);
@@ -689,6 +689,7 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
                         outputChannel,
                         sysMgr,
                         context.globalStorageUri,
+                        inlineScriptRouting,
                     ),
                 ),
                 safeRegister('shellStartupVars', shellStartupVarsMgr.initialize()),

@@ -191,13 +191,6 @@
                 "icon": "$(add)"
             },
             {
-                "command": "python-envs.setupInlineScriptEnvironment",
-                "title": "%python-envs.setupInlineScriptEnvironment.title%",
-                "category": "Python",
-                "icon": "$(python)",
-                "when": "config.python.useEnvironmentsExtension != false"
-            },
-            {
                 "command": "python-envs.set",
                 "title": "%python-envs.set.title%",
                 "category": "Python",
@@ -452,10 +445,6 @@
                 {
                     "command": "python-envs.createAny",
                     "when": "false"
-                },
-                {
-                    "command": "python-envs.setupInlineScriptEnvironment",
-                    "when": "config.python.useEnvironmentsExtension != false"
                 },
                 {
                     "command": "python-envs.revealProjectInExplorer",

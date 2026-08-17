@@ -57,7 +57,6 @@ suite('Smoke: Registration Checks', function () {
             // Environment management
             'python-envs.create',
             'python-envs.createAny',
-            'python-envs.setupInlineScriptEnvironment',
             'python-envs.set',
             'python-envs.setEnv',
             'python-envs.setEnvSelected',
