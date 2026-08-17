@@ -136,6 +136,12 @@ suite('InlineScriptLazyDetector', () => {
         return detector;
     }
 
+    function createDetectorWithoutRouting(): InlineScriptLazyDetector {
+        const detector = new InlineScriptLazyDetector();
+        detector.activate();
+        return detector;
+    }
+
     async function fireOpen(uri: Uri): Promise<void> {
         assert.ok(openListener, 'open listener should be registered after activate()');
         await openListener!(makeDoc(uri));
@@ -187,6 +193,16 @@ suite('InlineScriptLazyDetector', () => {
         detector.dispose();
     });
 
+    test('activate() without routing subscribes only to document events', () => {
+        const detector = createDetectorWithoutRouting();
+        assert.ok(onDidOpenStub.calledOnce, 'should subscribe to onDidOpenTextDocument');
+        assert.ok(onDidSaveStub.calledOnce, 'should subscribe to onDidSaveTextDocument');
+        assert.ok(onDidChangeStub.calledOnce, 'should subscribe to onDidChangeTextDocument');
+        assert.ok(onDidDeleteStub.notCalled, 'should not subscribe to onDidDeleteFiles');
+        assert.ok(onDidRenameStub.notCalled, 'should not subscribe to onDidRenameFiles');
+        detector.dispose();
+    });
+
     test('skips non-file URI schemes', async () => {
         const detector = createDetector();
         await fireOpen(Uri.parse('untitled:foo.py'));
@@ -210,6 +226,21 @@ suite('InlineScriptLazyDetector', () => {
         await fireOpen(uri);
         assert.ok(readMetadataStub.calledOnceWithExactly(uri), 'should still read saved metadata for routing');
         assert.strictEqual(callsFor(EventNames.INLINE_SCRIPT_DETECTED).length, 0, 'should not emit telemetry');
+        detector.dispose();
+    });
+
+    test('without routing skips files outside any workspace folder', async () => {
+        const uri = Uri.file(path.resolve('/elsewhere/foo.py'));
+        const setMetadataSpy = sinon.spy(InlineScriptRoutingRegistry.prototype, 'setMetadata');
+        getWorkspaceFolderStub.returns(undefined);
+        readMetadataStub.resolves(VALID_METADATA);
+        const detector = createDetectorWithoutRouting();
+
+        await fireOpen(uri);
+
+        assert.ok(readMetadataStub.notCalled, 'should not read files outside the workspace');
+        assert.strictEqual(callsFor(EventNames.INLINE_SCRIPT_DETECTED).length, 0, 'should not emit telemetry');
+        assert.ok(setMetadataSpy.notCalled, 'off-mode should not update routing metadata');
         detector.dispose();
     });
 
@@ -244,6 +275,34 @@ suite('InlineScriptLazyDetector', () => {
         assert.ok(readMetadataStub.notCalled, 'dirty open should not read saved metadata');
         assert.strictEqual(routingRegistry.getMetadata(uri), undefined);
         assert.strictEqual(routingRegistry.shouldRoute(uri), false);
+        detector.dispose();
+    });
+
+    test('without routing replays dirty workspace documents from saved disk and preserves edited duration gating', async () => {
+        const uri = Uri.file(path.resolve('/ws/restoredDirty.py'));
+        const setMetadataSpy = sinon.spy(InlineScriptRoutingRegistry.prototype, 'setMetadata');
+        const clearMetadataSpy = sinon.spy(InlineScriptRoutingRegistry.prototype, 'clearMetadata');
+        const validateAssociationSpy = sinon.spy(InlineScriptRoutingRegistry.prototype, 'setValidatedAssociation');
+        sinon.stub(Date, 'now').onFirstCall().returns(1_000).onSecondCall().returns(1_250);
+        setDocDirty(uri, true);
+        getOpenTextDocumentsStub.returns([makeDoc(uri)]);
+        readMetadataStub.resolves(VALID_METADATA);
+        const detector = createDetectorWithoutRouting();
+
+        await flushImmediate();
+        await flushImmediate();
+        fireChange(uri);
+
+        assert.ok(readMetadataStub.calledOnceWithExactly(uri), 'dirty replay should still read saved metadata');
+        const detectedCalls = callsFor(EventNames.INLINE_SCRIPT_DETECTED);
+        assert.strictEqual(detectedCalls.length, 1, 'dirty replay should still emit detection telemetry');
+        assert.strictEqual(detectedCalls[0].args[2].trigger, 'open');
+        const editedCalls = callsFor(EventNames.INLINE_SCRIPT_EDITED);
+        assert.strictEqual(editedCalls.length, 1, 'first edit after dirty replay should still emit telemetry');
+        assert.strictEqual(editedCalls[0].args[1], 250, 'edited duration should still be based on the detection time');
+        assert.ok(setMetadataSpy.notCalled, 'off-mode should not write routing metadata');
+        assert.ok(clearMetadataSpy.notCalled, 'off-mode should not clear routing metadata');
+        assert.ok(validateAssociationSpy.notCalled, 'off-mode should not change routing associations');
         detector.dispose();
     });
 

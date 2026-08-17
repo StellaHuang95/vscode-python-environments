@@ -129,6 +129,11 @@ suite('PythonEnvironmentManagers getLastKnownEnvironment', () => {
         routingRegistry.setValidatedAssociation(uri, associated);
     }
 
+    function recreateEnvManagersWithoutRouting(): void {
+        envManagers.dispose();
+        envManagers = new PythonEnvironmentManagers(projectManager.object);
+    }
+
     test('returns undefined before any environment has been resolved', () => {
         registerManager(async () => makeEnv('env1'));
         assert.strictEqual(envManagers.getLastKnownEnvironment(undefined), undefined);
@@ -417,6 +422,40 @@ suite('PythonEnvironmentManagers getLastKnownEnvironment', () => {
         routingRegistry.setValidatedAssociation(script, true);
 
         assert.strictEqual(envManagers.getEnvironmentManager(script)?.id, defaultId);
+    });
+
+    test('without a routing registry, does not route metadata-only inline associations', () => {
+        recreateEnvManagersWithoutRouting();
+        const shouldRouteSpy = sinon.spy(InlineScriptRoutingRegistry.prototype, 'shouldRoute');
+        const script = Uri.file('/workspace/project/script.py');
+        projectsByUri.set(script.toString(), { name: 'project', uri: Uri.file('/workspace/project') });
+        const defaultId = registerManager(async () => makeEnv('default'), async () => undefined, 'venv');
+        registerManager(async () => makeEnv('inline'), async () => undefined, 'inline-script');
+        defaultManagerId = defaultId;
+        routingRegistry.setMetadata(script, INLINE_METADATA);
+        routingRegistry.setValidatedAssociation(script, true);
+
+        assert.strictEqual(envManagers.getEnvironmentManager(script)?.id, defaultId);
+        assert.strictEqual(shouldRouteSpy.called, false, 'off-mode should not consult inline routeability');
+    });
+
+    test('without a routing registry, keeps baseline cached inline selections without routeability checks', async () => {
+        recreateEnvManagersWithoutRouting();
+        const shouldRouteSpy = sinon.spy(InlineScriptRoutingRegistry.prototype, 'shouldRoute');
+        const script = Uri.file('/workspace/project/script.py');
+        projectsByUri.set(script.toString(), { name: 'project', uri: Uri.file('/workspace/project') });
+        const defaultId = registerManager(async () => makeEnv('default'), async () => undefined, 'venv');
+        let inlineEnvironment: PythonEnvironment;
+        const inlineId = registerManager(async () => inlineEnvironment, async () => undefined, 'inline-script');
+        inlineEnvironment = { ...makeEnv('inline'), envId: { id: 'inline', managerId: inlineId } };
+        defaultManagerId = defaultId;
+
+        await envManagers.setEnvironment(script, inlineEnvironment, false);
+
+        assert.strictEqual(envManagers.getEnvironmentManager(script)?.id, inlineId);
+        assert.strictEqual(await envManagers.getEnvironment(script), inlineEnvironment);
+        assert.strictEqual(envManagers.getLastKnownEnvironment(script), inlineEnvironment);
+        assert.strictEqual(shouldRouteSpy.called, false, 'off-mode should not consult inline routeability');
     });
 
     test('routes an active inline-script selection before the containing project default', async () => {

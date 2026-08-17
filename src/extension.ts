@@ -66,8 +66,8 @@ import {
 } from './features/envCommands';
 import { PythonEnvironmentManagers } from './features/envManagers';
 import { EnvVarManager, PythonEnvVariableManager } from './features/execution/envVariableManager';
+import { latchInlineScriptFeatureActivation } from './features/inlineScript/activation';
 import { InlineScriptLazyDetector } from './features/inlineScript/lazyDetector';
-import { InlineScriptRoutingRegistry } from './common/inlineScript/routingRegistry';
 import {
     applyInitialEnvironmentSelection,
     registerInterpreterSettingsChangeListener,
@@ -188,8 +188,11 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
     const projectManager: PythonProjectManager = new PythonProjectManagerImpl();
     context.subscriptions.push(projectManager);
 
-    const inlineScriptRouting = new InlineScriptRoutingRegistry();
-    context.subscriptions.push(inlineScriptRouting);
+    const inlineScriptFeatureActivation = latchInlineScriptFeatureActivation();
+    const inlineScriptRouting = inlineScriptFeatureActivation.routingRegistry;
+    if (inlineScriptRouting) {
+        context.subscriptions.push(inlineScriptRouting);
+    }
 
     const envVarManager: EnvVarManager = new PythonEnvVariableManager(projectManager);
     context.subscriptions.push(envVarManager);
@@ -683,14 +686,16 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
                 ),
                 safeRegister(
                     'inlineScript',
-                    registerInlineScriptFeatures(
-                        nativeFinder,
-                        context.subscriptions,
-                        outputChannel,
-                        sysMgr,
-                        context.globalStorageUri,
-                        inlineScriptRouting,
-                    ),
+                    inlineScriptFeatureActivation.enabled
+                        ? registerInlineScriptFeatures(
+                              nativeFinder,
+                              context.subscriptions,
+                              outputChannel,
+                              sysMgr,
+                              context.globalStorageUri,
+                              inlineScriptFeatureActivation,
+                          )
+                        : Promise.resolve(),
                 ),
                 safeRegister('shellStartupVars', shellStartupVarsMgr.initialize()),
             ]);

@@ -3,17 +3,15 @@
 
 import { Disposable, LogOutputChannel, Uri } from 'vscode';
 import { EnvironmentManager, PythonEnvironmentApi } from '../../../api';
-import { InlineScriptRoutingRegistry } from '../../../common/inlineScript/routingRegistry';
 import { traceInfo, traceVerbose } from '../../../common/logging';
+import { InlineScriptFeatureActivation } from '../../../features/inlineScript/activation';
 import { getPythonApi } from '../../../features/pythonApi';
-import { isInlineScriptsFeatureEnabled } from '../../../helpers';
 import { NativePythonFinder } from '../../common/nativePythonFinder';
 import { InlineScriptEnvManager } from './envManager';
 
 /**
- * Register the inline-script env manager when the internal
- * `python-envs.inlineScripts.enabled` flag is true. The flag is
- * undeclared in `package.json`, so default users see nothing.
+ * Register the inline-script env manager when the activation-latched
+ * `python-envs.inlineScripts.enabled` flag is true.
  */
 export async function registerInlineScriptFeatures(
     nativeFinder: NativePythonFinder,
@@ -21,11 +19,15 @@ export async function registerInlineScriptFeatures(
     log: LogOutputChannel,
     baseManager: EnvironmentManager,
     globalStorageUri: Uri,
-    routingRegistry: InlineScriptRoutingRegistry,
+    activation: InlineScriptFeatureActivation,
 ): Promise<void> {
-    if (!isInlineScriptsFeatureEnabled()) {
+    if (!activation.enabled) {
         traceVerbose('Inline-script env manager: skipping registration (internal flag is off)');
         return;
+    }
+    const { routingRegistry } = activation;
+    if (!routingRegistry) {
+        throw new Error('Inline-script env manager requires a routing registry when the feature flag is on');
     }
 
     const api: PythonEnvironmentApi = await getPythonApi();

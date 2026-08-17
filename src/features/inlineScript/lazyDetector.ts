@@ -61,7 +61,7 @@ export class InlineScriptLazyDetector implements Disposable {
     // already torn down.
     private disposed = false;
 
-    constructor(private readonly routingRegistry: InlineScriptRoutingRegistry = new InlineScriptRoutingRegistry()) {}
+    constructor(private readonly routingRegistry?: InlineScriptRoutingRegistry) {}
 
     /**
      * Subscribe to workspace text-document events. Safe to call once
@@ -88,9 +88,13 @@ export class InlineScriptLazyDetector implements Disposable {
             onDidOpenTextDocument((doc) => this.handleDocument(doc, 'open')),
             onDidSaveTextDocument((doc) => this.handleDocument(doc, 'save')),
             onDidChangeTextDocument((e) => this.handleChange(e)),
-            onDidDeleteFiles((e) => e.files.forEach((uri) => this.clearRouteability(uri))),
-            onDidRenameFiles((e) => e.files.forEach((file) => this.clearRouteability(file.oldUri))),
         );
+        if (this.routingRegistry) {
+            this.subscriptions.push(
+                onDidDeleteFiles((e) => e.files.forEach((uri) => this.clearRouteability(uri))),
+                onDidRenameFiles((e) => e.files.forEach((file) => this.clearRouteability(file.oldUri))),
+            );
+        }
         // Defer the catch-up pass so we observe `workspace.textDocuments`
         // AFTER VS Code finishes registering the document that triggered
         // our activation. Running the loop synchronously here can race
@@ -106,13 +110,14 @@ export class InlineScriptLazyDetector implements Disposable {
      * `handleDocument` keeps this safe to call repeatedly.
      */
     private replayOpenDocuments(source: 'activate'): void {
-        const openDocs = getOpenTextDocuments().filter((d) => shouldTrackRoutingUri(d.uri));
+        const openDocs = getOpenTextDocuments().filter((d) => this.shouldTrackUri(d.uri));
+        const candidateDescription = this.routingRegistry ? 'candidate local .py' : 'candidate .py';
         if (openDocs.length === 0) {
-            traceVerbose(`inlineScriptLazyDetector: ${source} replay found no candidate local .py documents`);
+            traceVerbose(`inlineScriptLazyDetector: ${source} replay found no ${candidateDescription} documents`);
             return;
         }
         traceVerbose(
-            `inlineScriptLazyDetector: ${source} replay over ${openDocs.length} candidate local .py document(s): ` +
+            `inlineScriptLazyDetector: ${source} replay over ${openDocs.length} ${candidateDescription} document(s): ` +
                 openDocs.map((d) => d.uri.fsPath).join(', '),
         );
         for (const doc of openDocs) {
@@ -135,7 +140,7 @@ export class InlineScriptLazyDetector implements Disposable {
         // the `Trace` log level — to avoid flooding the default
         // `Info` channel.
         traceVerbose(`inlineScriptLazyDetector: event received (${trigger}) ${uri.toString()}`);
-        if (!shouldTrackRoutingUri(uri)) {
+        if (!this.shouldTrackUri(uri)) {
             traceVerbose(
                 `inlineScriptLazyDetector: skipped (${trigger}) ${uri.toString()} ` +
                     `(scheme='${uri.scheme}', extname='${path.extname(uri.fsPath).toLowerCase()}', ` +
@@ -143,7 +148,7 @@ export class InlineScriptLazyDetector implements Disposable {
             );
             return;
         }
-        if (trigger === 'open' && doc.isDirty) {
+        if (this.routingRegistry && trigger === 'open' && doc.isDirty) {
             traceVerbose(`inlineScriptLazyDetector: withholding dirty document metadata for ${uri.toString()}`);
             this.clearRouteability(uri);
             return;
@@ -171,8 +176,12 @@ export class InlineScriptLazyDetector implements Disposable {
             if (this.disposed) {
                 return;
             }
-            this.routingRegistry.setMetadata(uri, metadata);
-            if (!shouldEmitTelemetry || metadata === undefined) {
+            if (this.routingRegistry) {
+                this.routingRegistry.setMetadata(uri, metadata);
+                if (!shouldEmitTelemetry || metadata === undefined) {
+                    return;
+                }
+            } else if (metadata === undefined) {
                 return;
             }
             const key = uri.toString();
@@ -216,9 +225,11 @@ export class InlineScriptLazyDetector implements Disposable {
         if (e.contentChanges.length === 0) {
             return;
         }
-        const metadata = this.routingRegistry.getMetadata(e.document.uri);
-        if (metadata && this.contentChangesMayAffectMetadata(e.contentChanges, metadata.range.end)) {
-            this.clearRouteability(e.document.uri);
+        if (this.routingRegistry) {
+            const metadata = this.routingRegistry.getMetadata(e.document.uri);
+            if (metadata && this.contentChangesMayAffectMetadata(e.contentChanges, metadata.range.end)) {
+                this.clearRouteability(e.document.uri);
+            }
         }
         const key = e.document.uri.toString();
         if (!this.detectedUris.has(key)) {
@@ -244,11 +255,15 @@ export class InlineScriptLazyDetector implements Disposable {
     }
 
     private clearRouteability(uri: Uri): void {
-        if (!shouldTrackRoutingUri(uri)) {
+        if (!this.routingRegistry || !shouldTrackRoutingUri(uri)) {
             return;
         }
         this.routingRegistry.clearMetadata(uri);
         this.routingRegistry.setValidatedAssociation(uri, false);
+    }
+
+    private shouldTrackUri(uri: Uri): boolean {
+        return this.routingRegistry ? shouldTrackRoutingUri(uri) : shouldHandleUri(uri);
     }
 }
 

@@ -100,15 +100,17 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
 
     constructor(
         private readonly pm: PythonProjectManager,
-        private readonly inlineScriptRouting: InlineScriptRoutingRegistry = new InlineScriptRoutingRegistry(),
+        private readonly inlineScriptRouting?: InlineScriptRoutingRegistry,
     ) {
-        this.subscriptions.push(
-            this.inlineScriptRouting.onDidChangeRouteability((e) => {
-                void this.handleInlineScriptRouteabilityChange(e).catch((error) =>
-                    traceError('Failed to refresh inline-script routing:', error),
-                );
-            }),
-        );
+        if (this.inlineScriptRouting) {
+            this.subscriptions.push(
+                this.inlineScriptRouting.onDidChangeRouteability((e) => {
+                    void this.handleInlineScriptRouteabilityChange(e).catch((error) =>
+                        traceError('Failed to refresh inline-script routing:', error),
+                    );
+                }),
+            );
+        }
     }
 
     public registerEnvironmentManager(manager: EnvironmentManager, options?: { extensionId?: string }): Disposable {
@@ -238,13 +240,23 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
             }
 
             if (context instanceof Uri) {
-                const overrideManager = this.getInlineRoutingOverrideManager(context);
-                if (overrideManager) {
-                    return overrideManager;
-                }
-                const inlineManager = this._environmentManagers.get(INLINE_SCRIPT_MANAGER_ID);
-                if (inlineManager && this.inlineScriptRouting.shouldRoute(context)) {
-                    return inlineManager;
+                if (this.inlineScriptRouting) {
+                    const overrideManager = this.getInlineRoutingOverrideManager(context);
+                    if (overrideManager) {
+                        return overrideManager;
+                    }
+                    const inlineManager = this._environmentManagers.get(INLINE_SCRIPT_MANAGER_ID);
+                    if (inlineManager && this.inlineScriptRouting.shouldRoute(context)) {
+                        return inlineManager;
+                    }
+                } else {
+                    const inlineEnv = this._activeSelection.get(this.getInlineScriptSelectionKey(context));
+                    if (inlineEnv?.envId.managerId === INLINE_SCRIPT_MANAGER_ID) {
+                        const inlineManager = this._environmentManagers.get(INLINE_SCRIPT_MANAGER_ID);
+                        if (inlineManager) {
+                            return inlineManager;
+                        }
+                    }
                 }
             }
             return this.getConfiguredOrCachedEnvironmentManager(context, project);
@@ -752,6 +764,9 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
         manager: InternalEnvironmentManager,
         environment: PythonEnvironment | undefined,
     ): void {
+        if (!this.inlineScriptRouting) {
+            return;
+        }
         const key = this.getInlineScriptSelectionKey(scope);
         if (!environment || manager.id === INLINE_SCRIPT_MANAGER_ID) {
             this._inlineRoutingOverrides.delete(key);
@@ -761,6 +776,9 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
     }
 
     private clearInlineRoutingOverride(scope: Uri): void {
+        if (!this.inlineScriptRouting) {
+            return;
+        }
         this._inlineRoutingOverrides.delete(this.getInlineScriptSelectionKey(scope));
     }
 
@@ -832,7 +850,7 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
     }
 
     private shouldPublishInlineSelectionImmediately(scope: Uri, manager: InternalEnvironmentManager): boolean {
-        return manager.id !== INLINE_SCRIPT_MANAGER_ID || this.inlineScriptRouting.shouldRoute(scope);
+        return !this.inlineScriptRouting || manager.id !== INLINE_SCRIPT_MANAGER_ID || this.inlineScriptRouting.shouldRoute(scope);
     }
 
     private clearInlineActiveSelection(
