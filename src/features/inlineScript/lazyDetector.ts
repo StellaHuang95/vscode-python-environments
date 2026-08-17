@@ -2,19 +2,16 @@
 // Licensed under the MIT License.
 
 import * as path from 'path';
-import { Disposable, TextDocument, TextDocumentChangeEvent, TextDocumentContentChangeEvent, Uri } from 'vscode';
+import { Disposable, TextDocument, TextDocumentChangeEvent, Uri } from 'vscode';
 import { readInlineScriptMetadataFromFile } from '../../common/inlineScript/metadata';
-import { getInlineScriptRoutingKey, InlineScriptRoutingRegistry } from '../../common/inlineScript/routingRegistry';
 import { traceVerbose, traceWarn } from '../../common/logging';
 import { EventNames } from '../../common/telemetry/constants';
 import { sendTelemetryEvent } from '../../common/telemetry/sender';
 import {
     getOpenTextDocuments,
     getWorkspaceFolder,
-    onDidDeleteFiles,
     onDidChangeTextDocument,
     onDidOpenTextDocument,
-    onDidRenameFiles,
     onDidSaveTextDocument,
 } from '../../common/workspace.apis';
 
@@ -61,8 +58,6 @@ export class InlineScriptLazyDetector implements Disposable {
     // already torn down.
     private disposed = false;
 
-    constructor(private readonly routingRegistry: InlineScriptRoutingRegistry = new InlineScriptRoutingRegistry()) {}
-
     /**
      * Subscribe to workspace text-document events. Safe to call once
      * during extension activation.
@@ -88,8 +83,6 @@ export class InlineScriptLazyDetector implements Disposable {
             onDidOpenTextDocument((doc) => this.handleDocument(doc, 'open')),
             onDidSaveTextDocument((doc) => this.handleDocument(doc, 'save')),
             onDidChangeTextDocument((e) => this.handleChange(e)),
-            onDidDeleteFiles((e) => e.files.forEach((uri) => this.clearRouteability(uri))),
-            onDidRenameFiles((e) => e.files.forEach((file) => this.clearRouteability(file.oldUri))),
         );
         // Defer the catch-up pass so we observe `workspace.textDocuments`
         // AFTER VS Code finishes registering the document that triggered
@@ -106,13 +99,19 @@ export class InlineScriptLazyDetector implements Disposable {
      * `handleDocument` keeps this safe to call repeatedly.
      */
     private replayOpenDocuments(source: 'activate'): void {
-        const openDocs = getOpenTextDocuments().filter((d) => shouldTrackRoutingUri(d.uri));
+        // Restrict the replay to documents that the per-event handler
+        // would actually look at. This keeps the activation log
+        // proportional to the work the detector will do — on an
+        // editor with many tabs open we would otherwise dump every
+        // URI just to throw most of them away inside
+        // `handleDocument`.
+        const openDocs = getOpenTextDocuments().filter((d) => shouldHandleUri(d.uri));
         if (openDocs.length === 0) {
-            traceVerbose(`inlineScriptLazyDetector: ${source} replay found no candidate local .py documents`);
+            traceVerbose(`inlineScriptLazyDetector: ${source} replay found no candidate .py documents`);
             return;
         }
         traceVerbose(
-            `inlineScriptLazyDetector: ${source} replay over ${openDocs.length} candidate local .py document(s): ` +
+            `inlineScriptLazyDetector: ${source} replay over ${openDocs.length} candidate .py document(s): ` +
                 openDocs.map((d) => d.uri.fsPath).join(', '),
         );
         for (const doc of openDocs) {
@@ -135,17 +134,12 @@ export class InlineScriptLazyDetector implements Disposable {
         // the `Trace` log level — to avoid flooding the default
         // `Info` channel.
         traceVerbose(`inlineScriptLazyDetector: event received (${trigger}) ${uri.toString()}`);
-        if (!shouldTrackRoutingUri(uri)) {
+        if (!shouldHandleUri(uri)) {
             traceVerbose(
                 `inlineScriptLazyDetector: skipped (${trigger}) ${uri.toString()} ` +
                     `(scheme='${uri.scheme}', extname='${path.extname(uri.fsPath).toLowerCase()}', ` +
                     `inWorkspace=${getWorkspaceFolder(uri) !== undefined})`,
             );
-            return;
-        }
-        if (trigger === 'open' && doc.isDirty) {
-            traceVerbose(`inlineScriptLazyDetector: withholding dirty document metadata for ${uri.toString()}`);
-            this.clearRouteability(uri);
             return;
         }
         const key = uri.toString();
@@ -158,21 +152,20 @@ export class InlineScriptLazyDetector implements Disposable {
             await existing;
             return;
         }
-        const work = this.processOnce(uri, trigger, shouldHandleUri(uri)).finally(() => {
+        const work = this.processOnce(uri, trigger).finally(() => {
             this.inFlight.delete(key);
         });
         this.inFlight.set(key, work);
         await work;
     }
 
-    private async processOnce(uri: Uri, trigger: 'open' | 'save', shouldEmitTelemetry: boolean): Promise<void> {
+    private async processOnce(uri: Uri, trigger: 'open' | 'save'): Promise<void> {
         try {
             const metadata = await readInlineScriptMetadataFromFile(uri);
             if (this.disposed) {
                 return;
             }
-            this.routingRegistry.setMetadata(uri, metadata);
-            if (!shouldEmitTelemetry || metadata === undefined) {
+            if (metadata === undefined) {
                 return;
             }
             const key = uri.toString();
@@ -216,10 +209,6 @@ export class InlineScriptLazyDetector implements Disposable {
         if (e.contentChanges.length === 0) {
             return;
         }
-        const metadata = this.routingRegistry.getMetadata(e.document.uri);
-        if (metadata && this.contentChangesMayAffectMetadata(e.contentChanges, metadata.range.end)) {
-            this.clearRouteability(e.document.uri);
-        }
         const key = e.document.uri.toString();
         if (!this.detectedUris.has(key)) {
             return;
@@ -234,21 +223,6 @@ export class InlineScriptLazyDetector implements Disposable {
             `inlineScriptLazyDetector: first edit observed on ${e.document.uri.fsPath} (${duration}ms after detection)`,
         );
         sendTelemetryEvent(EventNames.INLINE_SCRIPT_EDITED, duration);
-    }
-
-    private contentChangesMayAffectMetadata(
-        changes: readonly TextDocumentContentChangeEvent[],
-        metadataEnd: number,
-    ): boolean {
-        return changes.some((change) => change.rangeOffset < metadataEnd);
-    }
-
-    private clearRouteability(uri: Uri): void {
-        if (!shouldTrackRoutingUri(uri)) {
-            return;
-        }
-        this.routingRegistry.clearMetadata(uri);
-        this.routingRegistry.setValidatedAssociation(uri, false);
     }
 }
 
@@ -269,8 +243,4 @@ export function shouldHandleUri(uri: Uri): boolean {
         return false;
     }
     return true;
-}
-
-function shouldTrackRoutingUri(uri: Uri): boolean {
-    return getInlineScriptRoutingKey(uri) !== undefined;
 }

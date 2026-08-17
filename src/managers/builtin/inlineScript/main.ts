@@ -3,7 +3,6 @@
 
 import { Disposable, LogOutputChannel, Uri } from 'vscode';
 import { EnvironmentManager, PythonEnvironmentApi } from '../../../api';
-import { InlineScriptRoutingRegistry } from '../../../common/inlineScript/routingRegistry';
 import { traceInfo, traceVerbose } from '../../../common/logging';
 import { getPythonApi } from '../../../features/pythonApi';
 import { isInlineScriptsFeatureEnabled } from '../../../helpers';
@@ -21,7 +20,6 @@ export async function registerInlineScriptFeatures(
     log: LogOutputChannel,
     baseManager: EnvironmentManager,
     globalStorageUri: Uri,
-    routingRegistry: InlineScriptRoutingRegistry,
 ): Promise<void> {
     if (!isInlineScriptsFeatureEnabled()) {
         traceVerbose('Inline-script env manager: skipping registration (internal flag is off)');
@@ -29,7 +27,7 @@ export async function registerInlineScriptFeatures(
     }
 
     const api: PythonEnvironmentApi = await getPythonApi();
-    const mgr = new InlineScriptEnvManager(nativeFinder, api, baseManager, globalStorageUri, log, routingRegistry);
+    const mgr = new InlineScriptEnvManager(nativeFinder, api, baseManager, globalStorageUri, log);
     disposables.push(mgr, api.registerEnvironmentManager(mgr));
     traceInfo('Inline-script env manager: registered (internal flag is on)');
 }

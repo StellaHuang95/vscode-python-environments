@@ -15,10 +15,6 @@ import {
     EnvironmentManagerAlreadyRegisteredError,
     PackageManagerAlreadyRegisteredError,
 } from '../common/errors/AlreadyRegisteredError';
-import {
-    InlineScriptRouteabilityChangeEvent,
-    InlineScriptRoutingRegistry,
-} from '../common/inlineScript/routingRegistry';
 import { traceError, traceVerbose } from '../common/logging';
 import { StopWatch } from '../common/stopWatch';
 import { EventNames } from '../common/telemetry/constants';
@@ -57,7 +53,6 @@ function generateId(name: string, extensionId?: string): string {
 export class PythonEnvironmentManagers implements EnvironmentManagers {
     private _environmentManagers: Map<string, InternalEnvironmentManager> = new Map();
     private _packageManagers: Map<string, InternalPackageManager> = new Map();
-    private readonly subscriptions: Disposable[] = [];
 
     /**
      * The last environment announced as "active" for each scope.
@@ -69,7 +64,6 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
      * Only mutated by setEnvironment() / setEnvironments() / refreshEnvironment().
      */
     private readonly _activeSelection = new Map<string, PythonEnvironment | undefined>();
-    private readonly _inlineRoutingOverrides = new Map<string, string>();
     private readonly _selectionRevisions = new Map<string, number>();
     private readonly _selectionOperationCounters = new Map<string, number>();
 
@@ -98,18 +92,7 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
     public onDidChangeActiveEnvironment: Event<DidChangeEnvironmentEventArgs> =
         this._onDidChangeActiveEnvironment.event;
 
-    constructor(
-        private readonly pm: PythonProjectManager,
-        private readonly inlineScriptRouting: InlineScriptRoutingRegistry = new InlineScriptRoutingRegistry(),
-    ) {
-        this.subscriptions.push(
-            this.inlineScriptRouting.onDidChangeRouteability((e) => {
-                void this.handleInlineScriptRouteabilityChange(e).catch((error) =>
-                    traceError('Failed to refresh inline-script routing:', error),
-                );
-            }),
-        );
-    }
+    constructor(private readonly pm: PythonProjectManager) {}
 
     public registerEnvironmentManager(manager: EnvironmentManager, options?: { extensionId?: string }): Disposable {
         const registrationStopWatch = new StopWatch();
@@ -202,8 +185,6 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
     public dispose() {
         this._environmentManagers.clear();
         this._packageManagers.clear();
-        this._inlineRoutingOverrides.clear();
-        this.subscriptions.forEach((subscription) => subscription.dispose());
         this._onDidChangeEnvironmentManager.dispose();
         this._onDidChangePackageManager.dispose();
         this._onDidChangeEnvironments.dispose();
@@ -217,11 +198,10 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
      *
      * Priority:
      * 1. Use an exact per-script project setting.
-     * 2. Use an explicit in-session per-script override.
-     * 3. Use a recognized per-script inline association.
-     * 4. Use the containing project or default setting.
-     * 5. Fall back to the cached project/global environment's manager.
-     * 6. If context is a string or PythonEnvironment, return its manager directly.
+     * 2. Use a cached per-script inline selection.
+     * 3. Use the containing project or default setting.
+     * 4. Fall back to the cached project/global environment's manager.
+     * 5. If context is a string or PythonEnvironment, return its manager directly.
      */
     public getEnvironmentManager(context: EnvironmentManagerScope): InternalEnvironmentManager | undefined {
         if (this._environmentManagers.size === 0) {
@@ -231,23 +211,47 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
 
         if (context === undefined || context instanceof Uri) {
             const project = context ? this.pm.get(context) : undefined;
-            const exactManager =
-                context instanceof Uri ? this.getExactProjectEnvironmentManager(context, project) : undefined;
-            if (exactManager) {
-                return exactManager;
+            if (
+                context instanceof Uri &&
+                project &&
+                normalizePath(project.uri.fsPath) === normalizePath(context.fsPath)
+            ) {
+                const exactManagerId = getProjectEnvironmentManagerSetting(this.pm, context);
+                const exactManager = exactManagerId
+                    ? this._environmentManagers.get(exactManagerId)
+                    : undefined;
+                if (exactManager) {
+                    return exactManager;
+                }
             }
 
             if (context instanceof Uri) {
-                const overrideManager = this.getInlineRoutingOverrideManager(context);
-                if (overrideManager) {
-                    return overrideManager;
-                }
-                const inlineManager = this._environmentManagers.get(INLINE_SCRIPT_MANAGER_ID);
-                if (inlineManager && this.inlineScriptRouting.shouldRoute(context)) {
-                    return inlineManager;
+                const inlineEnv = this._activeSelection.get(this.getInlineScriptSelectionKey(context));
+                if (inlineEnv?.envId.managerId === INLINE_SCRIPT_MANAGER_ID) {
+                    const inlineManager = this._environmentManagers.get(INLINE_SCRIPT_MANAGER_ID);
+                    if (inlineManager) {
+                        return inlineManager;
+                    }
                 }
             }
-            return this.getConfiguredOrCachedEnvironmentManager(context, project);
+
+            const defaultEnvManagerId = getDefaultEnvManagerSetting(this.pm, context);
+            if (defaultEnvManagerId !== undefined) {
+                const settingsManager = this._environmentManagers.get(defaultEnvManagerId);
+                if (settingsManager) {
+                    return settingsManager;
+                }
+            }
+
+            const cachedEnv = this._activeSelection.get(project ? project.uri.toString() : 'global');
+            if (cachedEnv) {
+                const cachedManager = this._environmentManagers.get(cachedEnv.envId.managerId);
+                if (cachedManager) {
+                    return cachedManager;
+                }
+            }
+
+            return undefined;
         }
 
         if (typeof context === 'string') {
@@ -360,8 +364,6 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
         const project = scope ? this.pm.get(scope) : undefined;
         const key = this.getActiveSelectionKey(scope, manager, project);
         const operation = this.beginSelectionOperation(key);
-        const publishInlineSelection =
-            !(scope instanceof Uri) || this.shouldPublishInlineSelectionImmediately(scope, manager);
         const inlineClearOperation =
             scope instanceof Uri && manager.id !== INLINE_SCRIPT_MANAGER_ID
                 ? this.beginSelectionOperation(this.getInlineScriptSelectionKey(scope))
@@ -394,11 +396,7 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
         }
 
         if (scope instanceof Uri) {
-            this.updateInlineRoutingOverride(scope, manager, environment);
             this.clearInlineActiveSelection(scope, manager, inlineClearOperation);
-        }
-        if (!publishInlineSelection) {
-            return;
         }
         if (!this.commitSelectionOperation(key, operation)) {
             return;
@@ -473,11 +471,7 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
                     await setAllManagerSettings(settings);
                 }
                 selections.forEach((selection) => {
-                    this.updateInlineRoutingOverride(selection.scope, manager, environment);
                     this.clearInlineActiveSelection(selection.scope, manager, selection.inlineClearOperation);
-                    if (!selection.publishInlineSelection) {
-                        return;
-                    }
                     if (!this.commitSelectionOperation(selection.key, selection.operation)) {
                         return;
                     }
@@ -542,7 +536,6 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
                     await manager.set(uris);
                     await Promise.all(
                         selections.map(async (selection) => {
-                            this.clearInlineRoutingOverride(selection.scope);
                             const newEnv = await manager.get(selection.scope);
                             if (!this.commitSelectionOperation(selection.key, selection.operation)) {
                                 return;
@@ -700,117 +693,6 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
         return `inline-script:${normalizePath(scope.fsPath)}`;
     }
 
-    private getExactProjectEnvironmentManager(
-        scope: Uri,
-        project: PythonProject | undefined,
-    ): InternalEnvironmentManager | undefined {
-        if (!project || normalizePath(project.uri.fsPath) !== normalizePath(scope.fsPath)) {
-            return undefined;
-        }
-        const exactManagerId = getProjectEnvironmentManagerSetting(this.pm, scope);
-        return exactManagerId ? this._environmentManagers.get(exactManagerId) : undefined;
-    }
-
-    private getConfiguredOrCachedEnvironmentManager(
-        context: Uri | undefined,
-        project: PythonProject | undefined,
-    ): InternalEnvironmentManager | undefined {
-        const defaultEnvManagerId = getDefaultEnvManagerSetting(this.pm, context);
-        if (defaultEnvManagerId !== undefined) {
-            const settingsManager = this._environmentManagers.get(defaultEnvManagerId);
-            if (settingsManager) {
-                return settingsManager;
-            }
-        }
-
-        const cachedEnv = this._activeSelection.get(this.getProjectSelectionKey(project));
-        if (cachedEnv) {
-            const cachedManager = this._environmentManagers.get(cachedEnv.envId.managerId);
-            if (cachedManager) {
-                return cachedManager;
-            }
-        }
-
-        return undefined;
-    }
-
-    private getProjectSelectionKey(project: PythonProject | undefined): string {
-        return project ? project.uri.toString() : 'global';
-    }
-
-    private getInlineRoutingOverrideManager(scope: Uri): InternalEnvironmentManager | undefined {
-        const managerId = this._inlineRoutingOverrides.get(this.getInlineScriptSelectionKey(scope));
-        return managerId ? this._environmentManagers.get(managerId) : undefined;
-    }
-
-    private updateInlineRoutingOverride(
-        scope: Uri,
-        manager: InternalEnvironmentManager,
-        environment: PythonEnvironment | undefined,
-    ): void {
-        const key = this.getInlineScriptSelectionKey(scope);
-        if (!environment || manager.id === INLINE_SCRIPT_MANAGER_ID) {
-            this._inlineRoutingOverrides.delete(key);
-            return;
-        }
-        this._inlineRoutingOverrides.set(key, manager.id);
-    }
-
-    private clearInlineRoutingOverride(scope: Uri): void {
-        this._inlineRoutingOverrides.delete(this.getInlineScriptSelectionKey(scope));
-    }
-
-    private async handleInlineScriptRouteabilityChange(
-        event: InlineScriptRouteabilityChangeEvent,
-    ): Promise<void> {
-        const { uri, previousRouteable } = event;
-        const project = this.pm.get(uri);
-        const exactManager = this.getExactProjectEnvironmentManager(uri, project);
-        if (exactManager) {
-            if (exactManager.id === INLINE_SCRIPT_MANAGER_ID) {
-                await this.refreshEnvironment(uri);
-            }
-            return;
-        }
-
-        if (this.getInlineRoutingOverrideManager(uri)) {
-            return;
-        }
-
-        const manager = this.getEnvironmentManager(uri);
-        if (!manager) {
-            return;
-        }
-
-        const refreshedProject = this.pm.get(uri);
-        const key = this.getActiveSelectionKey(uri, manager, refreshedProject);
-        const operation = this.beginSelectionOperation(key);
-        const newEnv = await manager.get(uri);
-        const latestProject = this.pm.get(uri);
-        if (this.getEnvironmentManager(uri) !== manager || !this.commitSelectionOperation(key, operation)) {
-            return;
-        }
-
-        const inlineKey = this.getInlineScriptSelectionKey(uri);
-        const oldEnv = previousRouteable
-            ? this._activeSelection.get(inlineKey)
-            : this._activeSelection.get(this.getProjectSelectionKey(latestProject));
-
-        if (manager.id !== INLINE_SCRIPT_MANAGER_ID) {
-            this._activeSelection.delete(inlineKey);
-        }
-        this._activeSelection.set(key, newEnv);
-        if (!this.isSameEnvironment(oldEnv, newEnv)) {
-            await this.fireActiveEnvironmentEvents([
-                {
-                    uri: this.getActiveSelectionUri(uri, manager, latestProject),
-                    old: oldEnv,
-                    new: newEnv,
-                },
-            ]);
-        }
-    }
-
     private beginPendingSelection(scope: Uri, manager: InternalEnvironmentManager): PendingEnvironmentSelection {
         const project = this.pm.get(scope);
         const key = this.getActiveSelectionKey(scope, manager, project);
@@ -819,16 +701,11 @@ export class PythonEnvironmentManagers implements EnvironmentManagers {
             project,
             key,
             operation: this.beginSelectionOperation(key),
-            publishInlineSelection: this.shouldPublishInlineSelectionImmediately(scope, manager),
             inlineClearOperation:
                 manager.id === INLINE_SCRIPT_MANAGER_ID
                     ? undefined
                     : this.beginSelectionOperation(this.getInlineScriptSelectionKey(scope)),
         };
-    }
-
-    private shouldPublishInlineSelectionImmediately(scope: Uri, manager: InternalEnvironmentManager): boolean {
-        return manager.id !== INLINE_SCRIPT_MANAGER_ID || this.inlineScriptRouting.shouldRoute(scope);
     }
 
     private clearInlineActiveSelection(
@@ -920,6 +797,5 @@ interface PendingEnvironmentSelection {
     readonly project: PythonProject | undefined;
     readonly key: string;
     readonly operation: number;
-    readonly publishInlineSelection: boolean;
     readonly inlineClearOperation: number | undefined;
 }

@@ -5,7 +5,6 @@ import assert from 'assert';
 import * as sinon from 'sinon';
 import { Disposable, LogOutputChannel, Uri } from 'vscode';
 import { EnvironmentManager, PythonEnvironmentApi } from '../../../../api';
-import { InlineScriptRoutingRegistry } from '../../../../common/inlineScript/routingRegistry';
 import * as pythonApi from '../../../../features/pythonApi';
 import * as helpers from '../../../../helpers';
 import { registerInlineScriptFeatures } from '../../../../managers/builtin/inlineScript/main';
@@ -35,7 +34,6 @@ suite('registerInlineScriptFeatures (feature-flag gate)', () => {
     const nativeFinder = {} as NativePythonFinder;
     const baseManager = {} as EnvironmentManager;
     const globalStorageUri = Uri.file('inline-script-global-storage');
-    const routingRegistry = new InlineScriptRoutingRegistry();
 
     setup(() => {
         isEnabledStub = sinon.stub(helpers, 'isInlineScriptsFeatureEnabled');
@@ -53,14 +51,7 @@ suite('registerInlineScriptFeatures (feature-flag gate)', () => {
         isEnabledStub.returns(false);
         const disposables: Disposable[] = [];
 
-        await registerInlineScriptFeatures(
-            nativeFinder,
-            disposables,
-            makeFakeLog(),
-            baseManager,
-            globalStorageUri,
-            routingRegistry,
-        );
+        await registerInlineScriptFeatures(nativeFinder, disposables, makeFakeLog(), baseManager, globalStorageUri);
 
         assert.strictEqual(disposables.length, 0, 'no disposables should be added when flag is off');
         assert.strictEqual(getPythonApiStub.called, false, 'should not even call getPythonApi when gated off');
@@ -71,14 +62,7 @@ suite('registerInlineScriptFeatures (feature-flag gate)', () => {
         isEnabledStub.returns(true);
         const disposables: Disposable[] = [];
 
-        await registerInlineScriptFeatures(
-            nativeFinder,
-            disposables,
-            makeFakeLog(),
-            baseManager,
-            globalStorageUri,
-            routingRegistry,
-        );
+        await registerInlineScriptFeatures(nativeFinder, disposables, makeFakeLog(), baseManager, globalStorageUri);
 
         assert.strictEqual(getPythonApiStub.callCount, 1);
         assert.strictEqual(registerEnvironmentManagerStub.callCount, 1);

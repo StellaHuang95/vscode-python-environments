@@ -11,20 +11,16 @@ import { Uri } from 'vscode';
 import { PythonEnvironment } from '../../../api';
 import {
     CacheEntrySummary,
-    MAX_SOURCE_METADATA_IDENTITY_HASHES,
-    SOURCE_METADATA_IDENTITY_HASH_HEX_LENGTH,
     INLINE_SCRIPT_CACHE_DIR_NAME,
     InlineScriptEnvMeta,
     META_JSON_FILENAME,
     META_SCHEMA_VERSION,
     getBaseInterpreterStatus,
-    hashSourceMetadataIdentity,
     getMetaJsonPath,
     getScriptEnvCacheRoot,
     getScriptEnvDir,
     inspectOwnedCacheEntry,
     inspectMetaJson,
-    mergeSourceMetadataIdentityHashes,
     readMetaJson,
     resolveCacheEntryPath,
     selectStaleEntries,
@@ -93,9 +89,7 @@ suite('inlineScriptCacheLayout', () => {
         });
 
         test('writeMetaJson then readMetaJson returns the same object', async () => {
-            const meta = makeMeta({
-                sourceMetadataIdentityHashes: [hashSourceMetadataIdentity('{"requiresPython":">=3.11","dependencies":["requests"]}')],
-            });
+            const meta = makeMeta();
             await writeMetaJson(envDir, meta);
             const read = await readMetaJson(envDir);
             assert.deepStrictEqual(read, meta);
@@ -196,11 +190,6 @@ suite('inlineScriptCacheLayout', () => {
             assert.deepStrictEqual(await inspectMetaJson(envDir), { kind: 'valid', metadata });
         });
 
-        test('classifies a newer schema as unsupported without treating it as malformed', async () => {
-            await writeRaw(JSON.stringify({ ...makeMeta(), schemaVersion: 99 }));
-            assert.deepStrictEqual(await inspectMetaJson(envDir), { kind: 'unsupported' });
-        });
-
         test('classifies non-ENOENT sidecar stat failures as unavailable', async () => {
             sinon.stub(fsExtra, 'lstat').rejects(Object.assign(new Error('permission denied'), { code: 'EACCES' }));
             assert.deepStrictEqual(await inspectMetaJson(envDir), { kind: 'unavailable' });
@@ -244,10 +233,11 @@ suite('inlineScriptCacheLayout', () => {
             );
         });
 
-        test('classifies a newer schemaVersion as unsupported', async () => {
+        test('returns undefined for an unknown schemaVersion', async () => {
             await writeRaw(JSON.stringify({ ...makeMeta(), schemaVersion: 99 }));
-            const result = await inspectMetaJson(envDir);
-            assert.deepStrictEqual(result, { kind: 'unsupported' });
+            const result = await readMetaJson(envDir);
+            assert.strictEqual(result, undefined);
+            assert.ok(traceWarnStub.called);
         });
 
         test('returns undefined when baseInterpreterPath is missing', async () => {
@@ -280,31 +270,6 @@ suite('inlineScriptCacheLayout', () => {
             await writeRaw(JSON.stringify(partial));
             assert.strictEqual(await readMetaJson(envDir), undefined);
             await writeRaw(JSON.stringify({ ...makeMeta(), baseInterpreterVersion: '   ' }));
-            assert.strictEqual(await readMetaJson(envDir), undefined);
-        });
-
-        test('returns undefined for malformed sourceMetadataIdentityHashes', async () => {
-            await writeRaw(JSON.stringify({ ...makeMeta(), sourceMetadataIdentityHashes: 'not-an-array' }));
-            assert.strictEqual(await readMetaJson(envDir), undefined);
-            await writeRaw(JSON.stringify({ ...makeMeta(), sourceMetadataIdentityHashes: [] }));
-            assert.strictEqual(await readMetaJson(envDir), undefined);
-            await writeRaw(JSON.stringify({ ...makeMeta(), sourceMetadataIdentityHashes: ['bad-hash'] }));
-            assert.strictEqual(await readMetaJson(envDir), undefined);
-        });
-
-        test('returns undefined for duplicate or oversized sourceMetadataIdentityHashes', async () => {
-            const hash = hashSourceMetadataIdentity('same');
-            await writeRaw(JSON.stringify({ ...makeMeta(), sourceMetadataIdentityHashes: [hash, hash] }));
-            assert.strictEqual(await readMetaJson(envDir), undefined);
-            await writeRaw(
-                JSON.stringify({
-                    ...makeMeta(),
-                    sourceMetadataIdentityHashes: Array.from(
-                        { length: MAX_SOURCE_METADATA_IDENTITY_HASHES + 1 },
-                        (_, index) => hashSourceMetadataIdentity(`id-${index}`),
-                    ),
-                }),
-            );
             assert.strictEqual(await readMetaJson(envDir), undefined);
         });
 
@@ -369,36 +334,11 @@ suite('inlineScriptCacheLayout', () => {
             assert.strictEqual('_internal' in result, false);
         });
 
-        test('old sidecars without sourceMetadataIdentityHashes remain valid', async () => {
-            const result = await inspectMetaJson(envDir);
-            assert.deepStrictEqual(result, { kind: 'missing' });
-            await writeRaw(JSON.stringify(makeMeta()));
-            assert.ok(await readMetaJson(envDir));
-        });
-
         test('returns undefined when the sidecar path is a directory rather than a file', async () => {
             await fs.remove(getMetaJsonPath(envDir).fsPath).catch(() => undefined);
             await fs.ensureDir(getMetaJsonPath(envDir).fsPath);
             assert.strictEqual(await readMetaJson(envDir), undefined);
             assert.ok(traceWarnStub.called);
-        });
-
-        suite('source metadata hash helpers', () => {
-            test('hashSourceMetadataIdentity returns fixed-size lowercase hex', () => {
-                const hash = hashSourceMetadataIdentity('metadata-identity');
-                assert.strictEqual(hash.length, SOURCE_METADATA_IDENTITY_HASH_HEX_LENGTH);
-                assert.ok(/^[0-9a-f]+$/.test(hash));
-            });
-
-            test('mergeSourceMetadataIdentityHashes dedupes and caps the newest hashes', () => {
-                const hashes = Array.from({ length: MAX_SOURCE_METADATA_IDENTITY_HASHES }, (_, index) =>
-                    hashSourceMetadataIdentity(`id-${index}`),
-                );
-                const merged = mergeSourceMetadataIdentityHashes(hashes, hashSourceMetadataIdentity('latest'));
-                assert.ok(merged);
-                assert.strictEqual(merged.length, MAX_SOURCE_METADATA_IDENTITY_HASHES);
-                assert.strictEqual(merged[merged.length - 1], hashSourceMetadataIdentity('latest'));
-            });
         });
 
         test('returns undefined when the sidecar exceeds the size cap (1 MiB)', async () => {
