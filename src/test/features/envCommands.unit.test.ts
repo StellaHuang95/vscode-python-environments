@@ -1,12 +1,21 @@
 import * as assert from 'assert';
+import * as path from 'path';
 import * as sinon from 'sinon';
 import * as typeMoq from 'typemoq';
-import { Uri } from 'vscode';
+import { Uri, WorkspaceFolder } from 'vscode';
 import { PythonEnvironment, PythonProject } from '../../api';
 import * as commandApi from '../../common/command.api';
+import { INLINE_SCRIPT_MANAGER_ID } from '../../common/constants';
 import * as managerApi from '../../common/pickers/managers';
 import * as projectApi from '../../common/pickers/projects';
-import { createAnyEnvironmentCommand, removePythonProject, revealEnvInManagerView } from '../../features/envCommands';
+import * as windowApis from '../../common/window.apis';
+import * as workspaceApis from '../../common/workspace.apis';
+import {
+    clearScriptEnvironmentCacheCommand,
+    createAnyEnvironmentCommand,
+    removePythonProject,
+    revealEnvInManagerView,
+} from '../../features/envCommands';
 import * as settingHelpers from '../../features/settings/settingHelpers';
 import { EnvManagerView } from '../../features/views/envManagersView';
 import { ProjectEnvironment, ProjectItem } from '../../features/views/treeViewItems';
@@ -204,6 +213,7 @@ suite('Remove Python Project Command Tests', () => {
         } as unknown as PythonProjectManager;
         sinon.stub(settingHelpers, 'removePythonProjectSetting').callsFake(async () => {
             calls.push('removeSetting');
+            return [];
         });
 
         await removePythonProject(item, projectManager, envManagers);
@@ -213,6 +223,244 @@ suite('Remove Python Project Command Tests', () => {
             (envManagers.setEnvironment as sinon.SinonStub).calledOnceWithExactly(project.uri, undefined),
             'Should clear the project environment through the central manager',
         );
+    });
+});
+
+suite('Clear Script Environment Cache Command Tests', () => {
+    const workspacePath = process.platform === 'win32' ? 'C:\\workspace' : '/workspace';
+    const workspaceFolder: WorkspaceFolder = {
+        uri: Uri.file(workspacePath),
+        name: 'workspace',
+        index: 0,
+    };
+
+    teardown(() => {
+        sinon.restore();
+    });
+
+    test('cancels without clearing the cache or touching project settings', async () => {
+        const clearCache = sinon.stub().resolves();
+        const envManagers = {
+            getEnvironmentManager: sinon.stub().withArgs(INLINE_SCRIPT_MANAGER_ID).returns({
+                supportsClearCache: () => true,
+                clearCache,
+            }),
+        } as unknown as EnvironmentManagers;
+        const projectManager = {
+            getProjects: sinon.stub().returns([]),
+            create: sinon.stub(),
+            remove: sinon.stub(),
+        } as unknown as PythonProjectManager;
+        sinon.stub(windowApis, 'showWarningMessage').resolves(undefined);
+        sinon.stub(workspaceApis, 'getWorkspaceFolders').returns([]);
+        const removeSettings = sinon.stub(settingHelpers, 'removePythonProjectSetting').resolves([]);
+
+        await clearScriptEnvironmentCacheCommand(envManagers, projectManager);
+
+        sinon.assert.notCalled(clearCache);
+        sinon.assert.notCalled(removeSettings);
+        sinon.assert.notCalled(projectManager.remove as sinon.SinonStub);
+    });
+
+    test('clears the cache and removes only inline-script projects returned by the settings cleanup', async () => {
+        const inlineProject: PythonProject = {
+            uri: Uri.file(path.join(workspacePath, 'script.py')),
+            name: 'script.py',
+        };
+        const clearCache = sinon.stub().resolves();
+        const envManagers = {
+            getEnvironmentManager: sinon.stub().withArgs(INLINE_SCRIPT_MANAGER_ID).returns({
+                supportsClearCache: () => true,
+                clearCache,
+            }),
+        } as unknown as EnvironmentManagers;
+        const projectManager = {
+            getProjects: sinon.stub().returns([inlineProject]),
+            create: sinon.stub().callsFake((name: string, uri: Uri) => ({ name, uri })),
+            remove: sinon.stub(),
+        } as unknown as PythonProjectManager;
+        sinon.stub(windowApis, 'showWarningMessage').resolves('Clear Cache' as never);
+        sinon.stub(workspaceApis, 'getWorkspaceFolders').returns([workspaceFolder]);
+        sinon.stub(workspaceApis, 'getConfiguration').returns({
+            get: (key: string) =>
+                key === 'pythonProjects'
+                    ? [
+                          {
+                              path: 'script.py',
+                              envManager: INLINE_SCRIPT_MANAGER_ID,
+                              packageManager: 'ms-python.python:pip',
+                          },
+                          {
+                              path: 'other.py',
+                              envManager: 'ms-python.python:venv',
+                              packageManager: 'ms-python.python:pip',
+                          },
+                      ]
+                    : [],
+            inspect: (key: string) =>
+                key === 'pythonProjects'
+                    ? {
+                          workspaceValue: [
+                              {
+                                  path: 'script.py',
+                                  envManager: INLINE_SCRIPT_MANAGER_ID,
+                                  packageManager: 'ms-python.python:pip',
+                              },
+                              {
+                                  path: 'other.py',
+                                  envManager: 'ms-python.python:venv',
+                                  packageManager: 'ms-python.python:pip',
+                              },
+                          ],
+                          workspaceFolderValue: undefined,
+                      }
+                    : undefined,
+        } as never);
+        const removeSettings = sinon.stub(settingHelpers, 'removePythonProjectSetting').resolves([inlineProject]);
+
+        await clearScriptEnvironmentCacheCommand(envManagers, projectManager);
+
+        sinon.assert.calledOnce(clearCache);
+        sinon.assert.calledOnceWithExactly(removeSettings, [
+            {
+                project: inlineProject,
+                envManager: INLINE_SCRIPT_MANAGER_ID,
+            },
+        ]);
+        sinon.assert.calledOnceWithExactly(projectManager.remove as sinon.SinonStub, [inlineProject]);
+    });
+
+    test('includes inline-script projects without a .py extension', async () => {
+        const inlineProjectUri = Uri.file(path.join(workspacePath, 'runner'));
+        const clearCache = sinon.stub().resolves();
+        const envManagers = {
+            getEnvironmentManager: sinon.stub().withArgs(INLINE_SCRIPT_MANAGER_ID).returns({
+                supportsClearCache: () => true,
+                clearCache,
+            }),
+        } as unknown as EnvironmentManagers;
+        const projectManager = {
+            getProjects: sinon.stub().returns([]),
+            create: sinon.stub().callsFake((name: string, uri: Uri) => ({ name, uri })),
+            remove: sinon.stub(),
+        } as unknown as PythonProjectManager;
+        sinon.stub(windowApis, 'showWarningMessage').resolves('Clear Cache' as never);
+        sinon.stub(workspaceApis, 'getWorkspaceFolders').returns([workspaceFolder]);
+        sinon.stub(workspaceApis, 'getConfiguration').returns({
+            get: (key: string) =>
+                key === 'pythonProjects'
+                    ? [
+                          {
+                              path: 'runner',
+                              envManager: INLINE_SCRIPT_MANAGER_ID,
+                              packageManager: 'ms-python.python:pip',
+                          },
+                          {
+                              path: 'unrelated',
+                              envManager: 'ms-python.python:venv',
+                              packageManager: 'ms-python.python:pip',
+                          },
+                      ]
+                    : [],
+            inspect: (key: string) =>
+                key === 'pythonProjects'
+                    ? {
+                          workspaceValue: [
+                              {
+                                  path: 'runner',
+                                  envManager: INLINE_SCRIPT_MANAGER_ID,
+                                  packageManager: 'ms-python.python:pip',
+                              },
+                              {
+                                  path: 'unrelated',
+                                  envManager: 'ms-python.python:venv',
+                                  packageManager: 'ms-python.python:pip',
+                              },
+                          ],
+                          workspaceFolderValue: undefined,
+                      }
+                    : undefined,
+        } as never);
+        const removeSettings = sinon
+            .stub(settingHelpers, 'removePythonProjectSetting')
+            .callsFake(async (edits) => [edits[0].project]);
+
+        await clearScriptEnvironmentCacheCommand(envManagers, projectManager);
+
+        assert.strictEqual(removeSettings.callCount, 1);
+        assert.strictEqual(removeSettings.firstCall.args[0].length, 1);
+        assert.strictEqual(removeSettings.firstCall.args[0][0].envManager, INLINE_SCRIPT_MANAGER_ID);
+        assert.strictEqual(removeSettings.firstCall.args[0][0].project.uri.fsPath, inlineProjectUri.fsPath);
+        assert.strictEqual((projectManager.create as sinon.SinonStub).callCount, 1);
+        assert.strictEqual((projectManager.create as sinon.SinonStub).firstCall.args[0], 'runner');
+        assert.strictEqual(
+            (projectManager.create as sinon.SinonStub).firstCall.args[1].fsPath.toLowerCase(),
+            inlineProjectUri.fsPath.toLowerCase(),
+        );
+        sinon.assert.notCalled(projectManager.remove as sinon.SinonStub);
+    });
+
+    test('removes a hidden inline workspace entry when a folder override exists for the same URI', async () => {
+        const projectUri = Uri.file(path.join(workspacePath, 'script.py'));
+        const visibleProject: PythonProject = {
+            uri: projectUri,
+            name: 'script.py',
+        };
+        const clearCache = sinon.stub().resolves();
+        const envManagers = {
+            getEnvironmentManager: sinon.stub().withArgs(INLINE_SCRIPT_MANAGER_ID).returns({
+                supportsClearCache: () => true,
+                clearCache,
+            }),
+        } as unknown as EnvironmentManagers;
+        const projectManager = {
+            getProjects: sinon.stub().returns([visibleProject]),
+            create: sinon.stub(),
+            remove: sinon.stub(),
+        } as unknown as PythonProjectManager;
+        sinon.stub(windowApis, 'showWarningMessage').resolves('Clear Cache' as never);
+        sinon.stub(workspaceApis, 'getWorkspaceFolders').returns([workspaceFolder]);
+        sinon.stub(workspaceApis, 'getConfiguration').returns({
+            get: (key: string) =>
+                key === 'pythonProjects'
+                    ? [
+                          {
+                              path: 'script.py',
+                              envManager: 'ms-python.python:venv',
+                              packageManager: 'ms-python.python:pip',
+                          },
+                      ]
+                    : [],
+            inspect: (key: string) =>
+                key === 'pythonProjects'
+                    ? {
+                          workspaceValue: [
+                              {
+                                  path: 'script.py',
+                                  envManager: INLINE_SCRIPT_MANAGER_ID,
+                                  packageManager: 'ms-python.python:pip',
+                              },
+                          ],
+                          workspaceFolderValue: [
+                              {
+                                  path: 'script.py',
+                                  envManager: 'ms-python.python:venv',
+                                  packageManager: 'ms-python.python:pip',
+                              },
+                          ],
+                      }
+                    : undefined,
+        } as never);
+        const removeSettings = sinon
+            .stub(settingHelpers, 'removePythonProjectSetting')
+            .callsFake(async (edits) => [edits[0].project]);
+
+        await clearScriptEnvironmentCacheCommand(envManagers, projectManager);
+
+        assert.strictEqual(removeSettings.callCount, 1);
+        assert.strictEqual(removeSettings.firstCall.args[0].length, 1);
+        assert.strictEqual(removeSettings.firstCall.args[0][0].project.uri.fsPath, visibleProject.uri.fsPath);
+        assert.strictEqual(removeSettings.firstCall.args[0][0].envManager, INLINE_SCRIPT_MANAGER_ID);
     });
 });
 

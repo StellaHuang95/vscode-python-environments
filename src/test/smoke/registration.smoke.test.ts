@@ -65,6 +65,7 @@ suite('Smoke: Registration Checks', function () {
             'python-envs.setPkgManager',
             'python-envs.refreshAllManagers',
             'python-envs.clearCache',
+            'python-envs.clearScriptEnvCache',
             'python-envs.searchSettings',
 
             // Package management

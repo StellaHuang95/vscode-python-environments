@@ -45,6 +45,7 @@ import { ProjectCreatorsImpl } from './features/creators/projectCreators';
 import {
     addPythonProjectCommand,
     copyPathToClipboard,
+    clearScriptEnvironmentCacheCommand,
     createAnyEnvironmentCommand,
     createEnvironmentCommand,
     createTerminalCommand,
@@ -370,6 +371,9 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
             await clearPersistentState();
             await envManagers.clearCache(undefined);
             await clearShellProfileCache(shellStartupProviders);
+        }),
+        commands.registerCommand('python-envs.clearScriptEnvCache', async () => {
+            await clearScriptEnvironmentCacheCommand(envManagers, projectManager);
         }),
         commands.registerCommand('python-envs.runInTerminal', (item) => {
             return runInTerminalCommand(item, api, terminalManager);

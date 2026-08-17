@@ -144,7 +144,11 @@ suite('InlineScriptEnvManager', () => {
                     persistedAssociations = value;
                 }
             }),
-            clear: sinon.stub(),
+            clear: sinon.stub().callsFake(async (keys?: string[]) => {
+                if (!keys || keys.includes(INLINE_SCRIPT_ENVS_KEY)) {
+                    persistedAssociations = undefined;
+                }
+            }),
         };
         sinon.stub(persistentState, 'getWorkspacePersistentState').resolves(workspaceState);
 
@@ -2157,6 +2161,315 @@ suite('InlineScriptEnvManager', () => {
             assert.strictEqual(await manager.get(valid), undefined);
             assert.strictEqual(await manager.get(undefined), undefined);
             assert.strictEqual(await manager.get(Uri.parse('untitled:script.py')), undefined);
+        });
+    });
+
+    suite('clear cache', () => {
+        test('clears cached environments, persisted associations, and in-memory selections', async () => {
+            const first = scriptUri('first.py');
+            const second = scriptUri('second.py');
+            const environment = await createOwnedEnvironment();
+            await manager.set([first, second], environment);
+            const listener = sinon.spy();
+            manager.onDidChangeEnvironment(listener);
+
+            await manager.clearCache();
+
+            assert.strictEqual(await fs.pathExists(envDir().fsPath), false);
+            assert.strictEqual(persistedAssociations, undefined);
+            assert.strictEqual(await manager.get(first), undefined);
+            assert.strictEqual(await manager.get(second), undefined);
+            assert.deepStrictEqual(
+                listener.getCalls().map((call) => normalizePath(call.args[0].uri.fsPath)).sort(),
+                [first.fsPath, second.fsPath].map((value) => normalizePath(value)).sort(),
+            );
+            assert.deepStrictEqual(
+                listener.getCalls().map((call) => call.args[0].old),
+                [environment, environment],
+            );
+            assert.ok(listener.getCalls().every((call) => call.args[0].new === undefined));
+        });
+
+        test('clears associations even when the cache directory is already missing', async () => {
+            const uri = scriptUri();
+            const environment = await createOwnedEnvironment();
+            await manager.set(uri, environment);
+            const listener = sinon.spy();
+            manager.onDidChangeEnvironment(listener);
+            await fs.remove(cacheLayout.getScriptEnvCacheRoot(globalStorageUri).fsPath);
+
+            await manager.clearCache();
+
+            assert.strictEqual(persistedAssociations, undefined);
+            assert.strictEqual(await manager.get(uri), undefined);
+            assert.strictEqual(listener.callCount, 1);
+            assert.strictEqual(normalizePath(listener.firstCall.args[0].uri.fsPath), normalizePath(uri.fsPath));
+            assert.strictEqual(listener.firstCall.args[0].old, environment);
+            assert.strictEqual(listener.firstCall.args[0].new, undefined);
+        });
+
+        test('is idempotent when the cache and associations are already absent', async () => {
+            const listener = sinon.spy();
+            manager.onDidChangeEnvironment(listener);
+
+            await manager.clearCache();
+            await manager.clearCache();
+
+            assert.strictEqual(persistedAssociations, undefined);
+            assert.strictEqual(listener.callCount, 0);
+        });
+
+        test('refuses to clear from an unsafe cache root', async function () {
+            if (isWindows() && !process.env.SystemDrive) {
+                this.skip();
+            }
+            const unsafeManager = new InlineScriptEnvManager(
+                nativeFinder,
+                api,
+                baseManager,
+                Uri.file(process.platform === 'win32' ? `${process.env.SystemDrive ?? 'C:'}\\` : '/'),
+                makeFakeLog(),
+            );
+
+            await assert.rejects(
+                unsafeManager.clearCache(),
+                /unsafe cache root/,
+            );
+
+            unsafeManager.dispose();
+        });
+
+        test('refuses to clear a symlinked cache root', async function () {
+            const symlinkStorageUri = Uri.file(path.join(tempRoot, 'symlink-storage'));
+            const symlinkManager = new InlineScriptEnvManager(
+                nativeFinder,
+                api,
+                baseManager,
+                symlinkStorageUri,
+                makeFakeLog(),
+            );
+            const realCacheRoot = cacheLayout.getScriptEnvCacheRoot(symlinkStorageUri).fsPath;
+            const externalCacheRoot = path.join(tempRoot, 'external-cache-root');
+            await fs.ensureDir(symlinkStorageUri.fsPath);
+            await fs.ensureDir(externalCacheRoot);
+            try {
+                await fs.symlink(externalCacheRoot, realCacheRoot, process.platform === 'win32' ? 'junction' : 'dir');
+            } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code;
+                if (code === 'EPERM' || code === 'EACCES') {
+                    this.skip();
+                }
+                throw error;
+            }
+
+            await assert.rejects(
+                symlinkManager.clearCache(),
+                /not a normal directory/,
+            );
+
+            symlinkManager.dispose();
+        });
+
+        test('refuses to clear when globalStorage is redirected through a symlink or junction', async function () {
+            const physicalStoragePath = path.join(tempRoot, 'physical-storage');
+            const redirectedStoragePath = path.join(tempRoot, 'redirected-storage');
+            await fs.ensureDir(physicalStoragePath);
+            await fs.ensureDir(redirectedStoragePath);
+            const redirectedManager = new InlineScriptEnvManager(
+                nativeFinder,
+                api,
+                baseManager,
+                Uri.file(redirectedStoragePath),
+                makeFakeLog(),
+            );
+            try {
+                await fs.remove(redirectedStoragePath);
+                await fs.symlink(
+                    physicalStoragePath,
+                    redirectedStoragePath,
+                    process.platform === 'win32' ? 'junction' : 'dir',
+                );
+            } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code;
+                if (code === 'EPERM' || code === 'EACCES') {
+                    this.skip();
+                }
+                throw error;
+            }
+
+            await assert.rejects(redirectedManager.clearCache(), /global storage root is not a normal directory/);
+
+            redirectedManager.dispose();
+        });
+
+        test('fails closed when physical cache verification reports a redirected root', async () => {
+            const internalManager = manager as unknown as {
+                getPhysicalOwnedCacheRootPath(cacheRoot: Uri): Promise<string | undefined>;
+            };
+            const original = internalManager.getPhysicalOwnedCacheRootPath.bind(manager);
+            internalManager.getPhysicalOwnedCacheRootPath = async () => {
+                throw new Error('Refusing to clear the script environment cache because the cache root is redirected.');
+            };
+            try {
+                await assert.rejects(manager.clearCache(), /cache root is redirected/);
+            } finally {
+                internalManager.getPhysicalOwnedCacheRootPath = original;
+            }
+        });
+
+        test('refuses to clear while a cached environment is locked', async () => {
+            const uri = scriptUri();
+            const environment = await createOwnedEnvironment();
+            await manager.set(uri, environment);
+            const lockPath = lockfileApis.getFileLockPath(environment.sysPrefix);
+            await fs.ensureDir(lockPath);
+            await fs.writeFile(path.join(lockPath, `owner-${process.pid}-test`), '');
+
+            await assert.rejects(manager.clearCache(), /being created/);
+
+            assert.deepStrictEqual(persistedAssociations, {
+                [normalizePath(uri.fsPath)]: environment.environmentPath.fsPath,
+            });
+            assert.strictEqual(await manager.get(uri), environment);
+        });
+
+        test('clears a retained lock and its corresponding cache entry', async () => {
+            const retainedCacheDir = envDir().fsPath;
+            const retainedLockPath = lockfileApis.getFileLockPath(retainedCacheDir);
+            await fs.outputFile(venvPythonPath(retainedCacheDir), '');
+            await fs.ensureDir(retainedLockPath);
+            await fs.writeFile(path.join(retainedLockPath, 'retained'), '');
+
+            await manager.clearCache();
+
+            assert.strictEqual(await fs.pathExists(retainedCacheDir), false);
+            assert.strictEqual(await fs.pathExists(retainedLockPath), false);
+        });
+
+        test('clears a stale owner lock and its corresponding cache entry', async () => {
+            const uri = scriptUri();
+            const environment = await createOwnedEnvironment();
+            await manager.set(uri, environment);
+            const staleLockPath = lockfileApis.getFileLockPath(environment.sysPrefix);
+            await fs.ensureDir(staleLockPath);
+            await fs.writeFile(path.join(staleLockPath, 'owner-424242-dead'), '');
+            const originalInspectFileLock = lockfileApis.inspectFileLock;
+            sinon.stub(lockfileApis, 'inspectFileLock').callsFake(async (filePath, options) => {
+                if (normalizePath(filePath) === normalizePath(environment.sysPrefix)) {
+                    return 'stale';
+                }
+                return originalInspectFileLock(filePath, options);
+            });
+
+            await manager.clearCache();
+
+            assert.strictEqual(await fs.pathExists(environment.sysPrefix), false);
+            assert.strictEqual(await fs.pathExists(staleLockPath), false);
+            assert.strictEqual(await manager.get(uri), undefined);
+        });
+
+        test('rejects an orphaned lock directory conservatively', async () => {
+            const uri = scriptUri();
+            const environment = await createOwnedEnvironment();
+            await manager.set(uri, environment);
+            await fs.ensureDir(lockfileApis.getFileLockPath(environment.sysPrefix));
+
+            await assert.rejects(manager.clearCache(), /incomplete or malformed/);
+
+            assert.strictEqual(await fs.pathExists(environment.sysPrefix), true);
+            assert.strictEqual(await manager.get(uri), environment);
+        });
+
+        test('surfaces a persistence failure after clearing disk and memory state', async () => {
+            const uri = scriptUri();
+            const environment = await createOwnedEnvironment();
+            await manager.set(uri, environment);
+            const listener = sinon.spy();
+            manager.onDidChangeEnvironment(listener);
+            workspaceState.clear.onFirstCall().rejects(new Error('Memento unavailable'));
+
+            await assert.rejects(manager.clearCache(), /Memento unavailable/);
+
+            assert.strictEqual(await fs.pathExists(envDir().fsPath), false);
+            assert.strictEqual(await manager.get(uri), undefined);
+            assert.strictEqual(listener.callCount, 1);
+            assert.strictEqual(normalizePath(listener.firstCall.args[0].uri.fsPath), normalizePath(uri.fsPath));
+            assert.strictEqual(listener.firstCall.args[0].old, environment);
+            assert.strictEqual(listener.firstCall.args[0].new, undefined);
+        });
+
+        test('does not let a pending rehydration restore an association after clear cache', async () => {
+            const uri = scriptUri();
+            const environment = await createOwnedEnvironment();
+            persistedAssociations = { [normalizePath(uri.fsPath)]: environment.environmentPath.fsPath };
+            let resolveRehydration: ((value: PythonEnvironment | undefined) => void) | undefined;
+            resolveVenvStub.callsFake(
+                () =>
+                    new Promise<PythonEnvironment | undefined>((resolve) => {
+                        resolveRehydration = resolve;
+                    }),
+            );
+            const listener = sinon.spy();
+            manager.onDidChangeEnvironment(listener);
+
+            const pendingGet = manager.get(uri);
+            await waitForStubCall(resolveVenvStub);
+            await manager.clearCache();
+            resolveRehydration!(environment);
+
+            assert.strictEqual(await pendingGet, undefined);
+            assert.strictEqual(await manager.get(uri), undefined);
+            assert.strictEqual(listener.callCount, 0);
+        });
+
+        test('rejects clear when creation started before the clear request', async () => {
+            const uri = scriptUri();
+            let resolveMetadata: ((value: metadataReader.InlineScriptMetadata | undefined) => void) | undefined;
+            readMetadataStub.callsFake(
+                () =>
+                    new Promise<metadataReader.InlineScriptMetadata | undefined>((resolve) => {
+                        resolveMetadata = resolve;
+                    }),
+            );
+
+            const createPromise = manager.create(uri);
+
+            await assert.rejects(manager.clearCache(), /being created/);
+            resolveMetadata!(VALID_METADATA);
+            assert.ok(await createPromise);
+            assert.strictEqual(await fs.pathExists(envDir().fsPath), true);
+        });
+
+        test('queues create behind a clear request that started first', async () => {
+            const uri = scriptUri();
+            let releaseClear: (() => void) | undefined;
+            let signalClearStarted: (() => void) | undefined;
+            const clearStarted = new Promise<void>((resolve) => {
+                signalClearStarted = resolve;
+            });
+            workspaceState.clear.callsFake(
+                async (keys?: string[]) =>
+                    new Promise<void>((resolve) => {
+                        signalClearStarted!();
+                        releaseClear = () => {
+                            if (!keys || keys.includes(INLINE_SCRIPT_ENVS_KEY)) {
+                                persistedAssociations = undefined;
+                            }
+                            resolve();
+                        };
+                    }),
+            );
+
+            const clearPromise = manager.clearCache();
+            const createPromise = manager.create(uri);
+
+            await clearStarted;
+            assert.strictEqual(readMetadataStub.callCount, 0);
+            releaseClear!();
+            await clearPromise;
+
+            assert.ok(await createPromise);
+            assert.ok(readMetadataStub.calledOnce);
         });
     });
 });
