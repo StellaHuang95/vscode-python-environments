@@ -258,33 +258,47 @@ for many scripts at once?
 
 - **Bulk creation** — user runs `Python Envs: Set Up Environments for Inline Script Files` from the command palette to discover all of them, list every detected inline-script files in a multi-select quick-pick.
 
-- **Single-script creation entry points** — two surfaces, both shown
-  only when the active file is a PEP 723 script with parsed metadata
-  and no matching inline env is currently associated. Ordinary `.py`
-  files and scripts already bound to an up-to-date inline env see no
-  change.
+- **Single-script creation entry point** — show one CodeLens only when
+  the active file is a PEP 723 script with parsed metadata and no
+  matching inline env is currently associated. Ordinary `.py` files
+  and scripts already bound to an up-to-date inline env see no
+  CodeLens.
 
-  - **CodeLens above the inline metadata block** 
-    Anchored to the first line of the `# /// script` block:
+  The CodeLens is anchored to the first line of the `# /// script`
+  block:
 
-    ```
-    📦 Set up environment for this script
-    # /// script
-    # dependencies = ["requests"]
-    # ///
-    ```
+  ```
+  📦 Set up environment for this script
+  # /// script
+  # dependencies = ["requests"]
+  # ///
+  ```
 
-  - **`Select Interpreter` quick-pick top-level item** 
+  Clicking it creates or reuses the inline environment, persists the
+  per-script association, registers the exact script project, and
+  publishes the script's active-environment change.
 
-Question for single-script creation entry points: Today the status bar shows the workspace's env (or
-"Select Python Interpreter" on yellow) for any focused `.py` file. When
-a PEP 723 file has metadata but no dedicated env yet, what does the status bar show?
+- **Status bar — no special treatment (Option A).** Before setup, the
+  status bar continues to show the currently active workspace/default
+  environment, exactly as it does for any other `.py` file. The
+  CodeLens carries setup discoverability.
 
-(A) Don't change it. Status bar shows `Python 3.11 ('.venv')` like any other file. **Becomes the natural choice now that the CodeLens carries discoverability** — the status bar stays predictable and the lens handles the "this file wants its own env" affordance.
+  After setup succeeds, the existing status-bar lookup for the active
+  document naturally resolves the new per-script environment and shows
+  the normal inline display name, for example
+  `Python 3.13.7 (inline)`. No status-bar-specific implementation is
+  required.
 
-(B) Append a hint. E.g., `$(warning) Python 3.11 ('.venv')` with a tooltip "demo.py declares inline metadata not present in this env.". Same click.
+  If setup is cancelled or fails, the current environment remains
+  active and the CodeLens remains available. If saved inline metadata
+  later changes so the associated environment is stale, inline routing
+  is invalidated, the status bar falls back to the workspace/default
+  environment, and the CodeLens becomes available again.
 
-(C) Override label. When metadata is present but the active env wasn't built from it, show `Set up env for demo.py`. 
+The first rollout does not add a special `Select Interpreter`
+top-level item or a separate status-bar treatment PR. Those surfaces
+can be reconsidered from feedback if the CodeLens is not discoverable
+enough.
 
 ## 9. Pylance
 
@@ -422,4 +436,3 @@ feature is working?
 | `inlineScript.envCreated` | trigger, durationMs, basePythonVersion, depCount, success | After every creation attempt |
 | `inlineScript.envReuseHit` | n/a | When ensureEnv finds a usable existing env, no work needed |
 | `inlineScript.envError` | category (no-compatible-python / install-failure / network / lock-timeout) | On creation/sync failure |
-
