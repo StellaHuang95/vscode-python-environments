@@ -26,6 +26,7 @@ export const SOURCE_METADATA_IDENTITY_HASH_HEX_LENGTH = 64;
 export const MAX_SOURCE_METADATA_IDENTITY_HASHES = 8;
 
 const MAX_META_JSON_BYTES = 1024 * 1024;
+const pendingMetaJsonWrites = new Map<string, Promise<void>>();
 
 /**
  * Validated on-disk schema for a cached inline-script environment's
@@ -176,29 +177,76 @@ export async function inspectMetaJson(envDir: Uri): Promise<InlineScriptMetaRead
 }
 
 /**
- * Atomically write the `.meta.json` sidecar via temp-file + rename.
+ * Queue writes for a single sidecar in this process. Production callers also
+ * hold the cache-entry file lock, which serializes this operation across
+ * extension-host processes.
  */
-export async function writeMetaJson(envDir: Uri, meta: InlineScriptEnvMeta): Promise<void> {
-    await fsapi.ensureDir(envDir.fsPath);
+export function writeMetaJson(envDir: Uri, meta: InlineScriptEnvMeta): Promise<void> {
     const finalPath = getMetaJsonPath(envDir).fsPath;
+    const key = normalizePath(path.resolve(finalPath));
+    const previous = pendingMetaJsonWrites.get(key) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(() => writeMetaJsonOnce(envDir, meta, finalPath));
+    let queued: Promise<void>;
+    queued = operation.finally(() => {
+        if (pendingMetaJsonWrites.get(key) === queued) {
+            pendingMetaJsonWrites.delete(key);
+        }
+    });
+    pendingMetaJsonWrites.set(key, queued);
+    return queued;
+}
+
+async function writeMetaJsonOnce(envDir: Uri, meta: InlineScriptEnvMeta, finalPath: string): Promise<void> {
+    await fsapi.ensureDir(envDir.fsPath);
     const tmpSuffix = crypto.randomBytes(6).toString('hex');
     const tmpPath = `${finalPath}.tmp-${tmpSuffix}`;
+    const backupPath = `${finalPath}.backup-${tmpSuffix}`;
     const payload = JSON.stringify(meta, undefined, 2);
+    let hasBackup = false;
+    let finalKnownToExist = false;
+
     try {
         await fsapi.writeFile(tmpPath, payload, 'utf8');
         try {
-            await fsapi.move(tmpPath, finalPath, { overwrite: true });
+            await fsapi.rename(tmpPath, finalPath);
+            finalKnownToExist = true;
+            return;
         } catch (err) {
             const code = (err as NodeJS.ErrnoException | undefined)?.code;
             if (!['EPERM', 'EEXIST', 'EBUSY'].includes(code ?? '')) {
                 throw err;
             }
-            await fsapi.remove(finalPath).catch(() => undefined);
-            await fsapi.move(tmpPath, finalPath, { overwrite: true });
         }
-    } catch (err) {
+
+        try {
+            await fsapi.rename(finalPath, backupPath);
+            hasBackup = true;
+        } catch (err) {
+            if (!isFileNotFoundError(err)) {
+                throw err;
+            }
+        }
+
+        try {
+            await fsapi.rename(tmpPath, finalPath);
+            finalKnownToExist = true;
+        } catch (replaceError) {
+            if (hasBackup) {
+                try {
+                    await fsapi.rename(backupPath, finalPath);
+                    finalKnownToExist = true;
+                } catch {
+                    // Keep the backup: it is the only known copy when
+                    // restoration cannot prove the final sidecar exists.
+                }
+            }
+            throw replaceError;
+        }
+    } finally {
         await fsapi.remove(tmpPath).catch(() => undefined);
-        throw err;
+        if (hasBackup && finalKnownToExist) {
+            await fsapi.remove(backupPath).catch(() => undefined);
+        }
     }
 }
 

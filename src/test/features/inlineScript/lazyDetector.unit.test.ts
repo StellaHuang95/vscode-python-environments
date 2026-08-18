@@ -9,6 +9,7 @@ import * as ism from '../../../common/inlineScript/metadata';
 import { InlineScriptRoutingRegistry } from '../../../common/inlineScript/routingRegistry';
 import { EventNames } from '../../../common/telemetry/constants';
 import * as telemetrySender from '../../../common/telemetry/sender';
+import { createDeferred } from '../../../common/utils/deferred';
 import * as wapi from '../../../common/workspace.apis';
 import { InlineScriptLazyDetector, shouldHandleUri } from '../../../features/inlineScript/lazyDetector';
 
@@ -315,12 +316,42 @@ suite('InlineScriptLazyDetector', () => {
         detector.dispose();
     });
 
-    test('concurrent open + save coalesces to a single read', async () => {
+    test('an in-flight open followed by save reads fresh metadata and cannot publish stale routing data', async () => {
         const uri = Uri.file(path.resolve('/ws/race.py'));
-        readMetadataStub.resolves(VALID_METADATA);
+        const staleRead = createDeferred<ism.InlineScriptMetadata>();
+        const savedMetadata = {
+            ...VALID_METADATA,
+            dependencies: ['saved'],
+        } satisfies ism.InlineScriptMetadata;
+        const savedRead = createDeferred<ism.InlineScriptMetadata>();
+        readMetadataStub.onFirstCall().returns(staleRead.promise);
+        readMetadataStub.onSecondCall().returns(savedRead.promise);
+        routingRegistry.setValidatedAssociation(uri, true);
         const detector = createDetector();
+        const open = openListener!(makeDoc(uri)) as Promise<void>;
+        const save = saveListener!(makeDoc(uri)) as Promise<void>;
+
+        assert.strictEqual(readMetadataStub.callCount, 1, 'save must wait for the older open read');
+        staleRead.resolve(VALID_METADATA);
+        await open;
+        await flushImmediate();
+
+        assert.strictEqual(readMetadataStub.callCount, 2, 'save must trigger a fresh post-save read');
+        assert.strictEqual(routingRegistry.getMetadata(uri), undefined, 'stale open data must not be published');
+        savedRead.resolve(savedMetadata);
+        await save;
+
+        assert.deepStrictEqual(routingRegistry.getMetadata(uri), savedMetadata);
+        assert.strictEqual(routingRegistry.shouldRoute(uri), true);
+        detector.dispose();
+    });
+
+    test('telemetry-only concurrent open + save still coalesces to a single read', async () => {
+        const uri = Uri.file(path.resolve('/ws/telemetry-race.py'));
+        readMetadataStub.resolves(VALID_METADATA);
+        const detector = createDetectorWithoutRouting();
         await Promise.all([fireOpen(uri), fireSave(uri)]);
-        assert.strictEqual(readMetadataStub.callCount, 1, 'concurrent open+save should coalesce to a single read');
+        assert.strictEqual(readMetadataStub.callCount, 1, 'telemetry-only mode should retain the original coalescing');
         detector.dispose();
     });
 
@@ -402,6 +433,35 @@ suite('InlineScriptLazyDetector', () => {
         fireChange(uri, makeContentChanges(metadata!.range.end + 5));
 
         assert.strictEqual(routingRegistry.shouldRoute(uri), true);
+        detector.dispose();
+    });
+
+    test('invalidates routing for a CRLF dependency edit using source offsets', async () => {
+        const uri = Uri.file(path.resolve('/elsewhere/crlf.py'));
+        const source = [
+            '# /// script',
+            ...Array.from({ length: 40 }, () => '#'),
+            '# dependencies = ["requests"]',
+            '# ///',
+            'print("body")',
+        ].join('\r\n');
+        const metadata = ism.readInlineScriptMetadata(source);
+        assert.ok(metadata?.sourceRange, 'parsed metadata should include source offsets');
+        const dependencyOffset = source.indexOf('# dependencies');
+        assert.ok(
+            dependencyOffset >= metadata.range.end,
+            'test requires a raw CRLF dependency offset beyond the normalized range',
+        );
+        assert.ok(dependencyOffset < metadata.sourceRange.end);
+        readMetadataStub.resolves(metadata);
+        routingRegistry.setValidatedAssociation(uri, true);
+        const detector = createDetector();
+
+        await fireOpen(uri);
+        fireChange(uri, makeContentChanges(dependencyOffset));
+
+        assert.strictEqual(routingRegistry.getMetadata(uri), undefined);
+        assert.strictEqual(routingRegistry.shouldRoute(uri), false);
         detector.dispose();
     });
 

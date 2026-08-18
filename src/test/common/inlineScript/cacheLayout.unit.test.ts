@@ -32,6 +32,7 @@ import {
     writeMetaJson,
 } from '../../../common/inlineScript/cacheLayout';
 import * as logging from '../../../common/logging';
+import { createDeferred } from '../../../common/utils/deferred';
 import * as platformUtils from '../../../common/utils/platformUtils';
 import { getVenvPythonPath } from '../../../common/utils/virtualEnvironment';
 
@@ -128,22 +129,129 @@ suite('inlineScriptCacheLayout', () => {
             );
         });
 
-        test('concurrent writeMetaJson calls leave one valid sidecar, never a missing one', async () => {
-            await writeMetaJson(envDir, makeMeta({ lastUsedAt: '2020-01-01T00:00:00.000Z' }));
-            const a = makeMeta({ lastUsedAt: '2025-01-01T00:00:00.000Z' });
-            const b = makeMeta({ lastUsedAt: '2030-01-01T00:00:00.000Z' });
-            await Promise.all([writeMetaJson(envDir, a), writeMetaJson(envDir, b)]);
-            const read = await readMetaJson(envDir);
-            assert.ok(read, 'sidecar must exist after concurrent writes');
-            assert.ok(
-                read.lastUsedAt === a.lastUsedAt || read.lastUsedAt === b.lastUsedAt,
-                `final write must be one of the concurrent payloads, got ${read.lastUsedAt}`,
+        test('restores an existing sidecar when both replacement attempts fail', async () => {
+            const existing = makeMeta({ lastUsedAt: '2020-01-01T00:00:00.000Z' });
+            await writeMetaJson(envDir, existing);
+            const replacementError = Object.assign(new Error('sharing violation'), { code: 'EPERM' });
+            const originalRename = fsExtra.rename;
+            const renameStub = sinon.stub(fsExtra, 'rename') as unknown as sinon.SinonStub;
+            renameStub.callsFake(async (source: string, destination: string) => {
+                switch (renameStub.callCount) {
+                    case 1:
+                    case 3:
+                        throw replacementError;
+                    default:
+                        return originalRename(source, destination);
+                }
+            });
+
+            await assert.rejects(
+                writeMetaJson(envDir, makeMeta({ lastUsedAt: '2030-01-01T00:00:00.000Z' })),
+                (error) => error === replacementError,
             );
+
+            assert.deepStrictEqual(await readMetaJson(envDir), existing);
+            assert.strictEqual(renameStub.callCount, 4, 'retryable replacement failure should restore after retry');
             const entries = await fs.readdir(envDir.fsPath);
             assert.deepStrictEqual(
-                entries.filter((name) => name.includes('.tmp-')),
+                entries.filter((name) => name.includes('.tmp-') || name.includes('.backup-')),
+                [],
+                'failed replacement must clean up temporary and backup files',
+            );
+        });
+
+        test('retains the backup when restoration cannot prove the final sidecar exists', async () => {
+            const existing = makeMeta({ lastUsedAt: '2020-01-01T00:00:00.000Z' });
+            await writeMetaJson(envDir, existing);
+            const replacementError = Object.assign(new Error('sharing violation'), { code: 'EPERM' });
+            const restoreError = Object.assign(new Error('restore failed'), { code: 'EIO' });
+            const originalRename = fsExtra.rename;
+            const renameStub = sinon.stub(fsExtra, 'rename') as unknown as sinon.SinonStub;
+            renameStub.callsFake(async (source: string, destination: string) => {
+                switch (renameStub.callCount) {
+                    case 1:
+                    case 3:
+                        throw replacementError;
+                    case 2:
+                        return originalRename(source, destination);
+                    default:
+                        throw restoreError;
+                }
+            });
+
+            await assert.rejects(
+                writeMetaJson(envDir, makeMeta({ lastUsedAt: '2030-01-01T00:00:00.000Z' })),
+                (error) => error === replacementError,
+            );
+
+            assert.strictEqual(await readMetaJson(envDir), undefined);
+            const entries = await fs.readdir(envDir.fsPath);
+            const backups = entries.filter((name) => name.includes('.backup-'));
+            assert.strictEqual(backups.length, 1, 'failed restoration must retain the only known good copy');
+            assert.deepStrictEqual(
+                JSON.parse(await fs.readFile(path.join(envDir.fsPath, backups[0]), 'utf8')),
+                existing,
+            );
+            assert.deepStrictEqual(entries.filter((name) => name.includes('.tmp-')), []);
+        });
+
+        test('serializes concurrent writes for the same sidecar and retains the latest metadata', async () => {
+            const a = makeMeta({ lastUsedAt: '2025-01-01T00:00:00.000Z' });
+            const b = makeMeta({ lastUsedAt: '2030-01-01T00:00:00.000Z' });
+            const firstRenameStarted = createDeferred<void>();
+            const allowFirstRename = createDeferred<void>();
+            const originalRename = fsExtra.rename;
+            const renameStub = sinon.stub(fsExtra, 'rename') as unknown as sinon.SinonStub;
+            renameStub.callsFake(async (source: string, destination: string) => {
+                if (renameStub.callCount === 1) {
+                    firstRenameStarted.resolve();
+                    await allowFirstRename.promise;
+                }
+                return originalRename(source, destination);
+            });
+
+            const first = writeMetaJson(envDir, a);
+            await firstRenameStarted.promise;
+            const second = writeMetaJson(envDir, b);
+            assert.strictEqual(renameStub.callCount, 1, 'the second same-path write must wait for the first');
+            allowFirstRename.resolve();
+            await Promise.all([first, second]);
+
+            const read = await readMetaJson(envDir);
+            assert.ok(read, 'sidecar must exist after concurrent writes');
+            assert.deepStrictEqual(read, b);
+            const entries = await fs.readdir(envDir.fsPath);
+            assert.deepStrictEqual(
+                entries.filter((name) => name.includes('.tmp-') || name.includes('.backup-')),
                 [],
             );
+        });
+
+        test('does not serialize writes for different sidecars', async () => {
+            const otherEnvDir = Uri.file(path.join(tmpDir, 'other-env'));
+            const firstFinalPath = getMetaJsonPath(envDir).fsPath;
+            const firstRenameStarted = createDeferred<void>();
+            const allowFirstRename = createDeferred<void>();
+            const originalRename = fsExtra.rename;
+            const renameStub = sinon.stub(fsExtra, 'rename') as unknown as sinon.SinonStub;
+            let delayedFirstRename = false;
+            renameStub.callsFake(async (source: string, destination: string) => {
+                if (!delayedFirstRename && destination === firstFinalPath) {
+                    delayedFirstRename = true;
+                    firstRenameStarted.resolve();
+                    await allowFirstRename.promise;
+                }
+                return originalRename(source, destination);
+            });
+
+            const first = writeMetaJson(envDir, makeMeta({ lastUsedAt: '2025-01-01T00:00:00.000Z' }));
+            await firstRenameStarted.promise;
+            const other = makeMeta({ lastUsedAt: '2030-01-01T00:00:00.000Z' });
+            await writeMetaJson(otherEnvDir, other);
+
+            assert.deepStrictEqual(await readMetaJson(otherEnvDir), other);
+            allowFirstRename.resolve();
+            await first;
         });
 
         test('writeMetaJson only serializes environment-level metadata', async () => {

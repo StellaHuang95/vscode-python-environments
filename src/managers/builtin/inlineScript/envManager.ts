@@ -2486,6 +2486,12 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
         return { kind: 'installed', installedPath: promptResult.pythonPath };
     }
 
+    /**
+     * Serializes cache-entry mutation across extension-host processes.
+     * Every `writeMetaJson` call in this manager is either directly inside
+     * this callback or reachable only through `createOrReuseEnvironment`,
+     * which invokes it under this lock.
+     */
     private async withCacheEntryLock<T>(
         envDir: Uri,
         action: (lock: AcquiredFileLock) => Promise<T>,

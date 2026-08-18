@@ -40,9 +40,13 @@ import {
  */
 export class InlineScriptLazyDetector implements Disposable {
     private readonly subscriptions: Disposable[] = [];
-    // In-flight reads keyed by `uri.toString()` so rapid open+save
-    // doesn't double-process the same file.
+    // In-flight reads keyed by `uri.toString()` so rapid open events
+    // don't double-process the same file.
     private readonly inFlight = new Map<string, Promise<void>>();
+    // Routing reads have a generation per URI. A save that arrives while
+    // an older read is in flight advances its generation and queues a
+    // post-save read, preventing the stale read from publishing metadata.
+    private readonly routingReadGenerations = new Map<string, number>();
     // URIs (as `uri.toString()`) for which we have already emitted
     // `inlineScript.detected` in this session. Used to dedup the detection
     // event across repeat opens/saves and to gate `inlineScript.edited` so
@@ -130,6 +134,7 @@ export class InlineScriptLazyDetector implements Disposable {
         this.subscriptions.forEach((s) => s.dispose());
         this.subscriptions.length = 0;
         this.inFlight.clear();
+        this.routingReadGenerations.clear();
     }
 
     private async handleDocument(doc: TextDocument, trigger: 'open' | 'save'): Promise<void> {
@@ -156,28 +161,41 @@ export class InlineScriptLazyDetector implements Disposable {
         const key = uri.toString();
         const existing = this.inFlight.get(key);
         if (existing) {
-            // Coalesce repeated open/save events for the same URI.
-            // We only parse for observation (telemetry), so the most
-            // recent in-flight read is good enough; there is no
-            // cached state downstream that could go stale.
+            if (this.routingRegistry && trigger === 'save') {
+                const routingGeneration = this.advanceRoutingReadGeneration(key);
+                const work = existing.then(() =>
+                    this.processOnce(uri, trigger, shouldHandleUri(uri), routingGeneration),
+                );
+                this.trackInFlight(key, work, routingGeneration);
+                await work;
+                return;
+            }
+            // Coalesce repeated open events, and all events in telemetry-only
+            // mode, where there is no routing state to become stale.
             await existing;
             return;
         }
-        const work = this.processOnce(uri, trigger, shouldHandleUri(uri)).finally(() => {
-            this.inFlight.delete(key);
-        });
-        this.inFlight.set(key, work);
+        const routingGeneration = this.routingRegistry ? this.currentRoutingReadGeneration(key) : undefined;
+        const work = this.processOnce(uri, trigger, shouldHandleUri(uri), routingGeneration);
+        this.trackInFlight(key, work, routingGeneration);
         await work;
     }
 
-    private async processOnce(uri: Uri, trigger: 'open' | 'save', shouldEmitTelemetry: boolean): Promise<void> {
+    private async processOnce(
+        uri: Uri,
+        trigger: 'open' | 'save',
+        shouldEmitTelemetry: boolean,
+        routingGeneration?: number,
+    ): Promise<void> {
         try {
             const metadata = await readInlineScriptMetadataFromFile(uri);
             if (this.disposed) {
                 return;
             }
             if (this.routingRegistry) {
-                this.routingRegistry.setMetadata(uri, metadata);
+                if (this.routingReadGenerations.get(uri.toString()) === routingGeneration) {
+                    this.routingRegistry.setMetadata(uri, metadata);
+                }
                 if (!shouldEmitTelemetry || metadata === undefined) {
                     return;
                 }
@@ -227,7 +245,13 @@ export class InlineScriptLazyDetector implements Disposable {
         }
         if (this.routingRegistry) {
             const metadata = this.routingRegistry.getMetadata(e.document.uri);
-            if (metadata && this.contentChangesMayAffectMetadata(e.contentChanges, metadata.range.end)) {
+            if (
+                metadata &&
+                this.contentChangesMayAffectMetadata(
+                    e.contentChanges,
+                    metadata.sourceRange?.end ?? metadata.range.end,
+                )
+            ) {
                 this.clearRouteability(e.document.uri);
             }
         }
@@ -260,6 +284,39 @@ export class InlineScriptLazyDetector implements Disposable {
         }
         this.routingRegistry.clearMetadata(uri);
         this.routingRegistry.setValidatedAssociation(uri, false);
+    }
+
+    private currentRoutingReadGeneration(key: string): number {
+        const current = this.routingReadGenerations.get(key);
+        if (current !== undefined) {
+            return current;
+        }
+        this.routingReadGenerations.set(key, 0);
+        return 0;
+    }
+
+    private advanceRoutingReadGeneration(key: string): number {
+        const next = this.currentRoutingReadGeneration(key) + 1;
+        this.routingReadGenerations.set(key, next);
+        return next;
+    }
+
+    private trackInFlight(key: string, work: Promise<void>, routingGeneration: number | undefined): void {
+        this.inFlight.set(key, work);
+        void work.then(
+            () => this.clearInFlight(key, work, routingGeneration),
+            () => this.clearInFlight(key, work, routingGeneration),
+        );
+    }
+
+    private clearInFlight(key: string, work: Promise<void>, routingGeneration: number | undefined): void {
+        if (this.inFlight.get(key) !== work) {
+            return;
+        }
+        this.inFlight.delete(key);
+        if (routingGeneration !== undefined && this.routingReadGenerations.get(key) === routingGeneration) {
+            this.routingReadGenerations.delete(key);
+        }
     }
 
     private shouldTrackUri(uri: Uri): boolean {
