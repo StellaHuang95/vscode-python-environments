@@ -26,6 +26,7 @@ export const SOURCE_METADATA_IDENTITY_HASH_HEX_LENGTH = 64;
 export const MAX_SOURCE_METADATA_IDENTITY_HASHES = 8;
 
 const MAX_META_JSON_BYTES = 1024 * 1024;
+const META_JSON_BACKUP_FILENAME_RE = /^\.meta\.json\.backup-[0-9a-f]{12}$/;
 const pendingMetaJsonWrites = new Map<string, Promise<void>>();
 
 /**
@@ -124,8 +125,73 @@ export async function readMetaJson(envDir: Uri): Promise<InlineScriptEnvMeta | u
 
 /** Classify sidecar state; only `unavailable` denotes transient I/O. */
 export async function inspectMetaJson(envDir: Uri): Promise<InlineScriptMetaReadResult> {
-    const metaPath = getMetaJsonPath(envDir).fsPath;
+    return inspectMetaJsonFile(getMetaJsonPath(envDir).fsPath);
+}
 
+/**
+ * Restore the most recently-used compatible sidecar backup while the caller
+ * owns the cache-entry lock. General readers must use {@link inspectMetaJson}.
+ */
+export async function restoreMetaJsonBackupUnderLock(
+    envDir: Uri,
+    isCompatible: (metadata: InlineScriptEnvMeta) => boolean = () => true,
+): Promise<InlineScriptMetaReadResult> {
+    const finalPath = getMetaJsonPath(envDir).fsPath;
+    const initial = await inspectMetaJsonFile(finalPath);
+    if (initial.kind !== 'missing') {
+        return initial;
+    }
+
+    let entries: string[];
+    try {
+        entries = await fsapi.readdir(envDir.fsPath);
+    } catch (error) {
+        traceWarn(`inline-script meta: failed to scan backup sidecars in ${envDir.fsPath}:`, error);
+        return { kind: 'unavailable' };
+    }
+
+    const validBackups: Array<{ readonly path: string; readonly metadata: InlineScriptEnvMeta }> = [];
+    for (const entry of entries.filter((name) => META_JSON_BACKUP_FILENAME_RE.test(name))) {
+        const result = await inspectMetaJsonFile(path.join(envDir.fsPath, entry));
+        if (result.kind === 'valid' && isCompatible(result.metadata)) {
+            validBackups.push({ path: path.join(envDir.fsPath, entry), metadata: result.metadata });
+        } else if (result.kind === 'unavailable' || result.kind === 'missing') {
+            // A listed candidate changing or becoming unreadable is an
+            // uncertain scan; preserve the entry rather than rebuilding it.
+            return { kind: 'unavailable' };
+        }
+    }
+
+    if (validBackups.length === 0) {
+        return { kind: 'missing' };
+    }
+
+    // `lastUsedAt` is schema-validated canonical ISO text. Prefer the newest
+    // compatible backup; use the path as a stable tie-breaker.
+    validBackups.sort((a, b) => {
+        if (a.metadata.lastUsedAt !== b.metadata.lastUsedAt) {
+            return a.metadata.lastUsedAt < b.metadata.lastUsedAt ? 1 : -1;
+        }
+        return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+    });
+    const selected = validBackups[0];
+
+    // Native rename may replace an existing destination on some platforms,
+    // so recheck under the caller's entry lock before restoring.
+    const current = await inspectMetaJsonFile(finalPath);
+    if (current.kind !== 'missing') {
+        return current;
+    }
+    try {
+        await fsapi.rename(selected.path, finalPath);
+    } catch (error) {
+        traceWarn(`inline-script meta: failed to restore backup ${selected.path}:`, error);
+        return { kind: 'unavailable' };
+    }
+    return { kind: 'valid', metadata: selected.metadata };
+}
+
+async function inspectMetaJsonFile(metaPath: string): Promise<InlineScriptMetaReadResult> {
     try {
         const stat = await fsapi.lstat(metaPath);
         if (!stat.isFile()) {

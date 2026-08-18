@@ -36,6 +36,7 @@ import {
     getScriptEnvDir,
     inspectOwnedCacheEntry,
     inspectMetaJson,
+    restoreMetaJsonBackupUnderLock,
     resolveCacheEntryPath,
     writeMetaJson,
 } from '../../../common/inlineScript/cacheLayout';
@@ -2660,6 +2661,11 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
         let sidecarResult;
         try {
             sidecarResult = await inspectMetaJson(envDir);
+            if (sidecarResult.kind === 'missing') {
+                sidecarResult = await restoreMetaJsonBackupUnderLock(envDir, (candidate) =>
+                    this.matchesSelectedBase(candidate, selectedBase),
+                );
+            }
         } catch {
             return { kind: 'uncertain' };
         }
@@ -2672,10 +2678,7 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
             };
         }
         const sidecar = sidecarResult.metadata;
-        if (
-            normalizePath(sidecar.baseInterpreterPath) !== normalizePath(selectedBase.canonicalPath) ||
-            sidecar.baseInterpreterVersion !== selectedBase.environment.version
-        ) {
+        if (!this.matchesSelectedBase(sidecar, selectedBase)) {
             return { kind: 'stale' };
         }
 
@@ -2721,6 +2724,13 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
             this.log.warn(`Failed to update inline-script cache metadata: ${getErrorMessage(error)}`);
         }
         return { kind: 'reusable', environment };
+    }
+
+    private matchesSelectedBase(sidecar: InlineScriptEnvMeta, selectedBase: SelectedBaseInterpreter): boolean {
+        return (
+            normalizePath(sidecar.baseInterpreterPath) === normalizePath(selectedBase.canonicalPath) &&
+            sidecar.baseInterpreterVersion === selectedBase.environment.version
+        );
     }
 
     private async buildCacheEntry(

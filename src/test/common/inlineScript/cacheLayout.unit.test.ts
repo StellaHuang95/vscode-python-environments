@@ -26,6 +26,7 @@ import {
     inspectMetaJson,
     mergeSourceMetadataIdentityHashes,
     readMetaJson,
+    restoreMetaJsonBackupUnderLock,
     resolveCacheEntryPath,
     selectStaleEntries,
     verifyBaseInterpreterExists,
@@ -267,6 +268,116 @@ suite('inlineScriptCacheLayout', () => {
             await writeMetaJson(envDir, makeMeta());
             const raw = await fs.readFile(getMetaJsonPath(envDir).fsPath, 'utf8');
             assert.ok(raw.includes('\n'), 'expected indented JSON');
+        });
+    });
+
+    suite('restoreMetaJsonBackupUnderLock', () => {
+        let tmpDir: string;
+        let envDir: Uri;
+
+        setup(async () => {
+            tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'isclayout-backup-recovery-'));
+            envDir = Uri.file(path.join(tmpDir, 'env'));
+            await fs.ensureDir(envDir.fsPath);
+        });
+
+        teardown(async () => {
+            await fs.remove(tmpDir);
+        });
+
+        function backupPath(suffix: string): string {
+            return `${getMetaJsonPath(envDir).fsPath}.backup-${suffix}`;
+        }
+
+        async function writeBackup(suffix: string, content: string | Buffer): Promise<void> {
+            await fs.writeFile(backupPath(suffix), content);
+        }
+
+        test('leaves valid backups untouched for unlocked readers, then restores one under the entry lock', async () => {
+            const metadata = makeMeta();
+            await writeBackup('abcdef123456', JSON.stringify(metadata));
+
+            assert.deepStrictEqual(await inspectMetaJson(envDir), { kind: 'missing' });
+            assert.strictEqual(await readMetaJson(envDir), undefined);
+            assert.strictEqual(await fs.pathExists(getMetaJsonPath(envDir).fsPath), false);
+
+            assert.deepStrictEqual(await restoreMetaJsonBackupUnderLock(envDir), { kind: 'valid', metadata });
+            assert.deepStrictEqual(await readMetaJson(envDir), metadata);
+            assert.strictEqual(await fs.pathExists(backupPath('abcdef123456')), false);
+        });
+
+        test('selects the newest valid backup and uses its path as a stable tie-breaker', async () => {
+            const older = makeMeta({ lastUsedAt: '2020-01-01T00:00:00.000Z' });
+            const sameTimeLaterPath = makeMeta({ lastUsedAt: '2030-01-01T00:00:00.000Z' });
+            const sameTimeEarlierPath = makeMeta({ lastUsedAt: '2030-01-01T00:00:00.000Z', baseInterpreterVersion: '3.13.0' });
+            await writeBackup('ffffffffffff', JSON.stringify(older));
+            await writeBackup('eeeeeeeeeeee', JSON.stringify(sameTimeLaterPath));
+            await writeBackup('000000000000', JSON.stringify(sameTimeEarlierPath));
+
+            assert.deepStrictEqual(await restoreMetaJsonBackupUnderLock(envDir), {
+                kind: 'valid',
+                metadata: sameTimeEarlierPath,
+            });
+            assert.deepStrictEqual(await readMetaJson(envDir), sameTimeEarlierPath);
+            assert.strictEqual(await fs.pathExists(backupPath('000000000000')), false);
+        });
+
+        test('leaves valid backups in place when none meet the compatibility predicate', async () => {
+            await writeBackup('abcdef123456', JSON.stringify(makeMeta()));
+
+            assert.deepStrictEqual(await restoreMetaJsonBackupUnderLock(envDir, () => false), { kind: 'missing' });
+            assert.strictEqual(await fs.pathExists(backupPath('abcdef123456')), true);
+            assert.strictEqual(await fs.pathExists(getMetaJsonPath(envDir).fsPath), false);
+        });
+
+        test('rejects temp, malformed, unsupported, and oversized artifacts without restoring them', async () => {
+            const finalPath = getMetaJsonPath(envDir).fsPath;
+            await fs.writeFile(`${finalPath}.tmp-abcdef123456`, JSON.stringify(makeMeta()));
+            await fs.writeFile(`${finalPath}.backup-ABCDEF123456`, JSON.stringify(makeMeta()));
+            await writeBackup('111111111111', 'not json');
+            await writeBackup('222222222222', JSON.stringify({ ...makeMeta(), schemaVersion: 99 }));
+            await writeBackup('333333333333', Buffer.alloc(1024 * 1024 + 1, 0x20));
+
+            assert.deepStrictEqual(await restoreMetaJsonBackupUnderLock(envDir), { kind: 'missing' });
+            assert.strictEqual(await fs.pathExists(finalPath), false);
+        });
+
+        test('rejects a symlink backup without restoring it', async function () {
+            const externalPath = path.join(tmpDir, 'external-meta.json');
+            await fs.writeFile(externalPath, JSON.stringify(makeMeta()));
+            try {
+                await fs.symlink(externalPath, backupPath('abcdef123456'), 'file');
+            } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code;
+                if (code === 'EPERM' || code === 'EACCES') {
+                    this.skip();
+                    return;
+                }
+                throw error;
+            }
+
+            assert.deepStrictEqual(await restoreMetaJsonBackupUnderLock(envDir), { kind: 'missing' });
+            assert.strictEqual(await fs.pathExists(getMetaJsonPath(envDir).fsPath), false);
+        });
+
+        test('preserves the entry when backup scanning is uncertain', async () => {
+            const backup = backupPath('abcdef123456');
+            await writeBackup('abcdef123456', JSON.stringify(makeMeta()));
+            sinon.stub(fsExtra, 'readdir').rejects(Object.assign(new Error('I/O error'), { code: 'EIO' }));
+
+            assert.deepStrictEqual(await restoreMetaJsonBackupUnderLock(envDir), { kind: 'unavailable' });
+            assert.strictEqual(await fs.pathExists(backup), true);
+            assert.strictEqual(await fs.pathExists(getMetaJsonPath(envDir).fsPath), false);
+        });
+
+        test('preserves the backup when restoration is uncertain', async () => {
+            const backup = backupPath('abcdef123456');
+            await writeBackup('abcdef123456', JSON.stringify(makeMeta()));
+            sinon.stub(fsExtra, 'rename').rejects(Object.assign(new Error('I/O error'), { code: 'EIO' }));
+
+            assert.deepStrictEqual(await restoreMetaJsonBackupUnderLock(envDir), { kind: 'unavailable' });
+            assert.strictEqual(await fs.pathExists(backup), true);
+            assert.strictEqual(await fs.pathExists(getMetaJsonPath(envDir).fsPath), false);
         });
     });
 

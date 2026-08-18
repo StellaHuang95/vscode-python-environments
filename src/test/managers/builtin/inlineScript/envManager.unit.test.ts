@@ -1238,6 +1238,61 @@ suite('InlineScriptEnvManager', () => {
             assert.ok(options.retryIntervalMs > 0);
         });
 
+        test('reuses a restart cache entry from an older backup matching the selected base', async () => {
+            const directory = envDir();
+            const executable = venvPythonPath(directory.fsPath);
+            const sidecar = {
+                schemaVersion: cacheLayout.META_SCHEMA_VERSION,
+                baseInterpreterPath: baseExecutable,
+                baseInterpreterVersion: baseEnvironment.version,
+                lastUsedAt: NOW.toISOString(),
+            } satisfies cacheLayout.InlineScriptEnvMeta;
+            const newerIncompatibleSidecar = {
+                ...sidecar,
+                baseInterpreterPath: path.join(tempRoot, 'other-base-python'),
+                baseInterpreterVersion: '3.13.0',
+                lastUsedAt: '2030-01-01T00:00:00.000Z',
+            } satisfies cacheLayout.InlineScriptEnvMeta;
+            const environment = makeEnvironment(
+                'ms-python.python:inline-script',
+                baseEnvironment.version,
+                executable,
+                directory.fsPath,
+            );
+            await fs.outputFile(executable, '');
+            await fs.writeFile(
+                `${cacheLayout.getMetaJsonPath(directory).fsPath}.backup-abcdef123456`,
+                JSON.stringify(sidecar),
+            );
+            await fs.writeFile(
+                `${cacheLayout.getMetaJsonPath(directory).fsPath}.backup-ffffffffffff`,
+                JSON.stringify(newerIncompatibleSidecar),
+            );
+            environmentsByExecutablePath.set(normalizePath(executable), environment);
+            inspectMetaStub.restore();
+
+            const result = await manager.create(scriptUri());
+
+            assert.strictEqual(result, environment);
+            assert.strictEqual(createWithProgressStub.callCount, 0, 'recovered cache entry must not rebuild');
+            assert.deepStrictEqual(await cacheLayout.readMetaJson(directory), sidecar);
+            assert.strictEqual(
+                await fs.pathExists(`${cacheLayout.getMetaJsonPath(directory).fsPath}.backup-abcdef123456`),
+                false,
+            );
+        });
+
+        test('preserves a restart cache entry when backup recovery is uncertain', async () => {
+            const markerPath = path.join(envDir().fsPath, 'keep.txt');
+            await fs.outputFile(markerPath, 'keep');
+            inspectMetaStub.resolves({ kind: 'missing' });
+            sinon.stub(cacheLayout, 'restoreMetaJsonBackupUnderLock').resolves({ kind: 'unavailable' });
+
+            assert.strictEqual(await manager.create(scriptUri()), undefined);
+            assert.strictEqual(await fs.readFile(markerPath, 'utf8'), 'keep');
+            assert.strictEqual(createWithProgressStub.callCount, 0);
+        });
+
         test('coalesces simultaneous same-key creation within one extension host', async () => {
             let continueCreation: (() => void) | undefined;
             let creationStarted: (() => void) | undefined;
