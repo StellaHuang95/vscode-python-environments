@@ -64,7 +64,7 @@ const BASE_INTERPRETER_MANAGER_IDS = new Set([
 const CACHE_LOCK_TIMEOUT_MS = 5 * 60 * 1000;
 const CACHE_LOCK_RETRY_MS = 500;
 const CACHED_ASSOCIATION_VALIDATION_INTERVAL_MS = 5_000;
-const DISCOVERY_RETRY_DELAYS_MS = [1_000, 5_000] as const;
+const DISCOVERY_RETRY_DELAYS_MS = [1_000, 5_000, 30_000] as const;
 /** Workspace-state key for PEP 723 script path to environment executable associations. */
 export const INLINE_SCRIPT_ENVS_KEY = `${ENVS_EXTENSION_ID}:inline-script:SCRIPT_ENVIRONMENTS`;
 
@@ -85,6 +85,11 @@ interface BuildCacheEntryResult {
     readonly retainLock?: boolean;
 }
 
+interface DiscoveryRefreshPass {
+    readonly promise: Promise<boolean>;
+    readonly checksForSnapshotChanges: boolean;
+}
+
 type CacheEntryInspection =
     | { readonly kind: 'absent' | 'stale' | 'uncertain' }
     | { readonly kind: 'reusable'; readonly environment: PythonEnvironment };
@@ -101,7 +106,8 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
     private readonly fsPathToPersistedEnvPath = new Map<string, string>();
     private readonly cachedAssociationValidatedAt = new Map<string, number>();
     private readonly associationRevisions = new Map<string, number>();
-    private pendingRefresh: Promise<boolean> | undefined;
+    private pendingRefresh: DiscoveryRefreshPass | undefined;
+    private pendingSnapshotRefresh: Promise<boolean> | undefined;
     private activationDiscoveryActive = false;
     private discoveryRetryAttempt = 0;
     private discoveryRetryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -241,7 +247,7 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
             return;
         }
         this.stopActivationDiscovery();
-        await this.getOrStartRefreshPass();
+        await this.getOrStartRefreshPass(false);
     }
 
     async getEnvironments(scope: GetEnvironmentsScope): Promise<PythonEnvironment[]> {
@@ -272,21 +278,74 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
         this.runActivationDiscoveryPass();
     }
 
-    private async getOrStartRefreshPass(): Promise<boolean> {
+    private getOrStartRefreshPass(checkForSnapshotChanges: boolean): Promise<boolean> {
         const pending = this.pendingRefresh;
+        if (pending) {
+            return checkForSnapshotChanges && !pending.checksForSnapshotChanges
+                ? this.getOrScheduleSnapshotRefresh(pending)
+                : pending.promise;
+        }
+
+        return this.startRefreshPass(checkForSnapshotChanges);
+    }
+
+    private startRefreshPass(checkForSnapshotChanges: boolean): Promise<boolean> {
+        const pass: DiscoveryRefreshPass = {
+            promise: this.refreshDiscoveredEnvironments(checkForSnapshotChanges),
+            checksForSnapshotChanges: checkForSnapshotChanges,
+        };
+        this.pendingRefresh = pass;
+        void pass.promise.then(
+            () => {
+                if (this.pendingRefresh === pass) {
+                    this.pendingRefresh = undefined;
+                }
+            },
+            () => {
+                if (this.pendingRefresh === pass) {
+                    this.pendingRefresh = undefined;
+                }
+            },
+        );
+        return pass.promise;
+    }
+
+    private getOrScheduleSnapshotRefresh(sharedPass: DiscoveryRefreshPass): Promise<boolean> {
+        const pending = this.pendingSnapshotRefresh;
         if (pending) {
             return pending;
         }
 
-        const refresh = this.refreshDiscoveredEnvironments();
-        this.pendingRefresh = refresh;
-        try {
-            return await refresh;
-        } finally {
-            if (this.pendingRefresh === refresh) {
-                this.pendingRefresh = undefined;
+        const followUp = this.startSnapshotRefreshAfter(sharedPass);
+        this.pendingSnapshotRefresh = followUp;
+        void followUp.then(
+            () => {
+                if (this.pendingSnapshotRefresh === followUp) {
+                    this.pendingSnapshotRefresh = undefined;
+                }
+            },
+            () => {
+                if (this.pendingSnapshotRefresh === followUp) {
+                    this.pendingSnapshotRefresh = undefined;
+                }
+            },
+        );
+        return followUp;
+    }
+
+    private startSnapshotRefreshAfter(sharedPass: DiscoveryRefreshPass): Promise<boolean> {
+        return sharedPass.promise.then(() => {
+            if (this.disposed || !this.activationDiscoveryActive) {
+                return false;
             }
-        }
+            const pending = this.pendingRefresh;
+            if (pending && pending !== sharedPass) {
+                return pending.checksForSnapshotChanges
+                    ? pending.promise
+                    : this.startSnapshotRefreshAfter(pending);
+            }
+            return this.startRefreshPass(true);
+        });
     }
 
     private runActivationDiscoveryPass(): void {
@@ -294,7 +353,7 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
             return;
         }
 
-        void this.getOrStartRefreshPass()
+        void this.getOrStartRefreshPass(true)
             .then((shouldRetry) => {
                 if (this.disposed || !this.activationDiscoveryActive) {
                     return;
@@ -314,7 +373,7 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
             });
     }
 
-    private async refreshDiscoveredEnvironments(): Promise<boolean> {
+    private async refreshDiscoveredEnvironments(checkForSnapshotChanges: boolean): Promise<boolean> {
         const cacheRoot = getScriptEnvCacheRoot(this.globalStorageUri);
         const previousByKey = new Map(
             this.collection.map((environment) => [this.getDiscoveredEnvironmentKey(environment), environment]),
@@ -339,7 +398,7 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
         let shouldRetry = false;
         for (const entryName of entryNames.sort()) {
             if (entryName.endsWith('.lock')) {
-                lockedKeys.add(normalizePath(Uri.joinPath(cacheRoot, entryName.slice(0, -5)).fsPath));
+                lockedKeys.add(this.getDiscoveryEntryKey(entryName.slice(0, -5)));
                 shouldRetry = true;
                 continue;
             }
@@ -349,7 +408,7 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
             }
 
             const envDir = Uri.joinPath(cacheRoot, entryName);
-            const key = normalizePath(envDir.fsPath);
+            const key = this.getDiscoveryEntryKey(entryName);
             const discovered = await this.inspectDiscoveredCacheEntry(cacheRoot, envDir);
             if (discovered.kind === 'resolved') {
                 nextByKey.set(key, discovered.environment);
@@ -364,6 +423,25 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
         for (const [key, previous] of previousByKey) {
             if (!nextByKey.has(key) && lockedKeys.has(key)) {
                 nextByKey.set(key, previous);
+            }
+        }
+
+        if (this.disposed) {
+            return false;
+        }
+
+        if (checkForSnapshotChanges) {
+            try {
+                const finalEntryNames = await fs.readdir(cacheRoot.fsPath);
+                const initialEntries = new Set(entryNames);
+                if (
+                    finalEntryNames.length !== entryNames.length ||
+                    finalEntryNames.some((entryName) => !initialEntries.has(entryName))
+                ) {
+                    shouldRetry = true;
+                }
+            } catch {
+                shouldRetry = true;
             }
         }
 
@@ -468,8 +546,12 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
         }
     }
 
+    private getDiscoveryEntryKey(entryName: string): string {
+        return normalizePath(entryName);
+    }
+
     private getDiscoveredEnvironmentKey(environment: PythonEnvironment): string {
-        return normalizePath(environment.sysPrefix);
+        return this.getDiscoveryEntryKey(path.basename(environment.sysPrefix));
     }
 
     private isSameDiscoveredEnvironment(first: PythonEnvironment, second: PythonEnvironment): boolean {
@@ -1037,10 +1119,15 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
     }
 
     private async isCacheEntryBusy(envDirPath: string): Promise<boolean> {
-        return (
-            this.pendingCreations.has(path.basename(envDirPath)) ||
-            (await fs.pathExists(`${path.resolve(envDirPath)}.lock`))
-        );
+        if (this.pendingCreations.has(path.basename(envDirPath))) {
+            return true;
+        }
+        try {
+            await fs.lstat(`${path.resolve(envDirPath)}.lock`);
+            return true;
+        } catch (error) {
+            return !isFileNotFoundError(error);
+        }
     }
 
     private bumpAssociationRevision(scriptPath: string): void {
