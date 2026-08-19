@@ -1702,7 +1702,7 @@ suite('InlineScriptEnvManager', () => {
             assert.strictEqual(sidecarsByEnvDir.size, 0);
         });
 
-        test('dedupes and caps coalesced same-key provenance hashes before the first sidecar write', async () => {
+        test('dedupes coalesced same-key provenance hashes before the first sidecar write', async () => {
             const cacheKeyValue = 'fedcba9876543210';
             const scriptSpecs = [
                 ['script-0.py', '>=3.0'],
@@ -1811,7 +1811,7 @@ suite('InlineScriptEnvManager', () => {
                 ) as cacheLayout.InlineScriptEnvMeta
             ).sourceMetadataIdentityHashes;
             assert.deepStrictEqual([...(sourceMetadataIdentityHashes ?? [])].sort(), [...(expectedHashes ?? [])].sort());
-            assert.strictEqual(sourceMetadataIdentityHashes?.length, cacheLayout.MAX_SOURCE_METADATA_IDENTITY_HASHES);
+            assert.strictEqual(sourceMetadataIdentityHashes?.length, expectedHashes?.length);
             assert.strictEqual(sourceMetadataIdentityHashes ? new Set(sourceMetadataIdentityHashes).size : 0, sourceMetadataIdentityHashes?.length);
         });
 

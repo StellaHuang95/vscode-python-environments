@@ -23,7 +23,7 @@ export const META_JSON_FILENAME = '.meta.json';
  */
 export const META_SCHEMA_VERSION = 1 as const;
 export const SOURCE_METADATA_IDENTITY_HASH_HEX_LENGTH = 64;
-export const MAX_SOURCE_METADATA_IDENTITY_HASHES = 8;
+export const MAX_SOURCE_METADATA_IDENTITY_HASHES = 128;
 
 const MAX_META_JSON_BYTES = 1024 * 1024;
 const META_JSON_BACKUP_FILENAME_RE = /^\.meta\.json\.backup-[0-9a-f]{12}$/;
