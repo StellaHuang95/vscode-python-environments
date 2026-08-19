@@ -3174,6 +3174,47 @@ suite('InlineScriptEnvManager', () => {
             assert.strictEqual(telemetryCalls(EventNames.INLINE_SCRIPT_ENV_ERROR).length, 0);
         });
 
+        test('emits one setup-failure when coalesced cache-root creation fails', async () => {
+            readMetadataStub.onSecondCall().resolves({ ...VALID_METADATA, requiresPython: '>=3.12' });
+            const cacheRootPath = cacheLayout.getScriptEnvCacheRoot(globalStorageUri).fsPath;
+            const originalEnsureDir = fsExtra.ensureDir;
+            let rejectCacheRoot: ((error: Error) => void) | undefined;
+            let signalCacheRoot: (() => void) | undefined;
+            const cacheRootStarted = new Promise<void>((resolve) => {
+                signalCacheRoot = resolve;
+            });
+            const cacheRootGate = new Promise<void>((_resolve, reject) => {
+                rejectCacheRoot = reject;
+            });
+            sinon.stub(fsExtra, 'ensureDir').callsFake(async (target: string) => {
+                if (normalizePath(target) === normalizePath(cacheRootPath)) {
+                    signalCacheRoot!();
+                    return cacheRootGate;
+                }
+                return originalEnsureDir(target);
+            });
+
+            const first = manager.create(scriptUri('a.py'));
+            await cacheRootStarted;
+            const second = manager.create(scriptUri('b.py'));
+            const pendingManager = manager as unknown as {
+                pendingCreations: Map<string, { sourceMetadataIdentityHashes?: readonly string[] }>;
+            };
+            await waitForCondition(
+                () => [...pendingManager.pendingCreations.values()][0]?.sourceMetadataIdentityHashes?.length === 2,
+                'Expected the second request to join the pending cache creation',
+            );
+            rejectCacheRoot!(new Error('global storage unavailable'));
+
+            assert.deepStrictEqual(await Promise.all([first, second]), [undefined, undefined]);
+            assert.deepStrictEqual(
+                telemetryCalls(EventNames.INLINE_SCRIPT_ENV_ERROR).map((call) => call.args),
+                [[EventNames.INLINE_SCRIPT_ENV_ERROR, undefined, { category: 'setup-failure' }]],
+            );
+            assert.strictEqual(lockStub.callCount, 0);
+            assert.strictEqual(createWithProgressStub.callCount, 0);
+        });
+
         test('excludes lock and cache inspection time from envCreated duration', async () => {
             await fs.ensureDir(envDir().fsPath);
             lockStub.callsFake(async () => {
@@ -4823,7 +4864,7 @@ suite('InlineScriptEnvManager', () => {
 
             assert.strictEqual(await manager.get(uri), undefined);
             assert.deepStrictEqual(persistedAssociations, {
-                [normalizePath(uri.fsPath)]: environment.environmentPath.fsPath,
+                [normalizePath(uri.fsPath)]: matchedAssociationRecord(environment.environmentPath.fsPath),
             });
             assert.strictEqual(listener.callCount, 0);
         });
@@ -5489,7 +5530,7 @@ suite('InlineScriptEnvManager', () => {
             await assert.rejects(manager.clearCache(), /being created/);
 
             assert.deepStrictEqual(persistedAssociations, {
-                [normalizePath(uri.fsPath)]: environment.environmentPath.fsPath,
+                [normalizePath(uri.fsPath)]: matchedAssociationRecord(environment.environmentPath.fsPath),
             });
             assert.strictEqual(await manager.get(uri), environment);
         });
@@ -5644,7 +5685,9 @@ suite('InlineScriptEnvManager', () => {
             assert.strictEqual(await fs.pathExists(firstEnvironment.sysPrefix), false);
             assert.strictEqual(await fs.pathExists(secondEnvironment.sysPrefix), true);
             assert.deepStrictEqual(persistedAssociations, {
-                [normalizePath(secondUri.fsPath)]: secondEnvironment.environmentPath.fsPath,
+                [normalizePath(secondUri.fsPath)]: matchedAssociationRecord(
+                    secondEnvironment.environmentPath.fsPath,
+                ),
             });
             assert.strictEqual(await manager.get(firstUri), undefined);
             assert.strictEqual(await manager.get(secondUri), secondEnvironment);

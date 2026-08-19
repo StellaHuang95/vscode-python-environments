@@ -2569,9 +2569,9 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
         const dependencyCount = this.getTelemetryDependencyCount(packages);
         const cacheRoot = getScriptEnvCacheRoot(this.globalStorageUri);
         const envDir = getScriptEnvDir(this.globalStorageUri, cacheKey);
-        await fs.ensureDir(cacheRoot.fsPath);
 
         try {
+            await fs.ensureDir(cacheRoot.fsPath);
             return await this.withCacheEntryLock(envDir, async (lock) => {
                 const cached = await this.inspectCacheEntry(
                     cacheRoot,
@@ -2819,9 +2819,12 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
             ...Object.keys(persistedAssociations),
             ...this.associationRevisions.keys(),
             ...this.cachedAssociationValidatedAt.keys(),
+            ...this.lastValidatedMetadataIdentities.keys(),
+            ...this.lastValidatedMetadataIdentityProofs.keys(),
             ...this.fsPathToEnv.keys(),
-            ...this.fsPathToPersistedEnvPath.keys(),
+            ...this.fsPathToPersistedAssociation.keys(),
             ...this.pendingRehydrations.keys(),
+            ...this.pendingMetadataRefreshes.keys(),
         ]);
         const priorSelections = new Map<string, PythonEnvironment | undefined>();
         scriptPaths.forEach((scriptPath) => {
@@ -3114,8 +3117,8 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
         const invalidatedScriptPaths = new Set<string>();
         for (const scriptPath of scriptPaths) {
             const environmentPaths = [
-                persistedAssociations[scriptPath],
-                this.fsPathToPersistedEnvPath.get(scriptPath),
+                persistedAssociations[scriptPath]?.environmentPath,
+                this.fsPathToPersistedAssociation.get(scriptPath)?.environmentPath,
                 this.fsPathToEnv.get(scriptPath)?.environmentPath.fsPath,
             ].filter((value): value is string => value !== undefined);
             const states = await Promise.all(
@@ -3177,7 +3180,8 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
                 await this.updatePersistedAssociations(
                     persistedPathsToClear.map((scriptPath) => ({
                         scriptPath,
-                        expectedEnvironmentPath: persistedAssociations[scriptPath],
+                        expectedEnvironmentPath: persistedAssociations[scriptPath].environmentPath,
+                        expectedPersistedAssociation: persistedAssociations[scriptPath],
                     })),
                 );
             }
@@ -3189,9 +3193,10 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
         for (const scriptPath of invalidatedScriptPaths) {
             this.bumpAssociationRevision(scriptPath);
             this.pendingRehydrations.delete(scriptPath);
+            this.pendingMetadataRefreshes.delete(scriptPath);
             this.fsPathToEnv.delete(scriptPath);
-            this.fsPathToPersistedEnvPath.delete(scriptPath);
-            this.cachedAssociationValidatedAt.delete(scriptPath);
+            this.fsPathToPersistedAssociation.delete(scriptPath);
+            this.clearValidatedRouteableState(scriptPath);
 
             const environment = priorSelections.get(scriptPath);
             if (environment) {
@@ -3208,7 +3213,7 @@ export class InlineScriptEnvManager implements EnvironmentManager, Disposable {
     private async getPersistedAssociationSnapshot(): Promise<PersistedInlineScriptEnvironments> {
         await this.persistenceQueue;
         const state = await getWorkspacePersistentState();
-        return this.asPersistedAssociations(await state.get<unknown>(INLINE_SCRIPT_ENVS_KEY)) ?? {};
+        return this.parsePersistedAssociations(await state.get<unknown>(INLINE_SCRIPT_ENVS_KEY))?.records ?? {};
     }
 
     private async removeCacheEntry(envDir: Uri): Promise<boolean> {

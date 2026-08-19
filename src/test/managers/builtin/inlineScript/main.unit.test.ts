@@ -6,6 +6,7 @@ import * as sinon from 'sinon';
 import { Disposable, LogOutputChannel, Uri } from 'vscode';
 import { EnvironmentManager, PythonEnvironmentApi } from '../../../../api';
 import { InlineScriptRoutingRegistry } from '../../../../common/inlineScript/routingRegistry';
+import * as workspaceApis from '../../../../common/workspace.apis';
 import { latchInlineScriptFeatureActivation } from '../../../../features/inlineScript/activation';
 import * as pythonApi from '../../../../features/pythonApi';
 import * as helpers from '../../../../helpers';
@@ -48,6 +49,8 @@ suite('registerInlineScriptFeatures (feature-flag gate)', () => {
         isEnabledStub = sinon.stub(helpers, 'isInlineScriptsFeatureEnabled');
         registerEnvironmentManagerStub = sinon.stub<[unknown], Disposable>().returns({ dispose: () => undefined });
         startActivationDiscoveryStub = sinon.stub(InlineScriptEnvManager.prototype, 'startActivationDiscovery');
+        sinon.stub(workspaceApis, 'onDidDeleteFiles').returns(new Disposable(() => undefined));
+        sinon.stub(workspaceApis, 'onDidRenameFiles').returns(new Disposable(() => undefined));
         getPythonApiStub = sinon.stub(pythonApi, 'getPythonApi').resolves({
             registerEnvironmentManager: registerEnvironmentManagerStub,
         } as unknown as PythonEnvironmentApi);
@@ -121,10 +124,16 @@ suite('registerInlineScriptFeatures (feature-flag gate)', () => {
     });
 
     test('when the feature flag is TRUE: defers activation-time discovery to the next turn', async () => {
-        isEnabledStub.returns(true);
         const disposables: Disposable[] = [];
 
-        await registerInlineScriptFeatures(nativeFinder, disposables, makeFakeLog(), baseManager, globalStorageUri);
+        await registerInlineScriptFeatures(
+            nativeFinder,
+            disposables,
+            makeFakeLog(),
+            baseManager,
+            globalStorageUri,
+            { enabled: true, routingRegistry },
+        );
 
         assert.strictEqual(
             startActivationDiscoveryStub.callCount,
