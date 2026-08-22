@@ -632,8 +632,21 @@ export class NativePythonFinderImpl implements NativePythonFinder {
     private async handleHardRefresh(
         options?: NativePythonEnvironmentKind | Uri[],
         configuration?: ConfigurationOptions,
+        generationAtStart?: number,
     ): Promise<NativeInfo[]> {
         const key = this.getKey(options);
+
+        // The cache generation captured at the SYNCHRONOUS start of the user-visible refresh, before
+        // any await. The soft path passes the generation it sampled before its own config build; a
+        // direct hard refresh samples it here (still before the build await below). If a clearCache()
+        // advances the generation while we are still building the effective configuration, this
+        // refresh — which *began* before that clear — must NOT repopulate the freshly-cleared cache:
+        // the generation guard in cache.set() rejects a store tagged with a now-stale generation.
+        // Sampling after the await would let a refresh whose config build straddles the clear observe
+        // the post-clear generation and wrongly pass that guard. Capturing at the true start keeps the
+        // "a refresh that began before a clear cannot repopulate the map" guarantee uniform across the
+        // soft and hard entry points.
+        const startGeneration = generationAtStart ?? this.cache.generation;
 
         // Capture the ONE effective configuration for this whole hard operation up front (settings
         // reads only, no discovery I/O). The soft path passes the config it already built; a direct
@@ -657,10 +670,6 @@ export class NativePythonFinderImpl implements NativePythonFinder {
             return inFlight.promise;
         }
 
-        // Capture the cache generation at the moment this hard refresh begins. If an explicit
-        // clearCache() advances the generation before the refresh completes, the result must NOT
-        // repopulate the cache (the clear would otherwise be silently undone).
-        const generationAtStart = this.cache.generation;
         this.cache.delete(key);
         if (!options) {
             this.outputChannel.debug('[Finder] Refreshing all environments');
@@ -672,7 +681,7 @@ export class NativePythonFinderImpl implements NativePythonFinder {
         // a rejected refresh does not poison the cache — the next call after a
         // failure starts a fresh attempt, matching today's behavior.
         const entry: InFlightRefresh = {
-            generation: generationAtStart,
+            generation: startGeneration,
             configuration: effectiveConfig,
             // Placeholder: `entry.promise` is assigned synchronously below, before the map is
             // populated. The cleanup closure only compares `entry` identity and never reads
@@ -692,7 +701,7 @@ export class NativePythonFinderImpl implements NativePythonFinder {
                 // Tag the entry with the exact configuration used to produce it so a later soft
                 // refresh can detect setting changes. The set is a no-op when the generation has
                 // advanced (an explicit clear ran while this refresh was in flight).
-                this.cache.set(key, refreshResult.configuration, results, generationAtStart);
+                this.cache.set(key, refreshResult.configuration, results, startGeneration);
                 return results;
             })
             .finally(() => {
@@ -709,6 +718,12 @@ export class NativePythonFinderImpl implements NativePythonFinder {
 
     private async handleSoftRefresh(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
         const key = this.getKey(options);
+        // Sample the generation SYNCHRONOUSLY, before the config-build await below, so a soft refresh
+        // that began before a clearCache() cannot repopulate the map on miss: it is threaded into the
+        // hard refresh and used to tag any resulting store, which the generation guard then rejects if
+        // a clear intervened. This mirrors the direct hard path's capture, keeping the guarantee
+        // uniform across entry points.
+        const generationAtStart = this.cache.generation;
         // Build the effective configuration from current settings (no discovery I/O). This uses the
         // EXACT same inputs as `configure`, so the result reflects precisely what a hard refresh would
         // send to PET. A soft hit is valid only when this key's saved configuration still matches, so
@@ -730,8 +745,9 @@ export class NativePythonFinderImpl implements NativePythonFinder {
 
         // Miss: no entry, stale generation, or the effective configuration changed for this key.
         // Thread the config we just built into the hard refresh so it is not rebuilt (single config
-        // per hard operation — used for coalescing, `configure`, and the result tag).
-        return this.handleHardRefresh(options, configuration);
+        // per hard operation — used for coalescing, `configure`, and the result tag) along with the
+        // generation sampled at this soft refresh's start.
+        return this.handleHardRefresh(options, configuration, generationAtStart);
     }
 
     public async clearCache(): Promise<void> {
@@ -770,8 +786,15 @@ export class NativePythonFinderImpl implements NativePythonFinder {
                 // fresh server with an empty in-memory cache. All discovery/resolve paths call
                 // ensureProcessRunning() first, so none can read the stale cache before the restart.
                 // This is an intentional reset, so it does not consume the crash-restart budget. Skip
-                // when a restart is already underway or the process was replaced mid-await — that fresh
-                // process already starts empty.
+                // when a restart is already underway or the process was replaced mid-await — a fresh
+                // process starts with an empty in-memory cache.
+                //
+                // Residual limit (documented): if a concurrent refresh both replaced the process AND
+                // drove it through configure+scan during our await, that replacement may have loaded the
+                // pre-sweep on-disk cache into memory; the on-disk sweep below then removes the file copy
+                // but not that in-memory copy, so a subsequent refresh could still serve it. We do not
+                // serialize clear against active refreshes here (that risks an unbounded Clear Cache
+                // wait); the extension cannot cancel work already accepted by the native process.
                 this.outputChannel.warn(
                     '[pet] Live `clear` request failed; restarting the PET server to drop its in-memory cache',
                     ex,

@@ -10,6 +10,7 @@ import { PythonProjectApi } from '../../../api';
 import {
     ConfigurationOptions,
     clearCacheDirectory,
+    NativeInfo,
     NativePythonFinderImpl,
     RefreshResult,
 } from '../../../managers/common/nativePythonFinder';
@@ -356,6 +357,137 @@ suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
         resolve1({ results: [], configuration: configA });
         resolve2({ results: [], configuration: configB });
         await Promise.all([p1, p2]);
+    });
+
+    test('refresh(false) returns a same-config soft hit and queues a fresh scan when the config changed', async () => {
+        const finder = createFinder();
+        const configA = makeConfig();
+        const configB: ConfigurationOptions = { ...makeConfig(), poetryExecutable: path.join('new', 'poetry') };
+        const buildConfig = stubConfig(finder);
+        const addToQueue = stubQueue(finder);
+
+        // Seed the soft cache for the 'all' key, tagged with configA at the current generation.
+        const cache = (
+            finder as unknown as {
+                cache: {
+                    set: (k: string, c: ConfigurationOptions, r: NativeInfo[], g: number) => boolean;
+                    generation: number;
+                };
+            }
+        ).cache;
+        const cachedResults = [{ executable: path.join('env', 'python') } as unknown as NativeInfo];
+        cache.set('all', configA, cachedResults, cache.generation);
+
+        // Same config → soft HIT: the cached results are returned and NO scan is queued. This exercises
+        // the real handleSoftRefresh → getValid wiring, not just the DiscoveryResultCache unit.
+        buildConfig.onCall(0).resolves(configA);
+        const hit = await finder.refresh(false);
+        assert.strictEqual(hit, cachedResults, 'a same-config soft refresh must return the exact cached results array');
+        assert.strictEqual(addToQueue.callCount, 0, 'a soft hit must not queue a scan');
+
+        // Changed config → soft MISS: handleSoftRefresh must thread the rebuilt config into a fresh
+        // hard scan rather than serve the now-stale cached entry.
+        buildConfig.onCall(1).resolves(configB);
+        let resolveScan!: (v: RefreshResult) => void;
+        addToQueue.onCall(0).returns(new Promise<RefreshResult>((r) => (resolveScan = r)));
+        const missPromise = finder.refresh(false);
+        await flush();
+        assert.strictEqual(addToQueue.callCount, 1, 'a changed-config soft refresh must queue a fresh scan');
+
+        resolveScan({ results: [], configuration: configB });
+        await missPromise;
+    });
+
+    test('a clearCache() that lands DURING a hard refresh config build does not repopulate the cleared cache', async () => {
+        const finder = createFinder();
+        // Route clearCache() to the disk path (no live server) so it only advances the generation and
+        // sweeps the (stubbed) directory — no RPC, no process interaction.
+        (finder as unknown as { processExited: boolean }).processExited = true;
+
+        const config = makeConfig();
+        // Suspend the hard refresh mid config-build so a clear can land while it is still awaiting.
+        let resolveConfig!: (c: ConfigurationOptions) => void;
+        stubConfig(finder).returns(new Promise<ConfigurationOptions>((r) => (resolveConfig = r)));
+        const addToQueue = stubQueue(finder);
+        let resolveScan!: (v: RefreshResult) => void;
+        addToQueue.onCall(0).returns(new Promise<RefreshResult>((r) => (resolveScan = r)));
+
+        const cache = (
+            finder as unknown as {
+                cache: { getValid: (k: string, c: ConfigurationOptions) => NativeInfo[] | undefined };
+            }
+        ).cache;
+
+        // handleHardRefresh samples generationAtStart SYNCHRONOUSLY, then suspends on the config build.
+        const p = finder.refresh(true);
+        await flush();
+        assert.strictEqual(addToQueue.callCount, 0, 'the scan must not be queued until the config build resolves');
+
+        // The clear lands while the refresh is still building its config → the generation advances.
+        await finder.clearCache();
+
+        // Let the straddling refresh finish: its config resolves, the scan is queued and returns data.
+        resolveConfig(config);
+        await flush();
+        assert.strictEqual(addToQueue.callCount, 1, 'the straddling refresh still runs its own scan');
+        resolveScan({
+            results: [{ executable: path.join('env', 'python') } as unknown as NativeInfo],
+            configuration: config,
+        });
+        await p;
+
+        // Because generationAtStart was captured BEFORE the config-build await, the store is rejected by
+        // the generation guard and the just-cleared cache stays empty. A post-await capture would have
+        // observed the post-clear generation and wrongly repopulated the cache.
+        assert.strictEqual(
+            cache.getValid('all', config),
+            undefined,
+            'a refresh that began before the clear must not repopulate the freshly-cleared cache',
+        );
+    });
+
+    test('a clearCache() during a SOFT refresh config build does not repopulate via the miss-triggered scan', async () => {
+        const finder = createFinder();
+        (finder as unknown as { processExited: boolean }).processExited = true;
+
+        const config = makeConfig();
+        // Suspend the soft refresh mid config-build (before its getValid + miss-triggered hard scan).
+        let resolveConfig!: (c: ConfigurationOptions) => void;
+        stubConfig(finder).returns(new Promise<ConfigurationOptions>((r) => (resolveConfig = r)));
+        const addToQueue = stubQueue(finder);
+        let resolveScan!: (v: RefreshResult) => void;
+        addToQueue.onCall(0).returns(new Promise<RefreshResult>((r) => (resolveScan = r)));
+
+        const cache = (
+            finder as unknown as {
+                cache: { getValid: (k: string, c: ConfigurationOptions) => NativeInfo[] | undefined };
+            }
+        ).cache;
+
+        // handleSoftRefresh samples the generation SYNCHRONOUSLY, then suspends on the config build.
+        const p = finder.refresh(false);
+        await flush();
+        assert.strictEqual(addToQueue.callCount, 0, 'no scan until the soft config build resolves');
+
+        await finder.clearCache(); // advances the generation mid soft-build
+
+        // Build resolves → getValid misses → hard scan is queued with the soft-sampled generation.
+        resolveConfig(config);
+        await flush();
+        assert.strictEqual(addToQueue.callCount, 1, 'the soft miss still queues a scan');
+        resolveScan({
+            results: [{ executable: path.join('env', 'python') } as unknown as NativeInfo],
+            configuration: config,
+        });
+        await p;
+
+        // The soft path threads its start generation into the hard refresh, so the store is rejected —
+        // matching the direct hard path (uniform "began before clear cannot repopulate" guarantee).
+        assert.strictEqual(
+            cache.getValid('all', config),
+            undefined,
+            'a soft refresh that began before the clear must not repopulate the cache on miss',
+        );
     });
 
     test('a post-clear refresh does NOT coalesce onto a pre-clear in-flight scan', async () => {
