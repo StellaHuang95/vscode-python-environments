@@ -8,7 +8,7 @@ import { Uri } from 'vscode';
 import { PythonEnvironment } from '../../../api';
 import { EventNames } from '../../../common/telemetry/constants';
 import * as telemetrySender from '../../../common/telemetry/sender';
-import { createDeferred } from '../../../common/utils/deferred';
+import { createDeferred, Deferred } from '../../../common/utils/deferred';
 import { FastPathOptions, tryFastPathGet } from '../../../managers/common/fastPath';
 
 function createMockEnv(envPath: string): PythonEnvironment {
@@ -30,20 +30,28 @@ interface FastPathTestOptions {
 }
 
 function createOpts(overrides?: Partial<FastPathOptions>): FastPathTestOptions {
-    const setInitialized = sinon.stub();
+    let current: Deferred<void> | undefined;
+    const setInitialized = sinon.stub().callsFake((d: Deferred<void> | undefined) => {
+        current = d;
+    });
     const persistedPath = __filename;
+    const opts: FastPathOptions = {
+        initialized: undefined,
+        setInitialized,
+        getInitialized: () => current,
+        scope: Uri.file(path.resolve('test', 'workspace')),
+        label: 'test',
+        getProjectFsPath: (s) => s.fsPath,
+        getPersistedPath: sinon.stub().resolves(persistedPath),
+        resolve: sinon.stub().resolves(createMockEnv(persistedPath)),
+        startBackgroundInit: sinon.stub().resolves(),
+        ...overrides,
+    };
+    // Mirror the manager's real _initialized field: getInitialized() reflects the latest value
+    // installed via setInitialized (seeded from any overridden `initialized`).
+    current = opts.initialized;
     return {
-        opts: {
-            initialized: undefined,
-            setInitialized,
-            scope: Uri.file(path.resolve('test', 'workspace')),
-            label: 'test',
-            getProjectFsPath: (s) => s.fsPath,
-            getPersistedPath: sinon.stub().resolves(persistedPath),
-            resolve: sinon.stub().resolves(createMockEnv(persistedPath)),
-            startBackgroundInit: sinon.stub().resolves(),
-            ...overrides,
-        },
+        opts,
         setInitialized,
     };
 }
@@ -339,6 +347,39 @@ suite('tryFastPathGet', () => {
             lastCallArg,
             undefined,
             'Should clear initialized after synchronous background init failure',
+        );
+    });
+
+    test('stale background init failure does not erase a newer initialization (ownership-aware reset)', async () => {
+        // Park run A's background init on a gate so it can fail *after* a newer run B replaces the
+        // guard. This reproduces the race where an older fast-path run's failure would otherwise
+        // clear whatever `_initialized` now points at — erasing B's (potentially successful) init.
+        const gate = createDeferred<void>();
+        const startBackgroundInit = sinon.stub().returns(gate.promise);
+        const { opts, setInitialized } = createOpts({ startBackgroundInit });
+
+        // Run A: installs deferred A and kicks off the (parked) background init.
+        await tryFastPathGet(opts);
+        assert.ok(setInitialized.calledOnce, 'A installs its own deferred');
+        const deferredA = setInitialized.firstCall.args[0] as Deferred<void>;
+        assert.ok(deferredA, 'A installed a deferred');
+
+        // A newer initialization B replaces the guard (e.g. clearCache()+init or a newer fast-path run).
+        const deferredB = createDeferred<void>();
+        opts.setInitialized(deferredB);
+
+        // Now A's background init fails *late*. Its failure handler must NOT clear B's deferred.
+        gate.reject(new Error('stale A failed'));
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.strictEqual(
+            opts.getInitialized(),
+            deferredB,
+            'a stale background-init failure must not erase a newer initialization',
+        );
+        assert.ok(
+            setInitialized.getCalls().every((c) => c.args[0] !== undefined),
+            'the guard must never be cleared to undefined by the stale failure',
         );
     });
 });

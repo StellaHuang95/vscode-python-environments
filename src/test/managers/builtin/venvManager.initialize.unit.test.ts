@@ -71,19 +71,30 @@ suite('VenvManager.initialize - retry after failure (throw style)', () => {
         assert.strictEqual(findVirtualEnvironmentsStub.callCount, 2, 'no re-discovery after a successful init');
     });
 
-    test('settles concurrent waiters during a failing run (leader rejects, waiter resolves)', async () => {
-        findVirtualEnvironmentsStub.rejects(new Error('discovery boom'));
+    test('leader and concurrent waiters reject with the same error, then a later call retries', async () => {
+        const boom = new Error('discovery boom');
+        findVirtualEnvironmentsStub.rejects(boom);
 
         const mgr = createManager();
 
-        // The leader started discovery; the waiter shares the captured deferred.
+        // The leader starts discovery; the waiter shares the captured deferred.
         const leader = mgr.initialize();
         const waiter = mgr.initialize();
 
-        // The leader surfaces the error (preserving throw-style behavior)...
-        await assert.rejects(leader, /discovery boom/);
-        // ...while the concurrent waiter settles without rejecting (no deadlock/unhandled rejection).
-        await assert.doesNotReject(waiter);
+        // Throw style: the leader AND every concurrent waiter must observe the *same* rejected
+        // initialization — not a contradictory mix where the leader throws but a waiter resolves
+        // to empty/partial state.
+        const leaderErr = await leader.then(
+            () => assert.fail('leader must reject on a failed initialization'),
+            (e) => e,
+        );
+        const waiterErr = await waiter.then(
+            () => assert.fail('waiter must reject on a failed initialization'),
+            (e) => e,
+        );
+        assert.strictEqual(leaderErr, boom, 'the leader rejects with the discovery error');
+        assert.strictEqual(waiterErr, boom, 'the waiter rejects with the same error as the leader');
+
         // Both shared a single discovery run.
         assert.strictEqual(findVirtualEnvironmentsStub.callCount, 1, 'concurrent callers share one discovery run');
 

@@ -95,17 +95,25 @@ export class VenvManager implements EnvironmentManager {
 
         try {
             await this.internalRefresh(undefined, false, VenvManagerStrings.venvInitialize);
+            // Discovery succeeded: settle the captured deferred so this run — and any concurrent
+            // waiters sharing it — observe a completed initialization.
+            initialized.resolve();
         } catch (ex) {
             // Discovery threw: clear the guard so a later call can retry initialization, but only
             // if this run still owns it (don't clobber a deferred a concurrent reset installed).
             if (this._initialized === initialized) {
                 this._initialized = undefined;
             }
-            throw ex;
-        } finally {
-            // Always settle the captured deferred so concurrent waiters unblock.
-            initialized.resolve();
+            // Reject the captured deferred so the leader AND every concurrent waiter observe the
+            // same failed initialization (throw style). The leader returns this same promise
+            // below, so there is no separate rejected promise left to surface as an unhandled
+            // rejection.
+            initialized.reject(ex);
         }
+
+        // Leader and waiters share this single settled promise — resolved on success, rejected on
+        // failure — never a contradictory mix of resolve-for-waiters and throw-for-leader.
+        return initialized.promise;
     }
 
     /**
@@ -375,6 +383,7 @@ export class VenvManager implements EnvironmentManager {
             setInitialized: (deferred) => {
                 this._initialized = deferred;
             },
+            getInitialized: () => this._initialized,
             scope,
             label: 'venv',
             getProjectFsPath: (s) => getProjectFsPathForScope(this.api, s),

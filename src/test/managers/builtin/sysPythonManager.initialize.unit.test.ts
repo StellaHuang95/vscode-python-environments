@@ -76,16 +76,34 @@ suite('SysPythonManager.initialize - retry after failure (throw style)', () => {
         assert.strictEqual(refreshPythonsStub.callCount, 2, 'no re-discovery after a successful init');
     });
 
-    test('settles concurrent waiters during a failing run (leader rejects, waiter resolves)', async () => {
-        refreshPythonsStub.rejects(new Error('discovery boom'));
+    test('leader and concurrent waiters reject with the same error', async () => {
+        const boom = new Error('discovery boom');
+        refreshPythonsStub.rejects(boom);
 
         const mgr = createManager();
 
         const leader = mgr.initialize();
         const waiter = mgr.initialize();
 
-        await assert.rejects(leader, /discovery boom/);
-        await assert.doesNotReject(waiter);
+        // Throw style: the leader AND every concurrent waiter must observe the *same* rejected
+        // initialization — not a contradictory mix where the leader throws but a waiter resolves
+        // to empty/partial state.
+        const leaderErr = await leader.then(
+            () => assert.fail('leader must reject on a failed initialization'),
+            (e) => e,
+        );
+        const waiterErr = await waiter.then(
+            () => assert.fail('waiter must reject on a failed initialization'),
+            (e) => e,
+        );
+        assert.strictEqual(leaderErr, boom, 'the leader rejects with the discovery error');
+        assert.strictEqual(waiterErr, boom, 'the waiter rejects with the same error as the leader');
         assert.strictEqual(refreshPythonsStub.callCount, 1, 'concurrent callers share one discovery run');
+
+        // State was cleared, so a fresh call retries.
+        refreshPythonsStub.resetBehavior();
+        refreshPythonsStub.resolves([]);
+        await assert.doesNotReject(mgr.initialize());
+        assert.strictEqual(refreshPythonsStub.callCount, 2, 'a fresh call retries after failure');
     });
 });

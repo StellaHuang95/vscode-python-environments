@@ -347,6 +347,7 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
             setInitialized: (deferred) => {
                 this._initialized = deferred;
             },
+            getInitialized: () => this._initialized,
             scope,
             label: 'conda',
             getProjectFsPath: (s) => getProjectFsPathForScope(this.api, s),

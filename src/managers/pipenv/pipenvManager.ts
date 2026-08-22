@@ -97,33 +97,35 @@ export class PipenvManager implements EnvironmentManager, Disposable {
                 toolSource = hasExplicitSetting ? 'settings' : 'local';
             }
 
+            let committed = false;
             await withProgress(
                 {
                     location: ProgressLocation.Window,
                     title: PipenvStrings.pipenvDiscovering,
                 },
                 async () => {
-                    this.collection = (await refreshPipenv(false, this.nativeFinder, this.api, this)) ?? [];
-                    await this.loadEnvMap();
-
-                    this._onDidChangeEnvironments.fire(
-                        this.collection.map((e) => ({ environment: e, kind: EnvironmentChangeKind.add })),
-                    );
+                    committed = await this.discoverAndCommit(initialized);
                 },
             );
 
-            envCount = this.collection.length;
+            // A superseded run (a concurrent clearCache()+reinit took over while we were
+            // discovering) committed nothing and no longer owns the current state, so skip the
+            // post-discovery bookkeeping: don't re-run tool lookup or emit a duplicate
+            // missing-manager notification for a collection it did not write.
+            if (committed) {
+                envCount = this.collection.length;
 
-            // If tool wasn't found via local lookup, check if refresh discovered it via PET
-            if (!preRefreshTool) {
-                const postRefreshTool = await getPipenv();
-                toolSource = postRefreshTool ? 'pet' : 'none';
-            }
+                // If tool wasn't found via local lookup, check if refresh discovered it via PET
+                if (!preRefreshTool) {
+                    const postRefreshTool = await getPipenv();
+                    toolSource = postRefreshTool ? 'pet' : 'none';
+                }
 
-            if (toolSource === 'none') {
-                result = 'tool_not_found';
-                if (this.projectManager) {
-                    await notifyMissingManagerIfDefault('ms-python.python:pipenv', this.projectManager, this.api);
+                if (toolSource === 'none') {
+                    result = 'tool_not_found';
+                    if (this.projectManager) {
+                        await notifyMissingManagerIfDefault('ms-python.python:pipenv', this.projectManager, this.api);
+                    }
                 }
             }
         } catch (ex) {
@@ -153,6 +155,81 @@ export class PipenvManager implements EnvironmentManager, Disposable {
         }
     }
 
+    /**
+     * Runs pipenv discovery and commits the resulting collection, project→env map and global
+     * environment atomically — but only if `owner` still owns initialization when discovery
+     * finishes.
+     *
+     * The new state is built entirely into locals first, so:
+     *  - a mid-flight throw (from discovery or the map build) can never leave partially written
+     *    collection/map/global state behind — the pre-run known-good state is left untouched;
+     *  - a superseded run (a concurrent clearCache()+init, or a newer fast-path run, replaced our
+     *    deferred while we were awaiting) discards its now-stale results instead of clobbering the
+     *    newer state.
+     *
+     * The commit itself is synchronous (no awaits between the ownership check and the final write),
+     * so it is atomic with respect to other callers.
+     *
+     * @param owner The deferred the caller installed as `this._initialized` for this run.
+     * @returns `true` if this run committed its state, `false` if it was superseded and discarded
+     *          its results (so the caller can skip post-discovery bookkeeping it no longer owns).
+     */
+    private async discoverAndCommit(owner: Deferred<void>): Promise<boolean> {
+        const collection = (await refreshPipenv(false, this.nativeFinder, this.api, this)) ?? [];
+        const { fsPathToEnv, globalEnv } = await this.buildEnvMap(collection);
+
+        // Ownership check: bail before touching shared state if a newer run has taken over.
+        if (this._initialized !== owner) {
+            return false;
+        }
+
+        this.collection = collection;
+        this.fsPathToEnv.clear();
+        for (const [projectPath, env] of fsPathToEnv) {
+            this.fsPathToEnv.set(projectPath, env);
+        }
+        this.globalEnv = globalEnv;
+
+        this._onDidChangeEnvironments.fire(
+            collection.map((e) => ({ environment: e, kind: EnvironmentChangeKind.add })),
+        );
+        return true;
+    }
+
+    /**
+     * Builds the project→environment map and global environment for the given collection WITHOUT
+     * mutating any shared manager state. Callers commit the returned result atomically so a failed
+     * or superseded run can never leave partially written mappings behind. Each entry is resolved
+     * by normalized identity against the collection being committed, so mappings never point into
+     * a stale collection.
+     */
+    private async buildEnvMap(
+        collection: PythonEnvironment[],
+    ): Promise<{ fsPathToEnv: Map<string, PythonEnvironment>; globalEnv: PythonEnvironment | undefined }> {
+        const fsPathToEnv = new Map<string, PythonEnvironment>();
+
+        // Load environment mappings for projects
+        const projects = this.api.getPythonProjects();
+        for (const project of projects) {
+            const envPath = await getPipenvForWorkspace(project.uri.fsPath);
+            if (envPath) {
+                const env = this.findEnvironmentByPathIn(collection, envPath);
+                if (env) {
+                    fsPathToEnv.set(normalizePath(project.uri.fsPath), env);
+                }
+            }
+        }
+
+        // Load global environment
+        let globalEnv: PythonEnvironment | undefined;
+        const globalEnvPath = await getPipenvForGlobal();
+        if (globalEnvPath) {
+            globalEnv = this.findEnvironmentByPathIn(collection, globalEnvPath);
+        }
+
+        return { fsPathToEnv, globalEnv };
+    }
+
     private async loadEnvMap() {
         // Load environment mappings for projects
         const projects = this.api.getPythonProjects();
@@ -174,8 +251,15 @@ export class PipenvManager implements EnvironmentManager, Disposable {
     }
 
     private findEnvironmentByPath(fsPath: string): PythonEnvironment | undefined {
+        return this.findEnvironmentByPathIn(this.collection, fsPath);
+    }
+
+    private findEnvironmentByPathIn(
+        collection: PythonEnvironment[],
+        fsPath: string,
+    ): PythonEnvironment | undefined {
         const normalized = normalizePath(fsPath);
-        return this.collection.find(
+        return collection.find(
             (env) =>
                 normalizePath(env.environmentPath.fsPath) === normalized ||
                 (env.execInfo?.run.executable && normalizePath(env.execInfo.run.executable) === normalized),
@@ -320,25 +404,25 @@ export class PipenvManager implements EnvironmentManager, Disposable {
             setInitialized: (deferred) => {
                 this._initialized = deferred;
             },
+            getInitialized: () => this._initialized,
             scope,
             label: 'pipenv',
             getProjectFsPath: (s) => getProjectFsPathForScope(this.api, s),
             getPersistedPath: (fsPath) => getPipenvForWorkspace(fsPath),
             resolve: (p) => resolvePipenvPath(p, this.nativeFinder, this.api, this),
-            startBackgroundInit: () =>
-                withProgress(
+            startBackgroundInit: () => {
+                // Capture the deferred fastPath just installed so the commit stays ownership-aware
+                // (discoverAndCommit only writes shared state if this deferred still owns init).
+                const owner = this._initialized;
+                return withProgress(
                     { location: ProgressLocation.Window, title: PipenvStrings.pipenvDiscovering },
                     async () => {
-                        this.collection = (await refreshPipenv(false, this.nativeFinder, this.api, this)) ?? [];
-                        await this.loadEnvMap();
-                        this._onDidChangeEnvironments.fire(
-                            this.collection.map((e) => ({
-                                environment: e,
-                                kind: EnvironmentChangeKind.add,
-                            })),
-                        );
+                        if (owner) {
+                            await this.discoverAndCommit(owner);
+                        }
                     },
-                ),
+                );
+            },
         });
         if (fastResult) {
             return fastResult.env;

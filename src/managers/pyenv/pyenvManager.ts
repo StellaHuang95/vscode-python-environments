@@ -204,6 +204,7 @@ export class PyEnvManager implements EnvironmentManager, Disposable {
             setInitialized: (deferred) => {
                 this._initialized = deferred;
             },
+            getInitialized: () => this._initialized,
             scope,
             label: 'pyenv',
             getProjectFsPath: (s) => getProjectFsPathForScope(this.api, s),
