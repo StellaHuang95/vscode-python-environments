@@ -11,6 +11,7 @@ import {
     ConfigurationOptions,
     clearCacheDirectory,
     NativePythonFinderImpl,
+    RefreshResult,
 } from '../../../managers/common/nativePythonFinder';
 
 /** A fake JSON-RPC connection whose `sendRequest` behavior the test controls. */
@@ -144,13 +145,29 @@ suite('NativePythonFinderImpl.clearCache', () => {
         assert.strictEqual(emptyDirStub.firstCall.args[0], cacheDir.fsPath);
     });
 
-    test('still empties the on-disk cache directory when the live `clear` RPC fails', async () => {
+    test('resets the live server and still empties the on-disk cache directory when the live `clear` RPC fails', async () => {
         const cacheDir = Uri.file(path.join(os.tmpdir(), 'pet-clear-rpcfail'));
         const finder = createFinder(cacheDir);
         connectionOf(finder).sendRequest.rejects(new Error('rpc boom'));
+        const internals = finder as unknown as {
+            proc?: { kill: sinon.SinonStub };
+            processExited: boolean;
+            restartAttempts: number;
+        };
+        const killStub = internals.proc!.kill;
+        internals.restartAttempts = 2; // pretend earlier crash-restarts happened
 
         await finder.clearCache();
 
+        // A failed live clear leaves PET's in-memory cache intact, and emptying the on-disk directory
+        // cannot evict it. So we terminate the process and mark it for restart; the next discovery
+        // spawns a fresh (empty) server. All discovery/resolve paths call ensureProcessRunning() first,
+        // so none can read the stale in-memory cache before that restart.
+        assert.strictEqual(killStub.called, true, 'the stale PET process should be terminated');
+        assert.strictEqual(internals.processExited, true, 'the server should be marked for restart');
+        assert.strictEqual(internals.proc, undefined, 'killProcess clears the process handle');
+        assert.strictEqual(internals.restartAttempts, 0, 'an intentional reset must not consume the restart budget');
+        // The on-disk sweep is the PRIMARY disk clear here (the live clear did not succeed).
         assert.strictEqual(emptyDirStub.callCount, 1, 'disk clear should run even after RPC failure');
         assert.strictEqual(emptyDirStub.firstCall.args[0], cacheDir.fsPath);
     });
@@ -191,6 +208,168 @@ suite('NativePythonFinderImpl.clearCache', () => {
             createFinder(Uri.file(path.join(os.tmpdir(), 'pet-clear-count')));
             assert.strictEqual(startStub.callCount, 1);
         });
+    });
+});
+
+suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
+    let outputChannel: LogOutputChannel;
+    const finders: NativePythonFinderImpl[] = [];
+
+    function makeConfig(): ConfigurationOptions {
+        return {
+            workspaceDirectories: [Uri.file(path.join('work', 'a')).fsPath],
+            environmentDirectories: [],
+            condaExecutable: undefined,
+            pipenvExecutable: undefined,
+            poetryExecutable: undefined,
+        };
+    }
+
+    function makeResult(): RefreshResult {
+        return { results: [], configuration: makeConfig() };
+    }
+
+    function createFinder(): NativePythonFinderImpl {
+        const finder = new NativePythonFinderImpl(
+            outputChannel,
+            path.join('tool', 'pet'),
+            makeApi(),
+            Uri.file(path.join(os.tmpdir(), 'pet-coalesce')),
+        );
+        finders.push(finder);
+        return finder;
+    }
+
+    setup(() => {
+        outputChannel = makeOutputChannel();
+        sinon.stub(fsExtra, 'emptyDir').resolves();
+        sinon.stub(telemetrySender, 'sendTelemetryEvent');
+        installStartStub();
+    });
+
+    teardown(() => {
+        disposeAll(finders);
+        sinon.restore();
+    });
+
+    // Replaces the pool's addToQueue so the test controls when each hard scan resolves, without
+    // spawning PET. Keeps the real pool object so dispose()'s pool.stop() still works.
+    function stubQueue(finder: NativePythonFinderImpl): sinon.SinonStub {
+        const pool = (finder as unknown as { pool: { addToQueue: unknown } }).pool;
+        return sinon.stub(pool as { addToQueue: () => Promise<RefreshResult> }, 'addToQueue');
+    }
+
+    function inFlightMap(finder: NativePythonFinderImpl): Map<string, unknown> {
+        return (finder as unknown as { inFlightRefreshes: Map<string, unknown> }).inFlightRefreshes;
+    }
+
+    test('coalesces concurrent hard refreshes for the same key within one generation', async () => {
+        const finder = createFinder();
+        const addToQueue = stubQueue(finder);
+        let resolve1!: (v: RefreshResult) => void;
+        addToQueue.onCall(0).returns(new Promise<RefreshResult>((r) => (resolve1 = r)));
+
+        const p1 = finder.refresh(true);
+        const p2 = finder.refresh(true); // same key ('all'), same generation → coalesced
+
+        assert.strictEqual(addToQueue.callCount, 1, 'the second concurrent refresh should coalesce');
+
+        resolve1(makeResult());
+        await Promise.all([p1, p2]);
+    });
+
+    test('a post-clear refresh does NOT coalesce onto a pre-clear in-flight scan', async () => {
+        const finder = createFinder();
+        const addToQueue = stubQueue(finder);
+        let resolve1!: (v: RefreshResult) => void;
+        let resolve2!: (v: RefreshResult) => void;
+        addToQueue.onCall(0).returns(new Promise<RefreshResult>((r) => (resolve1 = r)));
+        addToQueue.onCall(1).returns(new Promise<RefreshResult>((r) => (resolve2 = r)));
+
+        const p1 = finder.refresh(true); // generation 0, in flight
+        assert.strictEqual(addToQueue.callCount, 1);
+
+        await finder.clearCache(); // advances the generation
+
+        const p2 = finder.refresh(true); // generation 1 ≠ in-flight generation 0 → fresh scan
+        assert.strictEqual(
+            addToQueue.callCount,
+            2,
+            'a caller arriving after a clear must trigger a fresh scan, not reuse the stale one',
+        );
+
+        // The pre-clear scan resolving late must not repopulate the freshly cleared cache: its
+        // captured generation (0) no longer matches, so the tagging set() is a no-op.
+        resolve1(makeResult());
+        await p1;
+        const cache = (
+            finder as unknown as { cache: { getValid: (k: string, c: ConfigurationOptions) => unknown } }
+        ).cache;
+        assert.strictEqual(
+            cache.getValid('all', makeConfig()),
+            undefined,
+            'the stale pre-clear scan must not repopulate the cleared cache',
+        );
+
+        resolve2(makeResult());
+        await p2;
+    });
+
+    test('a settling pre-clear scan does not evict a newer request registered under the same key', async () => {
+        const finder = createFinder();
+        const addToQueue = stubQueue(finder);
+        let resolve1!: (v: RefreshResult) => void;
+        let resolve2!: (v: RefreshResult) => void;
+        addToQueue.onCall(0).returns(new Promise<RefreshResult>((r) => (resolve1 = r)));
+        addToQueue.onCall(1).returns(new Promise<RefreshResult>((r) => (resolve2 = r)));
+
+        const p1 = finder.refresh(true); // entry1 (generation 0)
+        await finder.clearCache(); // generation → 1
+        const p2 = finder.refresh(true); // entry2 (generation 1), overwrites the map slot
+        const entry2 = inFlightMap(finder).get('all');
+        assert.ok(entry2, 'the new refresh should be registered');
+
+        // The old pre-clear scan settles AFTER the new one registered. Its identity-safe cleanup must
+        // leave the newer slot intact.
+        resolve1(makeResult());
+        await p1;
+        assert.strictEqual(inFlightMap(finder).get('all'), entry2, 'the newer in-flight slot must survive');
+
+        // A third caller should coalesce onto the still-registered new scan, not spawn a third one.
+        const p3 = finder.refresh(true);
+        assert.strictEqual(addToQueue.callCount, 2, 'the third caller should coalesce onto the newer scan');
+
+        resolve2(makeResult());
+        await Promise.all([p2, p3]);
+    });
+
+    test('a settling pre-clear scan that REJECTS still does not evict a newer request', async () => {
+        const finder = createFinder();
+        const addToQueue = stubQueue(finder);
+        let reject1!: (e: unknown) => void;
+        let resolve2!: (v: RefreshResult) => void;
+        addToQueue.onCall(0).returns(new Promise<RefreshResult>((_resolve, reject) => (reject1 = reject)));
+        addToQueue.onCall(1).returns(new Promise<RefreshResult>((r) => (resolve2 = r)));
+
+        const p1 = finder.refresh(true); // entry1 (generation 0)
+        p1.catch(() => undefined); // the pre-clear scan is expected to reject
+        await finder.clearCache(); // generation → 1
+        const p2 = finder.refresh(true); // entry2 (generation 1), overwrites the map slot
+        const entry2 = inFlightMap(finder).get('all');
+        assert.ok(entry2, 'the new refresh should be registered');
+
+        // The old pre-clear scan REJECTS after the new one registered. Identity-safe cleanup runs in
+        // `.finally` on the rejection path too, so it must still leave the newer slot intact.
+        reject1(new Error('pre-clear scan failed'));
+        await p1.catch(() => undefined);
+        assert.strictEqual(
+            inFlightMap(finder).get('all'),
+            entry2,
+            'a rejected pre-clear scan must not evict the newer in-flight slot',
+        );
+
+        resolve2(makeResult());
+        await p2;
     });
 });
 

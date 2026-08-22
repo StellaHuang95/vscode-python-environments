@@ -353,6 +353,16 @@ async function sendRequestWithTimeout<T>(
 }
 
 /**
+ * A hard refresh that is currently running, tagged with the cache generation it was started under.
+ * The generation lets a later {@link NativePythonFinderImpl.clearCache} invalidate coalescing so a
+ * refresh that began before the clear cannot hand its stale results to a post-clear caller.
+ */
+interface InFlightRefresh {
+    promise: Promise<NativeInfo[]>;
+    generation: number;
+}
+
+/**
  * Concrete {@link NativePythonFinder} backed by the PET JSON-RPC server (with a CLI fallback).
  * Exported for unit testing; use {@link createNativePythonFinder} to construct one normally.
  */
@@ -362,9 +372,11 @@ export class NativePythonFinderImpl implements NativePythonFinder {
     private readonly cache = new DiscoveryResultCache();
     /**
      * Tracks in-flight hard refreshes by cache key so concurrent callers share a
-     * single PET scan instead of queueing duplicate work.
+     * single PET scan instead of queueing duplicate work. Each slot is tagged with the
+     * generation it began under so a clearCache() can stop post-clear callers from
+     * coalescing onto a stale, pre-clear scan.
      */
-    private inFlightRefreshes: Map<string, Promise<NativeInfo[]>> = new Map();
+    private inFlightRefreshes: Map<string, InFlightRefresh> = new Map();
     private startDisposables: Disposable[] = [];
     private proc: ChildProcess | undefined;
     private processExited: boolean = false;
@@ -598,9 +610,12 @@ export class NativePythonFinderImpl implements NativePythonFinder {
         const key = this.getKey(options);
 
         const inFlight = this.inFlightRefreshes.get(key);
-        if (inFlight) {
+        // Only coalesce with an in-flight refresh from the CURRENT generation. clearCache() advances
+        // the generation, so a scan that began before a clear must not hand its stale (pre-clear)
+        // results to a caller that arrived after the clear — that caller needs a fresh scan.
+        if (inFlight && inFlight.generation === this.cache.generation) {
             this.outputChannel.debug(`[Finder] Coalescing hard refresh with in-flight request for key: ${key}`);
-            return inFlight;
+            return inFlight.promise;
         }
 
         // Capture the cache generation at the moment this hard refresh begins. If an explicit
@@ -617,7 +632,14 @@ export class NativePythonFinderImpl implements NativePythonFinder {
         // .finally clears the in-flight slot on both success AND failure paths so
         // a rejected refresh does not poison the cache — the next call after a
         // failure starts a fresh attempt, matching today's behavior.
-        const refreshPromise = this.pool
+        const entry: InFlightRefresh = {
+            generation: generationAtStart,
+            // Placeholder: `entry.promise` is assigned synchronously below, before the map is
+            // populated. The cleanup closure only compares `entry` identity and never reads
+            // `entry.promise`, so this transient value is never load-bearing.
+            promise: undefined as unknown as Promise<NativeInfo[]>,
+        };
+        entry.promise = this.pool
             .addToQueue(options)
             .then((refreshResult) => {
                 const results = refreshResult?.results;
@@ -634,11 +656,15 @@ export class NativePythonFinderImpl implements NativePythonFinder {
                 return results;
             })
             .finally(() => {
-                this.inFlightRefreshes.delete(key);
+                // Identity-safe cleanup: only remove OUR slot. If a clear happened and a newer
+                // refresh replaced this key's entry, that newer entry must survive our completion.
+                if (this.inFlightRefreshes.get(key) === entry) {
+                    this.inFlightRefreshes.delete(key);
+                }
             });
 
-        this.inFlightRefreshes.set(key, refreshPromise);
-        return refreshPromise;
+        this.inFlightRefreshes.set(key, entry);
+        return entry.promise;
     }
 
     private async handleSoftRefresh(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
@@ -675,18 +701,40 @@ export class NativePythonFinderImpl implements NativePythonFinder {
 
         // 2) Clear the live PET server's IN-MEMORY cache when a process is running. PET's `clear`
         //    request wipes both its in-memory cache and its configured on-disk cacheDirectory. We do
-        //    NOT restart/spawn a process here — if none is running, the on-disk clear below suffices.
-        //    The request is bounded by a timeout so Clear Cache never waits indefinitely. A failure is
-        //    surfaced but not fatal: the on-disk clear below still empties our directory.
+        //    NOT restart/spawn a process here on success — if none is running, the on-disk clear below
+        //    suffices. The request is bounded by a timeout so Clear Cache never waits indefinitely. If
+        //    the request FAILS, PET's in-memory cache survives and the on-disk sweep below cannot evict
+        //    it, so we mark the server for restart (see below) rather than reporting a false success.
         let liveClearSucceeded = false;
         const serverLive = !this.startFailed && !this.processExited && this.proc !== undefined;
         if (serverLive) {
+            // Capture the exact process we send `clear` to. On failure we only reset THIS process: a
+            // concurrent restart may have swapped in a fresh (already empty-cache) server during the
+            // await, and killing that healthy replacement would just waste a restart cycle.
+            const procAtSend = this.proc;
             try {
                 await sendRequestWithTimeout(this.connection, 'clear', {}, CLEAR_TIMEOUT_MS);
                 liveClearSucceeded = true;
                 this.outputChannel.info('[pet] Cleared native discovery cache via live server');
             } catch (ex) {
-                this.outputChannel.warn('[pet] Live `clear` request failed; relying on on-disk clear', ex);
+                // The live clear failed (timeout or RPC error), so PET still holds its in-memory cache
+                // and emptying the on-disk directory alone would leave stale native results reachable.
+                // Terminate the current process and mark it for restart so the next discovery spawns a
+                // fresh server with an empty in-memory cache. All discovery/resolve paths call
+                // ensureProcessRunning() first, so none can read the stale cache before the restart.
+                // This is an intentional reset, so it does not consume the crash-restart budget. Skip
+                // when a restart is already underway or the process was replaced mid-await — that fresh
+                // process already starts empty.
+                this.outputChannel.warn(
+                    '[pet] Live `clear` request failed; restarting the PET server to drop its in-memory cache',
+                    ex,
+                );
+                if (!this.isRestarting && this.proc === procAtSend) {
+                    this.killProcess();
+                    this.processExited = true;
+                    this.processExitReason = 'clear_cache_reset';
+                    this.restartAttempts = 0;
+                }
             }
         }
 
