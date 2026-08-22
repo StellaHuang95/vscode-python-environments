@@ -1,6 +1,7 @@
 import { CancellationError } from 'vscode';
 import * as rpc from 'vscode-jsonrpc/node';
-import { RpcTimeoutError } from '../../managers/common/nativePythonFinder';
+import { RefreshBudgetExceededError, RpcTimeoutError } from '../../managers/common/nativePythonFinder';
+import { QueueTaskExpiredError } from '../utils/workerPool';
 import { BaseError } from '../errors/types';
 
 export type DiscoveryErrorType =
@@ -47,6 +48,13 @@ export function classifyError(ex: unknown): DiscoveryErrorType {
             default:
                 return 'rpc_timeout';
         }
+    }
+
+    // Bounded-latency errors: a queued refresh that expired before it could start, or a refresh whose
+    // end-to-end budget was spent mid-flight. Both are time-budget exhaustions, so they reuse the
+    // generic RPC timeout category (isTimeoutErrorType → true) rather than introducing a new bucket.
+    if (ex instanceof QueueTaskExpiredError || ex instanceof RefreshBudgetExceededError) {
+        return 'rpc_timeout';
     }
 
     // JSON-RPC connection errors (e.g., PET process died mid-request, connection closed/disposed)

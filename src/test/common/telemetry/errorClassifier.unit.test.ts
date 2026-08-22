@@ -3,7 +3,8 @@ import { CancellationError } from 'vscode';
 import * as rpc from 'vscode-jsonrpc/node';
 import { BaseError } from '../../../common/errors/types';
 import { classifyError, isTimeoutErrorType } from '../../../common/telemetry/errorClassifier';
-import { RpcTimeoutError } from '../../../managers/common/nativePythonFinder';
+import { QueueTaskExpiredError } from '../../../common/utils/workerPool';
+import { RefreshBudgetExceededError, RpcTimeoutError } from '../../../managers/common/nativePythonFinder';
 
 suite('Error Classifier', () => {
     suite('classifyError', () => {
@@ -16,6 +17,20 @@ suite('Error Classifier', () => {
             assert.strictEqual(classifyError(new RpcTimeoutError('refresh', 30000)), 'rpc_refresh_timeout');
             assert.strictEqual(classifyError(new RpcTimeoutError('resolve', 30000)), 'rpc_resolve_timeout');
             assert.strictEqual(classifyError(new RpcTimeoutError('info', 2000)), 'rpc_timeout');
+        });
+
+        test('should classify a QueueTaskExpiredError as a timeout (rpc_timeout)', () => {
+            const errorType = classifyError(new QueueTaskExpiredError(214_000));
+            assert.strictEqual(errorType, 'rpc_timeout');
+            assert.ok(isTimeoutErrorType(errorType), 'queue expiration should record as a timeout');
+        });
+
+        test('should classify a RefreshBudgetExceededError as a timeout (rpc_timeout)', () => {
+            // Message contains the word "restart", which would otherwise match the process_crash
+            // pattern — verifies the instanceof branch runs before message-pattern classification.
+            const errorType = classifyError(new RefreshBudgetExceededError('restart', 250));
+            assert.strictEqual(errorType, 'rpc_timeout');
+            assert.ok(isTimeoutErrorType(errorType), 'budget exhaustion should record as a timeout');
         });
 
         test('should classify non-Error values as unknown', () => {

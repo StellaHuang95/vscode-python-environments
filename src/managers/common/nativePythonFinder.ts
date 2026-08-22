@@ -1,6 +1,7 @@
 import { ChildProcess } from 'child_process';
 import * as fs from 'fs-extra';
 import * as path from 'path';
+import { performance } from 'perf_hooks';
 import { PassThrough } from 'stream';
 import { CancellationTokenSource, Disposable, ExtensionContext, LogOutputChannel, Uri } from 'vscode';
 import * as rpc from 'vscode-jsonrpc/node';
@@ -15,7 +16,7 @@ import { classifyError, isTimeoutErrorType } from '../../common/telemetry/errorC
 import { sendTelemetryEvent } from '../../common/telemetry/sender';
 import { untildify, untildifyArray } from '../../common/utils/pathUtils';
 import { isWindows } from '../../common/utils/platformUtils';
-import { createRunningWorkerPool, WorkerPool } from '../../common/utils/workerPool';
+import { createRunningWorkerPool, QueuePosition, WorkerPool } from '../../common/utils/workerPool';
 import { getConfiguration, getWorkspaceFolders } from '../../common/workspace.apis';
 import {
     getRefreshTelemetryMeasures,
@@ -90,6 +91,263 @@ export class ConfigureRetryState {
     reset(): void {
         this._timeoutCount = 0;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded end-to-end refresh latency
+// ---------------------------------------------------------------------------
+
+/**
+ * Smallest remaining budget, in milliseconds, in which it is still worth starting an
+ * extension-controlled stage (configure/refresh/resolve/CLI). Below this floor we fail fast
+ * with {@link RefreshBudgetExceededError} instead of handing a stage a near-zero timeout that
+ * would almost certainly expire. Justification: the fastest PET JSON-RPC round-trip (`info`, a
+ * constant lookup) is budgeted a "generous" {@link INFO_TIMEOUT_MS} (2s); one second is a hard
+ * floor below which even a trivial round-trip is unlikely to complete.
+ */
+export const MIN_STAGE_BUDGET_MS = 1_000;
+
+/**
+ * Computes the worst-case wall-clock of a *successful* server-mode refresh operation from the
+ * existing stage constants. This is one of the two inputs to {@link computeRefreshOperationBudgetMs}.
+ *
+ * A successful `doRefresh` runs at most `MAX_REFRESH_RETRIES + 1` (= 2) attempts. The longest
+ * successful path is reachable when the operation enters with an elevated restart-attempt state
+ * (`restartAttempts = 2`) and a pending configure-timeout backoff (`configureRetry.timeoutCount = 1`)
+ * while the process is healthy:
+ *
+ *   Attempt 0 — fails with a *retryable* refresh-RPC timeout (which triggers the single retry).
+ *   No restart precedes it, so the extended configure timeout is NOT reset:
+ *     - configure (extended after a prior timeout): MAX_CONFIGURE_TIMEOUT_MS   (60s)
+ *     - refresh RPC timeout:                        REFRESH_TIMEOUT_MS          (30s)
+ *     = 90s
+ *
+ *   Attempt 1 — restarts the process killed by attempt 0, then succeeds. The restart resets the
+ *   configure timeout to its base:
+ *     - restart backoff at the highest reachable attempt:
+ *         RESTART_BACKOFF_BASE_MS * 2^(MAX_RESTART_ATTEMPTS - 1)                (1s * 2^2 = 4s)
+ *     - configure (reset to base by the restart):   CONFIGURE_TIMEOUT_MS       (30s)
+ *     - refresh RPC:                                REFRESH_TIMEOUT_MS         (30s)
+ *     - parallel resolve enrichment (bounded):      RESOLVE_TIMEOUT_MS         (30s)
+ *     = 94s
+ *
+ *   Total = 90s + 94s = 184s.
+ *
+ * The two attempts hit their individual maxima under the same reachable entry state (a failing
+ * attempt with no restart but extended configure, followed by a succeeding attempt that restarts
+ * at attempt index 2), so the sum is an attained maximum, not a loose over-approximation.
+ *
+ * The derivation is expressed in terms of {@link MAX_REFRESH_RETRIES} so the budget scales if the
+ * retry count ever changes: only the first attempt can carry the extended configure timeout without
+ * a preceding restart (every later attempt must restart first, which resets configure to its base),
+ * so additional retries are modeled with the restart-based per-attempt cost.
+ */
+export function computeServerRefreshBudgetMs(): number {
+    const maxRestartBackoffMs = RESTART_BACKOFF_BASE_MS * Math.pow(2, MAX_RESTART_ATTEMPTS - 1);
+    // Only the first attempt can time out on an extended (already-backed-off) configure without a
+    // preceding restart. Every later attempt restarts first, which resets configure to its base.
+    const firstFailingAttemptMs = MAX_CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS;
+    const additionalFailingAttemptMs = maxRestartBackoffMs + CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS;
+    const failingAttemptsMs =
+        MAX_REFRESH_RETRIES > 0
+            ? firstFailingAttemptMs + (MAX_REFRESH_RETRIES - 1) * additionalFailingAttemptMs
+            : 0;
+    const succeedingAttemptMs = maxRestartBackoffMs + CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS + RESOLVE_TIMEOUT_MS;
+    return failingAttemptsMs + succeedingAttemptMs;
+}
+
+/**
+ * Computes the budget needed for the *CLI fallback* path, which is itself a valid successful path
+ * and must keep its established enumeration timeout ({@link CLI_FALLBACK_TIMEOUT_MS}) rather than
+ * being cut to whatever tiny remainder the server path leaves behind.
+ *
+ * The fallback is reached after the server path gives up. To bound its total latency without
+ * starving the CLI, we model:
+ *   - one worst *failing* server attempt (extended configure + refresh timeout):
+ *       MAX_CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS                          (60s + 30s = 90s)
+ *   - the restart/kill transition into the fallback (one max restart backoff):
+ *       RESTART_BACKOFF_BASE_MS * 2^(MAX_RESTART_ATTEMPTS - 1)                 (4s)
+ *   - the full CLI enumeration:
+ *       CLI_FALLBACK_TIMEOUT_MS                                               (120s)
+ *   = 214s
+ *
+ * To keep the server path from consuming this reserve, {@link retryWouldStarveCliFallbackMs} makes
+ * `doRefresh` skip a second server retry (and fall back to the CLI immediately) whenever another
+ * server attempt would leave less than a full CLI enumeration.
+ */
+export function computeCliFallbackPathBudgetMs(): number {
+    const maxRestartBackoffMs = RESTART_BACKOFF_BASE_MS * Math.pow(2, MAX_RESTART_ATTEMPTS - 1);
+    const worstServerAttemptMs = MAX_CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS;
+    const transitionMs = maxRestartBackoffMs;
+    return worstServerAttemptMs + transitionMs + CLI_FALLBACK_TIMEOUT_MS;
+}
+
+/**
+ * The single end-to-end budget for one queued refresh operation. It is the *maximum* of the two
+ * reachable successful paths — the full server retry path and the CLI-fallback path — so the cap
+ * can never truncate either valid flow, and is deliberately NOT a stack of every pathological
+ * timeout. With today's constants this is `max(184s, 214s) = 214s`.
+ */
+export function computeRefreshOperationBudgetMs(): number {
+    return Math.max(computeServerRefreshBudgetMs(), computeCliFallbackPathBudgetMs());
+}
+
+/**
+ * Returns true when doing another server refresh attempt would leave less than a full CLI
+ * enumeration ({@link CLI_FALLBACK_TIMEOUT_MS} + one stage floor) of remaining budget. `doRefresh`
+ * uses this to skip a second server retry and fall back to the CLI immediately, preserving the CLI
+ * enumeration budget instead of burning it on a retry.
+ *
+ * The worst additional server attempt is a restart-backed attempt (restart backoff + base configure
+ * + refresh); the extended-configure maximum only applies to the very first attempt, which has
+ * already happened by the time this is consulted.
+ */
+export function retryWouldStarveCliFallbackMs(remainingMs: number): boolean {
+    const maxRestartBackoffMs = RESTART_BACKOFF_BASE_MS * Math.pow(2, MAX_RESTART_ATTEMPTS - 1);
+    const worstRetryCostMs = maxRestartBackoffMs + CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS;
+    const cliReserveMs = CLI_FALLBACK_TIMEOUT_MS + MIN_STAGE_BUDGET_MS;
+    return remainingMs < worstRetryCostMs + cliReserveMs;
+}
+
+/** The action `doRefresh` takes after a server refresh attempt fails. See {@link decideRefreshRetry}. */
+export type RefreshRetryAction =
+    | { kind: 'retry' } // kill + restart the process and try another server attempt
+    // stop server mode and fall back to the JSON CLI (an existing success path). `reason` records why,
+    // so the caller's log selection rides with the decision instead of re-deriving it:
+    //   'starvation'       — another server retry would consume the reserved CLI enumeration budget
+    //   'server-exhausted' — all restart attempts are used / the process is dead
+    | { kind: 'cli-fallback'; reason: 'starvation' | 'server-exhausted' }
+    | { kind: 'budget-exceeded' } // the operation budget can no longer fund another attempt
+    | { kind: 'rethrow' }; // surface the original error unchanged
+
+/** Inputs to {@link decideRefreshRetry}. All values are read once by the caller to avoid clock races. */
+export interface RefreshRetryDecisionInput {
+    /** The failure is already a {@link RefreshBudgetExceededError} (deadline provenance preserved upstream). */
+    isBudgetError: boolean;
+    /** A retryable transport failure (refresh-RPC timeout or connection error), not a configure error. */
+    isRetryable: boolean;
+    /** Zero-based index of the attempt that just failed. */
+    attempt: number;
+    /** Maximum additional retries ({@link MAX_REFRESH_RETRIES}). */
+    maxRetries: number;
+    /** Remaining operation budget in ms, or `undefined` when the caller supplied no deadline. */
+    remainingMs: number | undefined;
+    /** Whether server mode is fully exhausted (all restart attempts used / process dead). */
+    serverExhausted: boolean;
+}
+
+/**
+ * Pure decision for `doRefresh`'s post-failure control flow: retry another server attempt, fall back
+ * to the CLI, surface a budget error, or rethrow. Extracted from `doRefresh` so the *composed*
+ * retry/CLI-fallback/budget decision — not just the arithmetic helpers it builds on — is unit-testable
+ * without spawning a real PET process or exporting the finder implementation. The caller performs the
+ * side effects (logging, kill/restart, throwing) so this stays free of I/O.
+ *
+ * Ordering mirrors the original inline logic exactly:
+ *  1. A budget error stops immediately (never retry/fall back — the CLI shares the same deadline).
+ *  2. A retryable failure with retries left: fail fast if the budget is below one stage floor, else
+ *     fall back to the CLI when another attempt would starve the reserved CLI enumeration budget,
+ *     otherwise retry.
+ *  3. Otherwise (non-retryable, or the final attempt): fall back to the CLI iff server mode is
+ *     exhausted, else rethrow.
+ */
+export function decideRefreshRetry(input: RefreshRetryDecisionInput): RefreshRetryAction {
+    if (input.isBudgetError) {
+        return { kind: 'rethrow' };
+    }
+
+    if (input.isRetryable && input.attempt < input.maxRetries) {
+        // A deadline is present (refresh path) but can no longer fund another attempt.
+        if (input.remainingMs !== undefined && input.remainingMs < MIN_STAGE_BUDGET_MS) {
+            return { kind: 'budget-exceeded' };
+        }
+        // Another server attempt would consume the reserved CLI enumeration budget: fall back now.
+        if (input.remainingMs !== undefined && retryWouldStarveCliFallbackMs(input.remainingMs)) {
+            return { kind: 'cli-fallback', reason: 'starvation' };
+        }
+        return { kind: 'retry' };
+    }
+
+    if (input.serverExhausted) {
+        return { kind: 'cli-fallback', reason: 'server-exhausted' };
+    }
+    return { kind: 'rethrow' };
+}
+
+/** End-to-end budget for a single queued refresh operation. See {@link computeRefreshOperationBudgetMs}. */
+export const REFRESH_OPERATION_BUDGET_MS = computeRefreshOperationBudgetMs();
+
+/** Monotonic clock (immune to wall-clock adjustments) used for deadlines. Injectable for tests. */
+export type MonotonicClock = () => number;
+
+const defaultMonotonicClock: MonotonicClock = () => performance.now();
+
+/**
+ * An absolute, monotonic deadline captured at enqueue time. All running stages of a bounded
+ * refresh clamp their timeouts to {@link remainingMs} so the operation cannot exceed its budget.
+ */
+export class Deadline {
+    private readonly deadlineAt: number;
+
+    /**
+     * @param budgetMs Total time, in milliseconds, allowed from construction until the deadline.
+     * @param now Monotonic clock. Defaults to `performance.now()`; injectable for deterministic tests.
+     */
+    constructor(
+        budgetMs: number,
+        private readonly now: MonotonicClock = defaultMonotonicClock,
+    ) {
+        this.deadlineAt = this.now() + budgetMs;
+    }
+
+    /** Milliseconds left before the deadline. Negative once the deadline has passed. */
+    remainingMs(): number {
+        return this.deadlineAt - this.now();
+    }
+
+    /** True when the remaining budget is below `floorMs` (default {@link MIN_STAGE_BUDGET_MS}). */
+    isExhausted(floorMs: number = MIN_STAGE_BUDGET_MS): boolean {
+        return this.remainingMs() < floorMs;
+    }
+}
+
+/**
+ * Error used to reject a bounded refresh (or one of its stages) once the operation budget is spent.
+ * @param stage Short identifier of the stage that ran out of budget (for logs/telemetry).
+ */
+export class RefreshBudgetExceededError extends Error {
+    constructor(
+        public readonly stage: string,
+        remainingMs: number,
+    ) {
+        super(`Refresh operation budget exceeded at stage '${stage}' (remaining ${Math.round(remainingMs)}ms)`);
+        this.name = this.constructor.name;
+    }
+}
+
+/**
+ * Clamps a stage's base timeout to the deadline's remaining budget.
+ *
+ * - When `deadline` is undefined (resolve and other non-refresh callers), returns `baseTimeoutMs`
+ *   unchanged so existing behavior is preserved.
+ * - When the remaining budget is below `floorMs`, throws {@link RefreshBudgetExceededError} so the
+ *   caller fails fast instead of starting a stage that would almost certainly time out.
+ * - Otherwise returns `min(baseTimeoutMs, remaining)`.
+ */
+export function clampTimeoutToRemaining(
+    baseTimeoutMs: number,
+    deadline: Deadline | undefined,
+    stage: string,
+    floorMs: number = MIN_STAGE_BUDGET_MS,
+): number {
+    if (deadline === undefined) {
+        return baseTimeoutMs;
+    }
+    const remaining = deadline.remainingMs();
+    if (remaining < floorMs) {
+        throw new RefreshBudgetExceededError(stage, remaining);
+    }
+    return Math.min(baseTimeoutMs, remaining);
 }
 
 export type NativePythonToolsSource = 'envs_extension' | 'python_extension';
@@ -342,9 +600,86 @@ async function sendRequestWithTimeout<T>(
     }
 }
 
+/**
+ * Converts a stage failure into a {@link RefreshBudgetExceededError} when the failure was caused by
+ * our own deadline clamp rather than genuine PET slowness — preserving *deadline provenance*.
+ *
+ * A stage is reclassified only when BOTH hold:
+ *  - `wasClamped` is true: the stage's effective timeout was the remaining operation budget (the
+ *    deadline was the binding constraint), not the stage's own base timeout. Callers compute this at
+ *    clamp time as `deadline !== undefined && effectiveTimeout < baseTimeout` (see
+ *    {@link clampTimeoutToRemaining}).
+ *  - the failure is an {@link RpcTimeoutError}: a stage clamped to the remaining budget that then
+ *    times out necessarily consumed the whole budget, so the deadline — not PET — ended it.
+ *
+ * Detecting this lets callers reclassify the failure as a budget-cap error *before* mutating ordinary
+ * stage retry counters or emitting stage-timeout telemetry, so a deadline cap is never misattributed
+ * to a slow PET. We deliberately do NOT infer this from a post-hoc `deadline.isExhausted()` check: a
+ * stage that ran on its *unclamped* base timeout and merely happened to finish with less than the
+ * floor of budget left (e.g. a 30s base timeout that started with 30.5s remaining) is a genuine PET
+ * timeout and must keep normal timeout/retry/recovery handling.
+ *
+ * Returns `undefined` (leave the error as an ordinary stage timeout) when the stage was not
+ * deadline-clamped, there is no deadline, or the error is not an {@link RpcTimeoutError}.
+ */
+export function toBudgetError(
+    ex: unknown,
+    deadline: Deadline | undefined,
+    stage: string,
+    wasClamped: boolean,
+): RefreshBudgetExceededError | undefined {
+    if (deadline !== undefined && wasClamped && ex instanceof RpcTimeoutError) {
+        return new RefreshBudgetExceededError(stage, deadline.remainingMs());
+    }
+    return undefined;
+}
+
+/**
+ * Awaits a (already clamped) restart backoff, then rechecks the deadline. Rejects with
+ * {@link RefreshBudgetExceededError} if the budget was spent during the wait, so a restart never
+ * proceeds to teardown/spawn after the deadline has passed.
+ *
+ * @param waitMs Backoff duration to wait (callers clamp this to the remaining budget first).
+ * @param deadline Optional operation deadline; when omitted the wait is unbounded (existing behavior).
+ * @param sleep Injectable sleep, for deterministic tests.
+ */
+export async function backoffThenCheckBudget(
+    waitMs: number,
+    deadline: Deadline | undefined,
+    sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+): Promise<void> {
+    if (waitMs > 0) {
+        await sleep(waitMs);
+    }
+    if (deadline?.isExhausted()) {
+        throw new RefreshBudgetExceededError('restart', deadline.remainingMs());
+    }
+}
+
+/**
+ * Item queued on the refresh worker pool. Carries the caller's refresh options plus the optional
+ * end-to-end {@link Deadline} captured at enqueue time, so the worker can clamp its running stages
+ * to the remaining budget.
+ */
+interface RefreshWorkItem {
+    options?: NativePythonEnvironmentKind | Uri[];
+    deadline?: Deadline;
+}
+
+/**
+ * Result of a single `doRefresh`. `complete` is false when the environment enumeration succeeded but
+ * per-environment enrichment (resolve) was cut short by the operation budget. Consumers still receive
+ * the full enumerated `info`, but an incomplete result is NOT written to the soft cache, so a later
+ * refresh retries the enrichment. Enumeration failures reject instead of returning a partial list.
+ */
+interface RefreshResult {
+    info: NativeInfo[];
+    complete: boolean;
+}
+
 class NativePythonFinderImpl implements NativePythonFinder {
     private connection: rpc.MessageConnection;
-    private readonly pool: WorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>;
+    private readonly pool: WorkerPool<RefreshWorkItem, RefreshResult>;
     private cache: Map<string, NativeInfo[]> = new Map();
     /**
      * Tracks in-flight hard refreshes by cache key so concurrent callers share a
@@ -374,8 +709,8 @@ class NativePythonFinderImpl implements NativePythonFinder {
         private readonly cacheDirectory?: Uri,
     ) {
         this.connection = this.start();
-        this.pool = createRunningWorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>(
-            async (options) => await this.doRefresh(options),
+        this.pool = createRunningWorkerPool<RefreshWorkItem, RefreshResult>(
+            async (work) => await this.doRefresh(work.options, work.deadline),
             1,
             'NativeRefresh-task',
         );
@@ -439,9 +774,12 @@ class NativePythonFinderImpl implements NativePythonFinder {
     /**
      * Ensures the PET process is running. If it has exited or failed, attempts to restart
      * with exponential backoff up to MAX_RESTART_ATTEMPTS times.
+     * @param deadline Optional operation deadline. When provided, the restart backoff is clamped to
+     *        the remaining budget and a restart is refused once the budget is spent.
      * @throws Error if the process cannot be started after all retry attempts
+     * @throws RefreshBudgetExceededError if the operation budget is spent
      */
-    private async ensureProcessRunning(): Promise<void> {
+    private async ensureProcessRunning(deadline?: Deadline): Promise<void> {
         // Process is running fine
         if (!this.startFailed && !this.processExited) {
             return;
@@ -462,36 +800,51 @@ class NativePythonFinderImpl implements NativePythonFinder {
         }
 
         // Attempt restart with exponential backoff
-        await this.restart();
+        await this.restart(deadline);
     }
 
     /**
      * Kills the current PET process (if running) and starts a fresh one.
      * Implements exponential backoff between restart attempts.
+     * @param deadline Optional operation deadline. When provided, the backoff wait is clamped to the
+     *        remaining budget and the restart fails fast if the budget is already spent.
      */
-    private async restart(): Promise<void> {
+    private async restart(deadline?: Deadline): Promise<void> {
+        // Fail fast before mutating any state if the budget can no longer fund a restart + a useful
+        // follow-up request. Leaves process/connection state untouched for the next operation.
+        if (deadline?.isExhausted()) {
+            throw new RefreshBudgetExceededError('restart', deadline.remainingMs());
+        }
+
         this.isRestarting = true;
         this.restartAttempts++;
         const attempt = this.restartAttempts;
         const triggerReason = this.processExitReason ?? (this.startFailed ? 'start_failed' : 'unknown');
 
+        // Clamp the exponential backoff to the remaining budget so a restart never overshoots the
+        // operation deadline (unbounded when no deadline is supplied — resolve/non-refresh callers).
         const backoffMs = RESTART_BACKOFF_BASE_MS * Math.pow(2, this.restartAttempts - 1);
+        const waitMs = deadline ? Math.min(backoffMs, Math.max(0, deadline.remainingMs())) : backoffMs;
         this.outputChannel.warn(
             `[pet] Restarting Python Environment Tools (attempt ${this.restartAttempts}/${MAX_RESTART_ATTEMPTS}, ` +
-                `waiting ${backoffMs}ms)`,
+                `waiting ${waitMs}ms)`,
         );
 
         const sw = new StopWatch();
         try {
+            // Wait out the (clamped) exponential backoff FIRST, then recheck the deadline. Once the
+            // operation budget is spent we must not tear down the current process or spawn a
+            // replacement, so this recheck sits immediately before teardown / state-reset / spawn.
+            // backoffThenCheckBudget throws RefreshBudgetExceededError if the budget elapsed during
+            // the wait; it is a plain (unbounded) wait when no deadline is supplied.
+            await backoffThenCheckBudget(waitMs, deadline);
+
             // Kill existing process if still running
             this.killProcess();
 
             // Dispose existing connection and streams
             this.startDisposables.forEach((d) => d.dispose());
             this.startDisposables = [];
-
-            // Wait with exponential backoff before restarting
-            await new Promise((resolve) => setTimeout(resolve, backoffMs));
 
             // Reset state flags
             this.processExited = false;
@@ -517,6 +870,15 @@ class NativePythonFinderImpl implements NativePythonFinder {
             // Reset restart attempts on successful start (process didn't immediately fail)
             // We'll reset this only after a successful request completes
         } catch (ex) {
+            if (ex instanceof RefreshBudgetExceededError) {
+                // The operation budget was spent during the clamped backoff wait. This is a budget
+                // cap, not a restart failure: undo the speculative attempt increment (no process was
+                // actually spawned) and skip restart-error telemetry so it is not misclassified as a
+                // PET restart error. The caller propagates it through the budget path.
+                this.restartAttempts--;
+                this.outputChannel.warn(`[pet] Restart aborted before spawn: ${ex.message}`);
+                throw ex;
+            }
             sendTelemetryEvent(
                 EventNames.PET_PROCESS_RESTART,
                 { duration: sw.elapsedTime, attempt },
@@ -596,18 +958,42 @@ class NativePythonFinderImpl implements NativePythonFinder {
             this.outputChannel.debug(`[Finder] Hard refresh for key: ${key}`);
         }
 
+        // A single monotonic deadline, captured now (enqueue time), bounds the operation end to end:
+        // the worker pool rejects the item with QueueTaskExpiredError if it is still queued when the
+        // budget elapses, and the same deadline clamps every running stage (configure/refresh/resolve/
+        // restart/CLI). This caps both unbounded queue wait behind a stuck refresh and CLI enrichment
+        // that would otherwise scale with the environment count.
+        //
+        // Trade-off (intentional): because the deadline is captured at enqueue and shared by the
+        // queue wait and the running stages, time spent waiting in the queue is subtracted from the
+        // running budget. Under sustained contention a distinct-key refresh queued behind a slow (but
+        // not yet stuck) refresh may therefore fail fast rather than wait unbounded — this is the
+        // point of the bound. In practice the common startup fan-out coalesces (all managers refresh
+        // key 'all', deduped via inFlightRefreshes), so genuinely distinct-key contention is rare.
+        const deadline = new Deadline(REFRESH_OPERATION_BUDGET_MS);
+
         // .finally clears the in-flight slot on both success AND failure paths so
         // a rejected refresh does not poison the cache — the next call after a
         // failure starts a fresh attempt, matching today's behavior.
         const refreshPromise = this.pool
-            .addToQueue(options)
+            .addToQueue({ options, deadline }, QueuePosition.back, REFRESH_OPERATION_BUDGET_MS)
             .then((result) => {
-                if (!result || !Array.isArray(result)) {
+                if (!result || !Array.isArray(result.info)) {
                     this.outputChannel.warn(`[pet] Worker pool returned invalid result type: ${typeof result}`);
                     return [] as NativeInfo[];
                 }
-                this.cache.set(key, result);
-                return result;
+                // Only cache a fully-enriched result. When enumeration succeeded but per-environment
+                // enrichment was cut short by the operation budget (complete === false), we still hand
+                // the caller the full enumerated list, but skip the cache so a later refresh retries
+                // the enrichment instead of serving a permanently under-resolved result.
+                if (result.complete) {
+                    this.cache.set(key, result.info);
+                } else {
+                    this.outputChannel.debug(
+                        `[Finder] Not caching enrichment-incomplete result for key: ${key} (budget exhausted during resolve)`,
+                    );
+                }
+                return result.info;
             })
             .finally(() => {
                 this.inFlightRefreshes.delete(key);
@@ -843,20 +1229,63 @@ class NativePythonFinderImpl implements NativePythonFinder {
         };
     }
 
-    private async doRefresh(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
+    private async doRefresh(
+        options?: NativePythonEnvironmentKind | Uri[],
+        deadline?: Deadline,
+    ): Promise<RefreshResult> {
         let lastError: unknown;
 
         for (let attempt = 0; attempt <= MAX_REFRESH_RETRIES; attempt++) {
             try {
-                return await this.doRefreshAttempt(options, attempt);
+                return await this.doRefreshAttempt(options, attempt, deadline);
             } catch (ex) {
                 lastError = ex;
 
-                // Retry on timeout or connection errors (PET hung or crashed mid-request)
+                const isBudgetError = ex instanceof RefreshBudgetExceededError;
+                // Retry on timeout or connection errors (PET hung or crashed mid-request).
                 const isRetryable =
                     (ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError;
-                if (isRetryable) {
-                    if (attempt < MAX_REFRESH_RETRIES) {
+                // Read the remaining budget once so the decision and any budget error it produces
+                // observe the same clock sample. `remainingMs` / `isServerExhausted()` are pure,
+                // synchronous reads, so evaluating them eagerly for every caught error (rather than
+                // lazily per-branch as the original did) yields identical values with no side effects.
+                const remainingMs = deadline?.remainingMs();
+
+                // The final retryable attempt is logged before the (shared) server-exhausted check,
+                // matching the original inline ordering.
+                if (isRetryable && attempt >= MAX_REFRESH_RETRIES) {
+                    this.outputChannel.error(`[pet] Refresh failed after ${MAX_REFRESH_RETRIES + 1} attempts`);
+                }
+
+                const decision = decideRefreshRetry({
+                    isBudgetError,
+                    isRetryable,
+                    attempt,
+                    maxRetries: MAX_REFRESH_RETRIES,
+                    remainingMs,
+                    serverExhausted: this.isServerExhausted(),
+                });
+
+                switch (decision.kind) {
+                    case 'budget-exceeded':
+                        // The deadline can no longer fund another attempt: surface a budget error
+                        // instead of burning the remaining time on a doomed restart + retry.
+                        this.outputChannel.warn('[pet] Refresh budget exhausted after attempt failure, not retrying');
+                        throw new RefreshBudgetExceededError('refresh_retry', remainingMs ?? 0);
+                    case 'cli-fallback':
+                        if (decision.reason === 'starvation') {
+                            // Skipped the retry to preserve the reserved CLI enumeration budget.
+                            // doRefreshAttempt already killed the process / set processExited for this
+                            // retryable failure, so the CLI fallback starts from a clean slate.
+                            this.outputChannel.warn(
+                                '[pet] Skipping server retry to preserve the CLI enumeration budget; falling back to JSON CLI',
+                            );
+                        } else {
+                            // Server mode is fully exhausted (all restart attempts used / process dead).
+                            this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh');
+                        }
+                        return await this.refreshViaJsonCli(options, deadline);
+                    case 'retry': {
                         const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
                         this.outputChannel.warn(
                             `[pet] Refresh ${reason} (attempt ${attempt + 1}/${MAX_REFRESH_RETRIES + 1}), restarting and retrying...`,
@@ -868,22 +1297,23 @@ class NativePythonFinderImpl implements NativePythonFinder {
                             ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
                         continue;
                     }
-                    // Final attempt failed
-                    this.outputChannel.error(`[pet] Refresh failed after ${MAX_REFRESH_RETRIES + 1} attempts`);
+                    case 'rethrow':
+                        // Budget errors stop immediately (the CLI shares this same deadline and would
+                        // only fail its own budget check); other non-retryable errors surface as-is.
+                        if (ex instanceof RefreshBudgetExceededError) {
+                            this.outputChannel.warn(
+                                `[pet] Refresh operation budget exhausted (${ex.message}), aborting`,
+                            );
+                        }
+                        throw ex;
                 }
-                // Non-timeout errors or final timeout — check if server is fully exhausted
-                if (this.isServerExhausted()) {
-                    this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh');
-                    return this.refreshViaJsonCli(options);
-                }
-                throw ex;
             }
         }
 
         // Should not reach here, but TypeScript needs this
         if (this.isServerExhausted()) {
             this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh (final)');
-            return this.refreshViaJsonCli(options);
+            return this.refreshViaJsonCli(options, deadline);
         }
         throw lastError;
     }
@@ -891,33 +1321,51 @@ class NativePythonFinderImpl implements NativePythonFinder {
     private async doRefreshAttempt(
         options: NativePythonEnvironmentKind | Uri[] | undefined,
         attempt: number,
-    ): Promise<NativeInfo[]> {
-        await this.ensureProcessRunning();
+        deadline?: Deadline,
+    ): Promise<RefreshResult> {
+        await this.ensureProcessRunning(deadline);
         const disposables: Disposable[] = [];
         const unresolved: Promise<void>[] = [];
         const nativeInfo: NativeInfo[] = [];
         const sw = new StopWatch();
         let unresolvedCount = 0;
+        // True when enumeration succeeded but at least one enrichment resolve was cut short by the
+        // operation budget. The full (partially-unresolved) list is still returned to the caller, but
+        // handleHardRefresh will not cache it, so a later refresh retries the enrichment.
+        let enrichmentIncomplete = false;
         let refreshPerf: RefreshPerformance | undefined;
         let workspaceDirCount: number | undefined;
         let searchPathCount: number | undefined;
+        // Hoisted so the catch can tell whether the refresh RPC ran on the deadline's remaining
+        // budget (clamped) vs its own base timeout — only a clamped timeout is a budget cap.
+        let refreshTimeoutMs = REFRESH_TIMEOUT_MS;
         try {
             const configuration = await this.buildConfigurationOptions();
             workspaceDirCount = configuration.workspaceDirectories.length;
             searchPathCount = configuration.environmentDirectories.length;
-            await this.configure(configuration);
+            await this.configure(configuration, deadline);
             const refreshOptions = this.getRefreshOptions(options);
             disposables.push(
                 this.connection.onNotification('environment', (data: NativeEnvInfo) => {
                     this.outputChannel.info(`Discovered env: ${data.executable || data.prefix}`);
                     if (data.executable && (!data.version || !data.prefix)) {
                         unresolvedCount++;
+                        // Clamp each enrichment resolve to the remaining budget. If the budget is
+                        // already spent, keep the unresolved record (never drop a discovered env).
+                        let resolveTimeout: number;
+                        try {
+                            resolveTimeout = clampTimeoutToRemaining(RESOLVE_TIMEOUT_MS, deadline, 'refresh_resolve');
+                        } catch {
+                            enrichmentIncomplete = true;
+                            nativeInfo.push(data);
+                            return;
+                        }
                         unresolved.push(
                             sendRequestWithTimeout<NativeEnvInfo>(
                                 this.connection,
                                 'resolve',
                                 { executable: data.executable },
-                                RESOLVE_TIMEOUT_MS,
+                                resolveTimeout,
                             )
                                 .then((environment: NativeEnvInfo) => {
                                     this.outputChannel.info(
@@ -925,9 +1373,19 @@ class NativePythonFinderImpl implements NativePythonFinder {
                                     );
                                     nativeInfo.push(environment);
                                 })
-                                .catch((ex) =>
-                                    this.outputChannel.error(`Error in Resolving ${JSON.stringify(data)}`, ex),
-                                ),
+                                .catch((ex) => {
+                                    // A resolve whose (clamped) timeout was cut short by an exhausted
+                                    // budget must not drop the env — retain the unresolved record so
+                                    // budget pressure never truncates discovery (mirrors the CLI path
+                                    // and the budget-skip branch above). Genuine resolve failures with
+                                    // budget still to spare keep the existing log-and-drop behavior.
+                                    if (deadline?.isExhausted()) {
+                                        enrichmentIncomplete = true;
+                                        nativeInfo.push(data);
+                                        return;
+                                    }
+                                    this.outputChannel.error(`Error in Resolving ${JSON.stringify(data)}`, ex);
+                                }),
                         );
                     } else {
                         nativeInfo.push(data);
@@ -943,11 +1401,12 @@ class NativePythonFinderImpl implements NativePythonFinder {
                     }
                 }),
             );
+            refreshTimeoutMs = clampTimeoutToRemaining(REFRESH_TIMEOUT_MS, deadline, 'refresh');
             await sendRequestWithTimeout<{ duration: number }>(
                 this.connection,
                 'refresh',
                 refreshOptions,
-                REFRESH_TIMEOUT_MS,
+                refreshTimeoutMs,
             );
             await Promise.all(unresolved);
 
@@ -976,6 +1435,23 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 },
             );
         } catch (ex) {
+            // Deadline provenance (checked before ordinary stage telemetry/counters/kill): a budget
+            // error — whether a stage below already threw it, or a clamped refresh-RPC timeout is
+            // reclassified here — must propagate as a budget cap. We deliberately do NOT emit
+            // PET_REFRESH stage-timeout telemetry, mutate restart/timeout counters, or kill the
+            // process for it: exhausting OUR operation budget does not mean PET is unhealthy, and
+            // sendRequestWithTimeout already cancelled the in-flight refresh RPC via its token.
+            // Only a *clamped* refresh timeout (the deadline, not REFRESH_TIMEOUT_MS, was binding) is
+            // reclassified; a full base-timeout is genuine PET slowness and keeps normal handling.
+            const refreshWasClamped = deadline !== undefined && refreshTimeoutMs < REFRESH_TIMEOUT_MS;
+            const budgetError =
+                ex instanceof RefreshBudgetExceededError
+                    ? ex
+                    : toBudgetError(ex, deadline, 'refresh', refreshWasClamped);
+            if (budgetError) {
+                this.outputChannel.warn(`[pet] Refresh attempt aborted by operation budget: ${budgetError.message}`);
+                throw budgetError;
+            }
             const errorType = classifyError(ex);
             sendTelemetryEvent(
                 EventNames.PET_REFRESH,
@@ -1013,7 +1489,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
             disposables.forEach((d) => d.dispose());
         }
 
-        return nativeInfo;
+        return { info: nativeInfo, complete: !enrichmentIncomplete };
     }
 
     private lastConfiguration?: ConfigurationOptions;
@@ -1021,8 +1497,10 @@ class NativePythonFinderImpl implements NativePythonFinder {
     /**
      * Configuration request, this must always be invoked before any other request.
      * Must be invoked when ever there are changes to any data related to the configuration details.
+     * @param deadline Optional operation deadline. When provided, the configure timeout is clamped to
+     *        the remaining budget and configure fails fast once the budget is spent.
      */
-    private async configure(options?: ConfigurationOptions) {
+    private async configure(options?: ConfigurationOptions, deadline?: Deadline) {
         const configuration = options ?? (await this.buildConfigurationOptions());
         const workspaceDirCount = configuration.workspaceDirectories.length;
         const envDirCount = configuration.environmentDirectories.length;
@@ -1037,8 +1515,10 @@ class NativePythonFinderImpl implements NativePythonFinder {
             return;
         }
         this.outputChannel.info('[pet] configure: Sending configuration update:', JSON.stringify(configuration));
-        // Exponential backoff: 30s, 60s on retry. Capped at REFRESH_TIMEOUT_MS.
-        const timeoutMs = this.configureRetry.getTimeoutMs();
+        // Exponential backoff: 30s, 60s on retry. Capped at MAX_CONFIGURE_TIMEOUT_MS, then further
+        // clamped to the remaining operation budget when a deadline is supplied (refresh path only).
+        const baseConfigureTimeoutMs = this.configureRetry.getTimeoutMs();
+        const timeoutMs = clampTimeoutToRemaining(baseConfigureTimeoutMs, deadline, 'configure');
         if (this.configureRetry.timeoutCount > 0) {
             this.outputChannel.info(
                 `[pet] configure: Using extended timeout of ${timeoutMs}ms (retry ${this.configureRetry.timeoutCount})`,
@@ -1057,6 +1537,22 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 { result: 'success' },
             );
         } catch (ex) {
+            // Deadline provenance (checked before ordinary stage telemetry/retry counters): if OUR
+            // budget clamp caused this timeout, reclassify it as a budget error up-front. We clear the
+            // cached configuration (so a later operation reconfigures) but do NOT call
+            // configureRetry.onTimeout(), emit PET_CONFIGURE stage-timeout telemetry, or kill the
+            // process — exhausting our own budget does not imply an unhealthy PET, and
+            // sendRequestWithTimeout already cancelled the in-flight configure via its token.
+            // Only reclassify when OUR budget clamp caused this timeout (the effective timeout was the
+            // remaining budget, not the configure base/extended timeout); a full base-timeout is a
+            // genuine PET timeout and keeps normal retry/telemetry handling.
+            const configureWasClamped = deadline !== undefined && timeoutMs < baseConfigureTimeoutMs;
+            const budgetError = toBudgetError(ex, deadline, 'configure', configureWasClamped);
+            if (budgetError) {
+                this.lastConfiguration = undefined;
+                this.outputChannel.warn(`[pet] Configure aborted by operation budget: ${budgetError.message}`);
+                throw budgetError;
+            }
             const errorType = classifyError(ex);
             sendTelemetryEvent(
                 EventNames.PET_CONFIGURE,
@@ -1203,9 +1699,19 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * Spawns PET as a one-shot subprocess and parses the JSON output.
      *
      * @param options Optional kind filter or URI search paths (same semantics as refresh()).
-     * @returns NativeInfo[] containing managers and environments, same as server mode.
+     * @param deadline Optional operation deadline shared with the server-mode path. When provided,
+     *        the `find` process and each enrichment resolve are clamped to the remaining budget.
+     *        If enumeration (the `find`) cannot complete within budget the call rejects, but once
+     *        `find` has completed, every discovered record is retained — running out of budget only
+     *        stops further enrichment; it never truncates the environment list.
+     * @returns RefreshResult whose `info` contains managers and environments (same as server mode).
+     *          `complete` is false when enumeration succeeded but enrichment ran out of budget, so
+     *          the caller can avoid caching a partially-enriched result.
      */
-    private async refreshViaJsonCli(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
+    private async refreshViaJsonCli(
+        options?: NativePythonEnvironmentKind | Uri[],
+        deadline?: Deadline,
+    ): Promise<RefreshResult> {
         const config = await this.buildConfigurationOptions();
         // venvFolders must be included explicitly as search paths when options is Uri[],
         // mirroring getRefreshOptions() server-mode behaviour (searchPaths may override environmentDirectories).
@@ -1215,15 +1721,24 @@ class NativePythonFinderImpl implements NativePythonFinder {
         this.outputChannel.info(`[pet] JSON CLI fallback refresh: ${this.toolPath} ${args.join(' ')}`);
         const stopWatch = new StopWatch();
 
+        // Enumeration must be able to complete within budget; clamp its timeout to the remaining
+        // budget (throws RefreshBudgetExceededError up-front if the budget is already spent).
+        const findTimeout = clampTimeoutToRemaining(CLI_FALLBACK_TIMEOUT_MS, deadline, 'cli_find');
+
         let stdout: string;
         try {
-            stdout = await this.runPetCliProcess(args, CLI_FALLBACK_TIMEOUT_MS);
+            stdout = await this.runPetCliProcess(args, findTimeout);
         } catch (ex) {
             sendTelemetryEvent(EventNames.PET_JSON_CLI_FALLBACK, stopWatch.elapsedTime, {
                 operation: 'refresh',
                 result: 'error',
             });
             this.outputChannel.error('[pet] JSON CLI fallback refresh failed:', ex);
+            // A budget-clamped enumeration that timed out is an incomplete enumeration: surface it as
+            // a budget error rather than a generic CLI timeout so it classifies consistently.
+            if (deadline?.isExhausted()) {
+                throw new RefreshBudgetExceededError('cli_find', deadline.remainingMs());
+            }
             throw ex;
         }
 
@@ -1267,17 +1782,59 @@ class NativePythonFinderImpl implements NativePythonFinder {
         // Each resolveViaJsonCli() spawns a new OS process, unlike server mode where all resolve
         // calls share a single long-lived process — so unbounded parallelism would cause CPU/memory
         // pressure. Process in batches of CLI_RESOLVE_CONCURRENCY.
+        let enrichmentBudgetSpent = false;
+        // Retains every not-yet-enriched record as-is (unresolved) so budget exhaustion never
+        // truncates the enumerated environment list. Called on both the up-front exhaustion check
+        // and the (rare) case where the clamp trips between that check and issuing the batch.
+        const retainRemainingUnresolved = (fromIndex: number): void => {
+            enrichmentBudgetSpent = true;
+            const remaining = toResolve.slice(fromIndex);
+            this.outputChannel.warn(
+                `[pet CLI] Refresh budget exhausted; retaining ${remaining.length} unresolved env(s) without enrichment`,
+            );
+            for (const env of remaining) {
+                nativeInfo.push(env);
+            }
+        };
         for (let i = 0; i < toResolve.length; i += CLI_RESOLVE_CONCURRENCY) {
+            // Enrichment is best-effort: once the budget is spent, retain every remaining discovered
+            // record as-is (unresolved) and stop. This bounds enrichment latency (which otherwise
+            // scales with environment count) without ever truncating the enumerated environment list.
+            if (deadline?.isExhausted()) {
+                retainRemainingUnresolved(i);
+                break;
+            }
             const batch = toResolve.slice(i, i + CLI_RESOLVE_CONCURRENCY);
+            // isExhausted() and clampTimeoutToRemaining() read the clock separately, so the budget
+            // could dip below the floor between them. Treat that clamp throw exactly like an
+            // exhausted budget (retain + stop) instead of letting it escape and discard everything
+            // already enumerated.
+            let resolveTimeout: number;
+            try {
+                resolveTimeout = clampTimeoutToRemaining(CLI_FALLBACK_TIMEOUT_MS, deadline, 'cli_resolve');
+            } catch (ex) {
+                if (ex instanceof RefreshBudgetExceededError) {
+                    retainRemainingUnresolved(i);
+                    break;
+                }
+                throw ex;
+            }
             await Promise.all(
                 batch.map((env) =>
-                    this.resolveViaJsonCli(env.executable!)
+                    this.resolveViaJsonCli(env.executable!, resolveTimeout)
                         .then((resolved) => {
                             this.outputChannel.info(`[pet CLI] Resolved env: ${resolved.executable}`);
                             nativeInfo.push(resolved);
                         })
                         .catch(() => {
-                            // If resolve fails, still include the partial env so nothing is silently dropped
+                            // If resolve fails, still include the partial env so nothing is silently
+                            // dropped. If the failure was our budget clamp cutting this resolve short
+                            // (deadline now exhausted), mark enrichment incomplete so even the final /
+                            // only batch is reported partial and the result is not cached — a later
+                            // refresh then retries the enrichment.
+                            if (deadline?.isExhausted()) {
+                                enrichmentBudgetSpent = true;
+                            }
                             this.outputChannel.warn(
                                 `[pet CLI] Could not resolve incomplete env, using partial data: ${env.executable}`,
                             );
@@ -1289,9 +1846,9 @@ class NativePythonFinderImpl implements NativePythonFinder {
 
         sendTelemetryEvent(EventNames.PET_JSON_CLI_FALLBACK, stopWatch.elapsedTime, {
             operation: 'refresh',
-            result: 'success',
+            result: enrichmentBudgetSpent ? 'partial' : 'success',
         });
-        return nativeInfo;
+        return { info: nativeInfo, complete: !enrichmentBudgetSpent };
     }
 
     /**
@@ -1302,7 +1859,10 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * @returns The resolved NativeEnvInfo.
      * @throws Error if PET cannot identify the environment or if the output cannot be parsed.
      */
-    private async resolveViaJsonCli(executable: string): Promise<NativeEnvInfo> {
+    private async resolveViaJsonCli(
+        executable: string,
+        timeoutMs: number = CLI_FALLBACK_TIMEOUT_MS,
+    ): Promise<NativeEnvInfo> {
         const args = ['resolve', executable, '--json'];
         if (this.cacheDirectory) {
             args.push('--cache-directory', this.cacheDirectory.fsPath);
@@ -1313,7 +1873,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
 
         let stdout: string;
         try {
-            stdout = await this.runPetCliProcess(args, CLI_FALLBACK_TIMEOUT_MS);
+            stdout = await this.runPetCliProcess(args, timeoutMs);
         } catch (ex) {
             sendTelemetryEvent(EventNames.PET_JSON_CLI_FALLBACK, stopWatch.elapsedTime, {
                 operation: 'resolve',
