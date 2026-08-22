@@ -464,9 +464,14 @@ export async function setEnvironmentCommand(
                 const globalEnvManager = em.getEnvironmentManager(undefined);
                 // Seed the recommendation synchronously so the picker opens immediately; the
                 // authoritative value is resolved after the picker is shown via resolveRecommended.
-                // Gate on globalEnvManager so no stale last-known env is surfaced when no manager
-                // owns it (matching the pre-streaming behavior).
-                const recommended = globalEnvManager ? em.getLastKnownEnvironment(undefined) : undefined;
+                // The last-known cache is scope-keyed, not manager-keyed, so only seed an entry the
+                // current global manager actually owns — a stale env from a since-changed manager
+                // would be unowned and silently ignored by setEnvironments on selection.
+                const lastKnownGlobal = globalEnvManager ? em.getLastKnownEnvironment(undefined) : undefined;
+                const recommended =
+                    globalEnvManager && lastKnownGlobal?.envId.managerId === globalEnvManager.id
+                        ? lastKnownGlobal
+                        : undefined;
                 const selected = await pickEnvironment(em.managers, globalEnvManager ? [globalEnvManager] : [], {
                     projects: [],
                     recommended,
@@ -489,8 +494,15 @@ export async function setEnvironmentCommand(
         const projectEnvManagers = em.getProjectEnvManagers(uris);
         const canRecommend = projectEnvManagers.length === 1 && uris.length === 1;
         // Seed synchronously from the last-known environment so the picker opens immediately; the
-        // authoritative value is resolved after the picker is shown via resolveRecommended.
-        const recommended = canRecommend ? em.getLastKnownEnvironment(uris[0]) : undefined;
+        // authoritative value is resolved after the picker is shown via resolveRecommended. The
+        // last-known cache is scope-keyed, not manager-keyed, so only seed an entry owned by the
+        // current project manager — a stale env from a since-changed manager would be unowned and
+        // silently ignored by setEnvironments on selection.
+        const lastKnownProject = canRecommend ? em.getLastKnownEnvironment(uris[0]) : undefined;
+        const recommended =
+            canRecommend && lastKnownProject?.envId.managerId === projectEnvManagers[0].id
+                ? lastKnownProject
+                : undefined;
         const selected = await pickEnvironment(em.managers, projectEnvManagers, {
             projects,
             recommended,

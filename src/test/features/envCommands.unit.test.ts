@@ -6,6 +6,7 @@ import { PythonEnvironment, PythonProject } from '../../api';
 import * as commandApi from '../../common/command.api';
 import { INLINE_SCRIPT_MANAGER_ID } from '../../common/constants';
 import * as managerApi from '../../common/pickers/managers';
+import * as environmentsPicker from '../../common/pickers/environments';
 import * as projectApi from '../../common/pickers/projects';
 import * as windowApis from '../../common/window.apis';
 import {
@@ -13,6 +14,7 @@ import {
     createAnyEnvironmentCommand,
     removePythonProject,
     revealEnvInManagerView,
+    setEnvironmentCommand,
 } from '../../features/envCommands';
 import * as settingHelpers from '../../features/settings/settingHelpers';
 import { EnvManagerView } from '../../features/views/envManagersView';
@@ -383,5 +385,111 @@ suite('Reveal Env In Manager View Command Tests', () => {
         // Assert
         assert.ok(executeCommandStub.calledOnceWith('env-managers.focus'), 'Should focus the env-managers view');
         managerView.verify((m) => m.reveal(environment), typeMoq.Times.once());
+    });
+});
+
+suite('Set Environment Command - recommendation seeding ownership', () => {
+    let pickEnvStub: sinon.SinonStub;
+
+    setup(() => {
+        // The picker itself is exercised elsewhere; here we only assert what seed it is handed.
+        pickEnvStub = sinon.stub(environmentsPicker, 'pickEnvironment').resolves(undefined);
+    });
+
+    teardown(() => {
+        sinon.restore();
+    });
+
+    function makeOwnedEnv(id: string, managerId: string): PythonEnvironment {
+        return {
+            envId: { id, managerId },
+            name: id,
+            displayName: id,
+            displayPath: `/envs/${id}`,
+            environmentPath: Uri.file(`/envs/${id}`),
+        } as unknown as PythonEnvironment;
+    }
+
+    function seededRecommendation(): PythonEnvironment | undefined {
+        assert.ok(pickEnvStub.calledOnce, 'pickEnvironment should be called exactly once');
+        const options = pickEnvStub.lastCall.args[2] as { recommended?: PythonEnvironment };
+        return options.recommended;
+    }
+
+    test('global: does not seed a last-known environment owned by a different manager', async () => {
+        const currentManager = { id: 'm-current', get: sinon.stub().resolves(undefined) } as unknown as InternalEnvironmentManager;
+        const em = {
+            get managers() {
+                return [currentManager];
+            },
+            getEnvironmentManager: sinon.stub().returns(currentManager),
+            // Scope-keyed cache holding an entry owned by a manager that is no longer current.
+            getLastKnownEnvironment: sinon.stub().returns(makeOwnedEnv('stale', 'm-old')),
+            setEnvironments: sinon.stub().resolves(),
+        } as unknown as EnvironmentManagers;
+        const wm = { getProjects: sinon.stub().returns([]) } as unknown as PythonProjectManager;
+
+        await setEnvironmentCommand(undefined, em, wm);
+
+        assert.strictEqual(
+            seededRecommendation(),
+            undefined,
+            'an unowned last-known env must not be seeded (setEnvironments would silently ignore it)',
+        );
+    });
+
+    test('global: seeds a last-known environment owned by the current manager', async () => {
+        const currentManager = { id: 'm-current', get: sinon.stub().resolves(undefined) } as unknown as InternalEnvironmentManager;
+        const ownedEnv = makeOwnedEnv('owned', 'm-current');
+        const em = {
+            get managers() {
+                return [currentManager];
+            },
+            getEnvironmentManager: sinon.stub().returns(currentManager),
+            getLastKnownEnvironment: sinon.stub().returns(ownedEnv),
+            setEnvironments: sinon.stub().resolves(),
+        } as unknown as EnvironmentManagers;
+        const wm = { getProjects: sinon.stub().returns([]) } as unknown as PythonProjectManager;
+
+        await setEnvironmentCommand(undefined, em, wm);
+
+        assert.strictEqual(seededRecommendation(), ownedEnv, 'a manager-owned last-known env should be seeded');
+    });
+
+    test('project: does not seed a last-known environment owned by a different manager', async () => {
+        const projectManager = { id: 'm-current', get: sinon.stub().resolves(undefined) } as unknown as InternalEnvironmentManager;
+        const uri = Uri.file('/workspace/proj');
+        const em = {
+            get managers() {
+                return [projectManager];
+            },
+            getProjectEnvManagers: sinon.stub().returns([projectManager]),
+            getLastKnownEnvironment: sinon.stub().returns(makeOwnedEnv('stale', 'm-old')),
+            setEnvironments: sinon.stub().resolves(),
+        } as unknown as EnvironmentManagers;
+        const wm = { getProjects: sinon.stub().returns([{ uri, name: 'proj' }]) } as unknown as PythonProjectManager;
+
+        await setEnvironmentCommand([uri], em, wm);
+
+        assert.strictEqual(seededRecommendation(), undefined, 'an unowned last-known env must not be seeded');
+    });
+
+    test('project: seeds a last-known environment owned by the current project manager', async () => {
+        const projectManager = { id: 'm-current', get: sinon.stub().resolves(undefined) } as unknown as InternalEnvironmentManager;
+        const ownedEnv = makeOwnedEnv('owned', 'm-current');
+        const uri = Uri.file('/workspace/proj');
+        const em = {
+            get managers() {
+                return [projectManager];
+            },
+            getProjectEnvManagers: sinon.stub().returns([projectManager]),
+            getLastKnownEnvironment: sinon.stub().returns(ownedEnv),
+            setEnvironments: sinon.stub().resolves(),
+        } as unknown as EnvironmentManagers;
+        const wm = { getProjects: sinon.stub().returns([{ uri, name: 'proj' }]) } as unknown as PythonProjectManager;
+
+        await setEnvironmentCommand([uri], em, wm);
+
+        assert.strictEqual(seededRecommendation(), ownedEnv, 'a manager-owned last-known env should be seeded');
     });
 });
