@@ -95,7 +95,8 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
             return this._initialized.promise;
         }
 
-        this._initialized = createDeferred();
+        const initialized = createDeferred<void>();
+        this._initialized = initialized;
         const stopWatch = new StopWatch();
         let result: 'success' | 'tool_not_found' | 'error' = 'success';
         let envCount = 0;
@@ -165,6 +166,11 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
             result = 'error';
             errorType = classifyError(ex);
             traceError('Conda lazy initialization failed', ex);
+            // Discovery threw: clear the guard so a later call can retry initialization, but only
+            // if this run still owns it (don't clobber a deferred a concurrent reset installed).
+            if (this._initialized === initialized) {
+                this._initialized = undefined;
+            }
         } finally {
             sendTelemetryEvent(EventNames.MANAGER_LAZY_INIT, stopWatch.elapsedTime, {
                 managerName: 'conda',
@@ -173,7 +179,7 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 toolSource,
                 errorType,
             });
-            this._initialized.resolve();
+            initialized.resolve();
         }
     }
 
