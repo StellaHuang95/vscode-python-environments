@@ -181,17 +181,18 @@ suite('NativePythonFinderImpl.clearCache', () => {
         await assert.rejects(() => finder.clearCache(), /disk boom/);
     });
 
-    test('does not fail the command when the redundant on-disk clear fails after a successful live clear', async () => {
-        // The live clear is authoritative here; the follow-up disk sweep is defense-in-depth, so a
-        // transient failure must NOT surface as a Clear Cache failure.
+    test('propagates the on-disk clear failure even after a successful live clear (fail-closed)', async () => {
+        // The live `clear` reporting success does NOT prove PET evicted OUR directory: before the
+        // first `configure`, PET clears its default location, not ours. So a failed on-disk sweep may
+        // leave a previous session's cache reachable and must surface rather than report false success.
         const cacheDir = Uri.file(path.join(os.tmpdir(), 'pet-clear-redundant-fail'));
         const finder = createFinder(cacheDir);
         emptyDirStub.rejects(new Error('redundant disk boom'));
 
-        await finder.clearCache();
+        await assert.rejects(() => finder.clearCache(), /redundant disk boom/);
 
         assert.strictEqual(connectionOf(finder).sendRequest.callCount, 1, 'live clear should have run');
-        assert.strictEqual(emptyDirStub.callCount, 1, 'redundant disk sweep should have been attempted');
+        assert.strictEqual(emptyDirStub.callCount, 1, 'on-disk sweep should have been attempted');
     });
 
     test('warns and does not throw when there is no live server and no cache directory', async () => {
@@ -294,14 +295,29 @@ suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
         return (finder as unknown as { inFlightRefreshes: Map<string, unknown> }).inFlightRefreshes;
     }
 
+    // Stubs buildConfigurationOptions so the effective config is deterministic (coalescing now
+    // depends on it). Configuration is built via an await, so callers must flush() before the
+    // in-flight slot / addToQueue call is observable.
+    function stubConfig(finder: NativePythonFinderImpl): sinon.SinonStub {
+        return sinon.stub(
+            finder as unknown as { buildConfigurationOptions: () => Promise<ConfigurationOptions> },
+            'buildConfigurationOptions',
+        );
+    }
+
+    // Flushes pending microtasks (and one macrotask) so an async config build + registration completes.
+    const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
+
     test('coalesces concurrent hard refreshes for the same key within one generation', async () => {
         const finder = createFinder();
+        stubConfig(finder).resolves(makeConfig());
         const addToQueue = stubQueue(finder);
         let resolve1!: (v: RefreshResult) => void;
         addToQueue.onCall(0).returns(new Promise<RefreshResult>((r) => (resolve1 = r)));
 
         const p1 = finder.refresh(true);
-        const p2 = finder.refresh(true); // same key ('all'), same generation → coalesced
+        const p2 = finder.refresh(true); // same key ('all'), same generation, same config → coalesced
+        await flush();
 
         assert.strictEqual(addToQueue.callCount, 1, 'the second concurrent refresh should coalesce');
 
@@ -309,8 +325,42 @@ suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
         await Promise.all([p1, p2]);
     });
 
+    test('a refresh under a CHANGED configuration does NOT coalesce onto an in-flight scan built with the old config', async () => {
+        const finder = createFinder();
+        const configA = makeConfig();
+        const configB: ConfigurationOptions = { ...makeConfig(), condaExecutable: path.join('new', 'conda') };
+        const buildConfig = stubConfig(finder);
+        buildConfig.onCall(0).resolves(configA);
+        buildConfig.onCall(1).resolves(configB);
+        const addToQueue = stubQueue(finder);
+        let resolve1!: (v: RefreshResult) => void;
+        let resolve2!: (v: RefreshResult) => void;
+        addToQueue.onCall(0).returns(new Promise<RefreshResult>((r) => (resolve1 = r)));
+        addToQueue.onCall(1).returns(new Promise<RefreshResult>((r) => (resolve2 = r)));
+
+        const p1 = finder.refresh(true); // builds configA → in-flight scan tagged configA
+        await flush();
+        assert.strictEqual(addToQueue.callCount, 1);
+
+        // A settings change does NOT advance the generation (only clearCache does). The in-flight
+        // slot has the same key and generation, so ONLY the configuration comparison can stop this
+        // caller from coalescing onto the stale scan that was started under configA.
+        const p2 = finder.refresh(true); // builds configB
+        await flush();
+        assert.strictEqual(
+            addToQueue.callCount,
+            2,
+            'a configuration change must force a fresh scan rather than reuse the old-config in-flight scan',
+        );
+
+        resolve1({ results: [], configuration: configA });
+        resolve2({ results: [], configuration: configB });
+        await Promise.all([p1, p2]);
+    });
+
     test('a post-clear refresh does NOT coalesce onto a pre-clear in-flight scan', async () => {
         const finder = createFinder();
+        stubConfig(finder).resolves(makeConfig());
         const addToQueue = stubQueue(finder);
         let resolve1!: (v: RefreshResult) => void;
         let resolve2!: (v: RefreshResult) => void;
@@ -318,11 +368,13 @@ suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
         addToQueue.onCall(1).returns(new Promise<RefreshResult>((r) => (resolve2 = r)));
 
         const p1 = finder.refresh(true); // generation 0, in flight
+        await flush(); // let it register as a gen-0 scan BEFORE the clear bumps the generation
         assert.strictEqual(addToQueue.callCount, 1);
 
         await finder.clearCache(); // advances the generation
 
         const p2 = finder.refresh(true); // generation 1 ≠ in-flight generation 0 → fresh scan
+        await flush();
         assert.strictEqual(
             addToQueue.callCount,
             2,
@@ -348,6 +400,7 @@ suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
 
     test('a settling pre-clear scan does not evict a newer request registered under the same key', async () => {
         const finder = createFinder();
+        stubConfig(finder).resolves(makeConfig());
         const addToQueue = stubQueue(finder);
         let resolve1!: (v: RefreshResult) => void;
         let resolve2!: (v: RefreshResult) => void;
@@ -355,8 +408,10 @@ suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
         addToQueue.onCall(1).returns(new Promise<RefreshResult>((r) => (resolve2 = r)));
 
         const p1 = finder.refresh(true); // entry1 (generation 0)
+        await flush(); // ensure entry1 is registered before the clear
         await finder.clearCache(); // generation → 1
         const p2 = finder.refresh(true); // entry2 (generation 1), overwrites the map slot
+        await flush();
         const entry2 = inFlightMap(finder).get('all');
         assert.ok(entry2, 'the new refresh should be registered');
 
@@ -368,6 +423,7 @@ suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
 
         // A third caller should coalesce onto the still-registered new scan, not spawn a third one.
         const p3 = finder.refresh(true);
+        await flush();
         assert.strictEqual(addToQueue.callCount, 2, 'the third caller should coalesce onto the newer scan');
 
         resolve2(makeResult());
@@ -376,6 +432,7 @@ suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
 
     test('a settling pre-clear scan that REJECTS still does not evict a newer request', async () => {
         const finder = createFinder();
+        stubConfig(finder).resolves(makeConfig());
         const addToQueue = stubQueue(finder);
         let reject1!: (e: unknown) => void;
         let resolve2!: (v: RefreshResult) => void;
@@ -384,8 +441,10 @@ suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
 
         const p1 = finder.refresh(true); // entry1 (generation 0)
         p1.catch(() => undefined); // the pre-clear scan is expected to reject
+        await flush(); // ensure entry1 is registered before the clear
         await finder.clearCache(); // generation → 1
         const p2 = finder.refresh(true); // entry2 (generation 1), overwrites the map slot
+        await flush();
         const entry2 = inFlightMap(finder).get('all');
         assert.ok(entry2, 'the new refresh should be registered');
 
