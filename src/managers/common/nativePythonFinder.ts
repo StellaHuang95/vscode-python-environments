@@ -342,7 +342,15 @@ async function sendRequestWithTimeout<T>(
     }
 }
 
-class NativePythonFinderImpl implements NativePythonFinder {
+/**
+ * @internal Concrete {@link NativePythonFinder} implementation.
+ *
+ * Exported only as a test seam so unit tests can drive the real JSON-RPC wiring in
+ * {@link NativePythonFinderImpl.start} against a fake child process (there is no other
+ * injection point for the spawned PET server). It is intentionally NOT part of the public
+ * extension API — production code must construct it via {@link createNativePythonFinder}.
+ */
+export class NativePythonFinderImpl implements NativePythonFinder {
     private connection: rpc.MessageConnection;
     private readonly pool: WorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>;
     private cache: Map<string, NativeInfo[]> = new Map();
@@ -540,6 +548,12 @@ class NativePythonFinderImpl implements NativePythonFinder {
 
     /**
      * Attempts to kill the PET process. Used during restart and timeout recovery.
+     *
+     * Note: this clears `this.proc`, so the killed child's `exit` handler in {@link start} will
+     * hit the `this.proc === proc` identity guard and intentionally NOT set `this.processExited`
+     * (it still tears down that child's streams). Callers that rely on a subsequent restart MUST
+     * set `this.processExited = true` themselves — as resolve(), configure(), doRefresh() and
+     * doRefreshAttempt() already do.
      */
     private killProcess(): void {
         if (this.proc && this.proc.exitCode === null) {
@@ -673,24 +687,64 @@ class NativePythonFinderImpl implements NativePythonFinder {
         const readable = new PassThrough();
         const writable = new PassThrough();
 
-        try {
-            this.proc = spawnProcess(this.toolPath, ['server'], { env: process.env, stdio: 'pipe' });
+        // Resources owned by THIS child/connection. `this.startDisposables` is pointed at this
+        // array immediately below (so a spawn/wiring failure later still leaves the kill disposable
+        // reachable for cleanup) so restart()/dispose() tear down the current child. The closures
+        // here keep referencing this child's array even after a later restart() swaps the shared
+        // field for a new one, so a dead child only ever closes its own resources.
+        const localDisposables: Disposable[] = [];
+        this.startDisposables = localDisposables;
 
-            if (!this.proc.stdout || !this.proc.stderr || !this.proc.stdin) {
+        // Ending the readable stream makes StreamMessageReader observe EOF, which fires the
+        // connection close handler and (via localDisposables below) disposes the connection so
+        // any in-flight requests reject promptly instead of waiting out their 30-60s timeouts.
+        // Idempotent so the exit/error handlers and explicit disposal can all call it safely.
+        let streamsEnded = false;
+        const endStreams = () => {
+            if (streamsEnded) {
+                return;
+            }
+            streamsEnded = true;
+            readable.end();
+            writable.end();
+        };
+
+        try {
+            // spawnProcess()'s stdio:'pipe' overload returns non-null stdio streams. Capture the
+            // child locally so the termination handlers below act on THIS child even after
+            // `this.proc` is cleared by killProcess() or replaced by restart().
+            const proc = spawnProcess(this.toolPath, ['server'], { env: process.env, stdio: 'pipe' });
+            this.proc = proc;
+
+            if (!proc.stdout || !proc.stderr || !proc.stdin) {
                 throw new Error('Failed to create stdio streams for PET process');
             }
 
-            this.proc.stdout.pipe(readable, { end: false });
-            this.proc.stderr.on('data', (data) => this.outputChannel.error(`[pet] ${data.toString()}`));
-            writable.pipe(this.proc.stdin, { end: false });
+            proc.stdout.pipe(readable, { end: false });
+            proc.stderr.on('data', (data) => this.outputChannel.error(`[pet] ${data.toString()}`));
+            writable.pipe(proc.stdin, { end: false });
+
+            // Shared teardown for when THIS child goes away (exit or spawn/runtime error). Both
+            // events can fire; endStreams() is idempotent and the shared-state mutation is guarded.
+            const handleChildTermination = (reason: string) => {
+                // Always close this child's streams so its connection disposes and pending
+                // requests reject — even if `this.proc` was already cleared/replaced.
+                endStreams();
+                // Only mutate shared exit state while this child is still the active one; a stale
+                // old child must never flip flags that now belong to a live replacement.
+                if (this.proc === proc) {
+                    this.processExited = true;
+                    // Preserve a more-specific reason (e.g. rpc_*) if one was already recorded
+                    // before the kill.
+                    if (this.processExitReason === undefined) {
+                        this.processExitReason = reason;
+                    }
+                }
+            };
 
             // Handle process exit - mark as exited so pending requests fail fast
-            this.proc.on('exit', (code, signal) => {
-                this.processExited = true;
-                // Preserve a more-specific reason (e.g. rpc_*) if one was already recorded before the kill.
-                if (this.processExitReason === undefined) {
-                    this.processExitReason = `process_exit:${code ?? 'null'}:${signal ?? 'none'}`;
-                }
+            proc.on('exit', (code, signal) => {
+                handleChildTermination(`process_exit:${code ?? 'null'}:${signal ?? 'none'}`);
                 if (code !== 0) {
                     this.outputChannel.error(
                         `[pet] Python Environment Tools exited unexpectedly with code ${code}, signal ${signal}`,
@@ -699,16 +753,12 @@ class NativePythonFinderImpl implements NativePythonFinder {
             });
 
             // Handle process errors (e.g., ENOENT if executable not found)
-            this.proc.on('error', (err) => {
-                this.processExited = true;
-                if (this.processExitReason === undefined) {
-                    this.processExitReason = 'process_error';
-                }
+            proc.on('error', (err) => {
+                handleChildTermination('process_error');
                 this.outputChannel.error('[pet] Process error:', err);
             });
 
-            const proc = this.proc;
-            this.startDisposables.push({
+            localDisposables.push({
                 dispose: () => {
                     try {
                         if (proc.exitCode === null) {
@@ -742,12 +792,9 @@ class NativePythonFinderImpl implements NativePythonFinder {
             new rpc.StreamMessageReader(readable),
             new rpc.StreamMessageWriter(writable),
         );
-        this.startDisposables.push(
+        localDisposables.push(
             connection,
-            new Disposable(() => {
-                readable.end();
-                writable.end();
-            }),
+            new Disposable(() => endStreams()),
             connection.onError((ex) => {
                 this.outputChannel.error('[pet] Connection Error:', ex);
             }),
@@ -772,7 +819,10 @@ class NativePythonFinderImpl implements NativePythonFinder {
             }),
             connection.onNotification('telemetry', (data) => this.outputChannel.info('[pet] Telemetry: ', data)),
             connection.onClose(() => {
-                this.startDisposables.forEach((d) => d.dispose());
+                // Dispose only THIS child's resources. Never touch `this.startDisposables`, which
+                // may already point at a replacement connection created by a later restart() — a
+                // stale close must not tear down the live connection.
+                localDisposables.forEach((d) => d.dispose());
             }),
         );
 
