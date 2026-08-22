@@ -670,6 +670,22 @@ export class NativePythonFinderImpl implements NativePythonFinder {
             return inFlight.promise;
         }
 
+        // Invalidate this key's prior entry before the hard scan runs. Two narrow, benign concurrency
+        // residuals are accepted here (neither ever serves stale data):
+        //   * Soft-visibility window (#3): the prior entry stayed visible from this refresh's start
+        //     until now (this delete runs only after the config-build await above). A concurrent soft
+        //     refresh in that window can getValid()-HIT and return it. That is intentional — the entry
+        //     is configuration-valid, so serving it honors the soft "cached-is-fine" contract, and this
+        //     hard scan replaces it on completion. Reserving the key synchronously before the await
+        //     would instead make every concurrent soft refresh miss and spawn a redundant scan for the
+        //     whole build window.
+        //   * Pre-clear delete (#2): if an explicit clearCache() lands during this refresh's config
+        //     build AND a concurrent post-clear refresh has already produced a fresh entry for this key,
+        //     this delete can drop that fresh entry. No stale data results — the generation guard in
+        //     cache.set() rejects this pre-clear refresh's own store, and getValid() config-checks every
+        //     hit — so the only effect is at most one redundant rescan on the next soft lookup. We keep
+        //     the generation guard (which upholds the "a refresh that began before a clear cannot
+        //     repopulate the map" guarantee) rather than add a restart loop to this hot path.
         this.cache.delete(key);
         if (!options) {
             this.outputChannel.debug('[Finder] Refreshing all environments');
@@ -698,10 +714,17 @@ export class NativePythonFinderImpl implements NativePythonFinder {
                     );
                     return [] as NativeInfo[];
                 }
-                // Tag the entry with the exact configuration used to produce it so a later soft
-                // refresh can detect setting changes. The set is a no-op when the generation has
-                // advanced (an explicit clear ran while this refresh was in flight).
-                this.cache.set(key, refreshResult.configuration, results, startGeneration);
+                // Only the CURRENT in-flight registrant for this key may write the cache. If a newer
+                // refresh (e.g. one started after a settings change) replaced our slot, its result —
+                // not this older, possibly different-configuration scan — must own the entry; an older
+                // scan settling last must not overwrite it and force current-config soft lookups to
+                // miss. Combined with the generation guard inside cache.set (which additionally rejects
+                // stores from a refresh that began before a clear), this keeps the cache holding the
+                // newest refresh's result. A superseded scan still returns its own results to the
+                // caller awaiting `entry.promise` below; it just does not persist them.
+                if (this.inFlightRefreshes.get(key) === entry) {
+                    this.cache.set(key, refreshResult.configuration, results, startGeneration);
+                }
                 return results;
             })
             .finally(() => {

@@ -359,6 +359,110 @@ suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
         await Promise.all([p1, p2]);
     });
 
+    test('an older same-generation scan settling last does not overwrite a newer request\'s cache entry', async () => {
+        const finder = createFinder();
+        const configA = makeConfig();
+        const configB: ConfigurationOptions = { ...makeConfig(), condaExecutable: path.join('new', 'conda') };
+        const buildConfig = stubConfig(finder);
+        buildConfig.onCall(0).resolves(configA);
+        buildConfig.onCall(1).resolves(configB);
+        const addToQueue = stubQueue(finder);
+        let resolve1!: (v: RefreshResult) => void;
+        let resolve2!: (v: RefreshResult) => void;
+        addToQueue.onCall(0).returns(new Promise<RefreshResult>((r) => (resolve1 = r)));
+        addToQueue.onCall(1).returns(new Promise<RefreshResult>((r) => (resolve2 = r)));
+
+        // Two concurrent hard refreshes for the same key ('all') in the SAME generation (no clear) but
+        // with DIFFERENT effective configs (a settings change between them). The second does NOT
+        // coalesce (config mismatch) and REPLACES the in-flight slot for this key.
+        const p1 = finder.refresh(true); // configA → entry1 registered
+        await flush();
+        assert.strictEqual(addToQueue.callCount, 1);
+        const p2 = finder.refresh(true); // configB → entry2 replaces entry1's slot
+        await flush();
+        assert.strictEqual(addToQueue.callCount, 2, 'a configuration change must start a fresh scan');
+
+        const resultsA = [{ executable: path.join('env', 'a') } as unknown as NativeInfo];
+        const resultsB = [{ executable: path.join('env', 'b') } as unknown as NativeInfo];
+
+        const cache = (
+            finder as unknown as {
+                cache: { getValid: (k: string, c: ConfigurationOptions) => NativeInfo[] | undefined };
+            }
+        ).cache;
+
+        // The NEWER scan (configB, still the registered slot) settles first and populates the entry.
+        resolve2({ results: resultsB, configuration: configB });
+        await p2;
+        assert.strictEqual(cache.getValid('all', configB), resultsB, 'the newer scan populates the entry');
+
+        // The OLDER scan (configA) settles LAST. Its slot is no longer its own entry — the newer
+        // configB scan already registered over it AND, having settled above, its identity-safe
+        // `.finally` then emptied the slot — so `inFlightRefreshes.get('all')` is now undefined. The
+        // identity guard (`get(key) === entry`) therefore skips this older scan's write, stopping it
+        // from overwriting the current configB entry with its stale configA result, which would
+        // otherwise force the next current-config soft lookup to miss and rescan.
+        resolve1({ results: resultsA, configuration: configA });
+        await p1;
+        assert.strictEqual(
+            cache.getValid('all', configB),
+            resultsB,
+            'an older same-generation scan settling last must not overwrite the newer entry',
+        );
+        assert.strictEqual(
+            cache.getValid('all', configA),
+            undefined,
+            'the stale older-configuration result must not be cached',
+        );
+    });
+
+    test('an older scan settling while a newer same-key entry still owns the slot does not write even transiently', async () => {
+        const finder = createFinder();
+        const configA = makeConfig();
+        const configB: ConfigurationOptions = { ...makeConfig(), poetryExecutable: path.join('new', 'poetry') };
+        const buildConfig = stubConfig(finder);
+        buildConfig.onCall(0).resolves(configA);
+        buildConfig.onCall(1).resolves(configB);
+        const addToQueue = stubQueue(finder);
+        let resolve1!: (v: RefreshResult) => void;
+        let resolve2!: (v: RefreshResult) => void;
+        addToQueue.onCall(0).returns(new Promise<RefreshResult>((r) => (resolve1 = r)));
+        addToQueue.onCall(1).returns(new Promise<RefreshResult>((r) => (resolve2 = r)));
+
+        const p1 = finder.refresh(true); // configA → entry1 registered
+        await flush();
+        const p2 = finder.refresh(true); // configB → entry2 replaces entry1's slot (still in flight)
+        await flush();
+        assert.strictEqual(addToQueue.callCount, 2, 'a configuration change must start a fresh scan');
+        assert.ok(inFlightMap(finder).get('all'), 'entry2 owns the slot while entry1 is still in flight');
+
+        const resultsA = [{ executable: path.join('env', 'a') } as unknown as NativeInfo];
+        const resultsB = [{ executable: path.join('env', 'b') } as unknown as NativeInfo];
+        const cache = (
+            finder as unknown as {
+                cache: { getValid: (k: string, c: ConfigurationOptions) => NativeInfo[] | undefined };
+            }
+        ).cache;
+
+        // The OLDER scan settles FIRST, while entry2 STILL owns the slot (its `.finally` has not run).
+        // This exercises the guard's `get(key) === entry2 !== entry1` branch: the write is skipped, so
+        // the stale configA result must never land in the cache — not even transiently before entry2
+        // completes. Without the guard, entry1 would write (configA, resultsA) here.
+        resolve1({ results: resultsA, configuration: configA });
+        await flush();
+        assert.strictEqual(
+            cache.getValid('all', configA),
+            undefined,
+            'a superseded scan whose slot is still owned by a newer entry must not write, even transiently',
+        );
+
+        // entry2 completes and legitimately populates the entry.
+        resolve2({ results: resultsB, configuration: configB });
+        await p2;
+        await p1;
+        assert.strictEqual(cache.getValid('all', configB), resultsB, 'the newer scan populates the entry');
+    });
+
     test('refresh(false) returns a same-config soft hit and queues a fresh scan when the config changed', async () => {
         const finder = createFinder();
         const configA = makeConfig();
