@@ -6,8 +6,10 @@ import { traceError } from '../logging';
 import { EventNames } from '../telemetry/constants';
 import { sendTelemetryEvent } from '../telemetry/sender';
 import { isWindows } from '../utils/platformUtils';
+import { normalizePath } from '../utils/pathUtils';
 import { handlePythonPath } from '../utils/pythonPath';
 import {
+    QuickPickController,
     showErrorMessage,
     showOpenDialog,
     showQuickPick,
@@ -120,16 +122,70 @@ async function createEnvironment(
     }
 }
 
+type EnvironmentQuickPickItem = QuickPickItem & {
+    result: PythonEnvironment;
+    manager: InternalEnvironmentManager;
+};
+
+type EnvironmentPickItem = QuickPickItem | (QuickPickItem & { result: PythonEnvironment });
+
+/**
+ * A manager's contribution to the picker, built exactly once when the manager's environments load.
+ * Reusing the same separator/item object references across rebuilds lets the QuickPick preserve the
+ * user's active/selected items by reference while more sections stream in.
+ */
+interface ManagerSection {
+    readonly separator: QuickPickItem;
+    readonly entries: ReadonlyArray<{ readonly key: string; readonly item: EnvironmentQuickPickItem }>;
+}
+
+/**
+ * Computes a stable, cross-manager identity for an environment so the same interpreter discovered by
+ * more than one manager is only shown once. Prefers the resolved executable path, then the
+ * environment path, and finally the manager-scoped id. Paths are normalized for cross-platform
+ * comparison.
+ */
+function environmentIdentityKey(e: PythonEnvironment): string {
+    const execPath = e.execInfo?.run?.executable;
+    if (execPath && execPath.trim().length > 0) {
+        return normalizePath(execPath);
+    }
+    const envPath = e.environmentPath?.fsPath;
+    if (envPath && envPath.trim().length > 0) {
+        return normalizePath(envPath);
+    }
+    return `${e.envId.managerId}:${e.envId.id}`;
+}
+
+function createEnvironmentItem(
+    e: PythonEnvironment,
+    manager: InternalEnvironmentManager,
+): EnvironmentQuickPickItem {
+    const pathDescription = e.displayPath;
+    const description =
+        e.description && e.description.trim() ? `${e.description} (${pathDescription})` : pathDescription;
+
+    return {
+        label: e.displayName ?? e.name,
+        description,
+        result: e,
+        manager,
+        iconPath: getIconPath(e.iconPath),
+    };
+}
+
 async function pickEnvironmentImpl(
-    items: (QuickPickItem | (QuickPickItem & { result: PythonEnvironment }))[],
+    items: EnvironmentPickItem[],
     managers: InternalEnvironmentManager[],
     projectEnvManagers: InternalEnvironmentManager[],
     options: EnvironmentPickOptions,
+    onDidShow?: (controller: QuickPickController<EnvironmentPickItem>) => void,
 ): Promise<PythonEnvironment | undefined> {
     const selected = await showQuickPickWithButtons(items, {
         placeHolder: Pickers.Environments.selectEnvironment,
         ignoreFocusOut: true,
         showBackButton: options?.showBackButton,
+        onDidShow,
     });
 
     if (selected && !Array.isArray(selected)) {
@@ -152,7 +208,7 @@ export async function pickEnvironment(
     projectEnvManagers: InternalEnvironmentManager[],
     options: EnvironmentPickOptions,
 ): Promise<PythonEnvironment | undefined> {
-    const items: (QuickPickItem | (QuickPickItem & { result: PythonEnvironment }))[] = [
+    const staticItems: EnvironmentPickItem[] = [
         {
             label: Interpreter.browsePath,
             iconPath: new ThemeIcon('folder'),
@@ -174,7 +230,7 @@ export async function pickEnvironment(
                 ? `${options.recommended.description} (${pathDescription})`
                 : pathDescription;
 
-        items.push(
+        staticItems.push(
             {
                 label: Common.recommended,
                 kind: QuickPickItemKind.Separator,
@@ -188,30 +244,74 @@ export async function pickEnvironment(
         );
     }
 
-    for (const manager of managers) {
-        items.push({
-            label: manager.displayName,
-            kind: QuickPickItemKind.Separator,
+    // Sections are stored per manager and rebuilt into the final list in a fixed manager order,
+    // independent of the order in which managers finish loading. This keeps section ordering
+    // deterministic while environments stream in.
+    const sections = new Map<string, ManagerSection>();
+
+    const buildItems = (): EnvironmentPickItem[] => {
+        const result: EnvironmentPickItem[] = [...staticItems];
+        const seen = new Set<string>();
+        // The recommended environment is already shown above; skip it in the manager sections.
+        if (options?.recommended) {
+            seen.add(environmentIdentityKey(options.recommended));
+        }
+        for (const manager of managers) {
+            const section = sections.get(manager.id);
+            if (!section) {
+                continue;
+            }
+            const visible: EnvironmentQuickPickItem[] = [];
+            for (const entry of section.entries) {
+                if (seen.has(entry.key)) {
+                    continue;
+                }
+                seen.add(entry.key);
+                visible.push(entry.item);
+            }
+            if (visible.length > 0) {
+                result.push(section.separator, ...visible);
+            }
+        }
+        return result;
+    };
+
+    const onDidShow = (controller: QuickPickController<EnvironmentPickItem>) => {
+        controller.setBusy(true);
+        const loads = managers.map(async (manager) => {
+            try {
+                const envs = await manager.getEnvironments('all');
+                const entries: { key: string; item: EnvironmentQuickPickItem }[] = [];
+                const localKeys = new Set<string>();
+                for (const e of envs) {
+                    const key = environmentIdentityKey(e);
+                    if (localKeys.has(key)) {
+                        continue;
+                    }
+                    localKeys.add(key);
+                    entries.push({ key, item: createEnvironmentItem(e, manager) });
+                }
+                sections.set(manager.id, {
+                    separator: {
+                        label: manager.displayName,
+                        kind: QuickPickItemKind.Separator,
+                    },
+                    entries,
+                });
+            } catch (err) {
+                traceError(
+                    `[pickEnvironment] Failed to load environments for manager "${manager.id}"; section skipped.`,
+                    err,
+                );
+            }
+            // Stream whatever has loaded so far; no-ops if the picker has already been closed.
+            controller.setItems(buildItems());
         });
-        const envs = await manager.getEnvironments('all');
-        items.push(
-            ...envs.map((e) => {
-                const pathDescription = e.displayPath;
-                const description =
-                    e.description && e.description.trim() ? `${e.description} (${pathDescription})` : pathDescription;
 
-                return {
-                    label: e.displayName ?? e.name,
-                    description: description,
-                    result: e,
-                    manager: manager,
-                    iconPath: getIconPath(e.iconPath),
-                };
-            }),
-        );
-    }
+        void Promise.allSettled(loads).finally(() => controller.setBusy(false));
+    };
 
-    return pickEnvironmentImpl(items, managers, projectEnvManagers, options);
+    return pickEnvironmentImpl(staticItems, managers, projectEnvManagers, options, onDidShow);
 }
 
 export async function pickEnvironmentFrom(environments: PythonEnvironment[]): Promise<PythonEnvironment | undefined> {
