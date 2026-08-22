@@ -1,7 +1,8 @@
 import assert from 'node:assert';
+import * as path from 'node:path';
 import * as sinon from 'sinon';
 import { Uri } from 'vscode';
-import { getResourceUri, normalizePath } from '../../common/utils/pathUtils';
+import { getResourceUri, isPathInside, normalizePath, toNormalizedPathKey } from '../../common/utils/pathUtils';
 import * as utils from '../../common/utils/platformUtils';
 
 suite('Path Utilities', () => {
@@ -126,6 +127,99 @@ suite('Path Utilities', () => {
             const result = normalizePath(testPath);
 
             assert.strictEqual(result, 'C:/Path/To/File.txt');
+        });
+    });
+
+    suite('isPathInside', () => {
+        // Absolute path rooted at the current platform's filesystem root (e.g. `C:\` or `/`).
+        const root = path.join(path.parse(process.cwd()).root, 'workspaces', 'app');
+
+        test('returns true when the candidate equals the scope (inclusive of scope.fsPath)', () => {
+            assert.strictEqual(isPathInside(root, root), true);
+        });
+
+        test('returns true for a direct child path', () => {
+            assert.strictEqual(isPathInside(root, path.join(root, '.venv')), true);
+        });
+
+        test('returns true for a deeply nested child path', () => {
+            assert.strictEqual(isPathInside(root, path.join(root, '.venv', 'bin', 'python')), true);
+        });
+
+        test('returns false for the parent directory', () => {
+            assert.strictEqual(isPathInside(root, path.dirname(root)), false);
+        });
+
+        test('returns false for a sibling directory that shares a name prefix (app vs app-2)', () => {
+            const sibling = path.join(path.dirname(root), 'app-2', '.venv', 'bin', 'python');
+            assert.strictEqual(isPathInside(root, sibling), false);
+        });
+
+        test('returns false for an unrelated directory', () => {
+            const unrelated = path.join(path.dirname(root), 'other', '.venv');
+            assert.strictEqual(isPathInside(root, unrelated), false);
+        });
+
+        test('resolves relative segments in the candidate before comparing', () => {
+            assert.strictEqual(isPathInside(root, path.join(root, 'pkg', '..', '.venv')), true);
+        });
+
+        test('returns false for a path on a different Windows drive', function () {
+            if (process.platform !== 'win32') {
+                this.skip();
+            }
+            assert.strictEqual(isPathInside('C:\\workspaces\\app', 'D:\\workspaces\\app\\.venv'), false);
+        });
+
+        test('is case-insensitive on Windows (drive letter and folder casing)', function () {
+            if (process.platform !== 'win32') {
+                this.skip();
+            }
+            assert.strictEqual(isPathInside('C:\\Workspaces\\App', 'c:\\workspaces\\app\\.venv\\Scripts\\python.exe'), true);
+        });
+    });
+
+    suite('toNormalizedPathKey', () => {
+        let isWindowsStub: sinon.SinonStub;
+
+        setup(() => {
+            isWindowsStub = sinon.stub(utils, 'isWindows');
+        });
+
+        teardown(() => {
+            sinon.restore();
+        });
+
+        test('equals normalizePath for an already-absolute path', () => {
+            isWindowsStub.returns(false);
+            const abs = path.join(path.parse(process.cwd()).root, 'workspaces', 'app');
+            assert.strictEqual(toNormalizedPathKey(abs), normalizePath(abs));
+        });
+
+        test('resolves relative segments before normalizing', () => {
+            isWindowsStub.returns(false);
+            const abs = path.join(path.parse(process.cwd()).root, 'workspaces', 'app');
+            // Build the string by hand (path.join would pre-collapse the `..`) so the `..` segment
+            // is only resolved by toNormalizedPathKey's internal path.resolve.
+            const withDotDot = `${abs}${path.sep}pkg${path.sep}..`;
+            assert.strictEqual(toNormalizedPathKey(withDotDot), normalizePath(abs));
+        });
+
+        test('produces identical keys for differently-cased Windows paths', function () {
+            if (process.platform !== 'win32') {
+                this.skip();
+            }
+            isWindowsStub.returns(true);
+            assert.strictEqual(
+                toNormalizedPathKey('C:\\Workspaces\\App'),
+                toNormalizedPathKey('c:\\workspaces\\app'),
+            );
+        });
+
+        test('uses forward slashes as separators', () => {
+            isWindowsStub.returns(false);
+            const key = toNormalizedPathKey(path.join(path.parse(process.cwd()).root, 'a', 'b', 'c'));
+            assert.strictEqual(key.includes('\\'), false);
         });
     });
 });
