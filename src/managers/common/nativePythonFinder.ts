@@ -394,6 +394,32 @@ export function killPetProcessWithGrace(
     }
 }
 
+/**
+ * Applies a PET child-process lifecycle event (exit or error) to the finder's shared restart
+ * state, guarded by process identity.
+ *
+ * `eventProc` is the child that emitted the event and `currentProc` is the finder's active child
+ * at the moment the event fires. When they differ, the event comes from a process a restart has
+ * already superseded; `markExited` is skipped so the stale exit cannot flip `processExited` and
+ * make the next request restart — and thereby kill — the healthy replacement. Diagnostic logging
+ * and local resource cleanup are the caller's responsibility and run regardless.
+ *
+ * Exported for unit testing only; it is not part of the extension's public API.
+ *
+ * @returns true when the event applied to the active child, false when ignored as stale.
+ */
+export function applyPetProcessExit(
+    currentProc: KillablePetProcess | undefined,
+    eventProc: KillablePetProcess,
+    markExited: () => void,
+): boolean {
+    if (currentProc !== eventProc) {
+        return false;
+    }
+    markExited();
+    return true;
+}
+
 class NativePythonFinderImpl implements NativePythonFinder {
     private connection: rpc.MessageConnection;
     private readonly pool: WorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>;
@@ -723,22 +749,28 @@ class NativePythonFinderImpl implements NativePythonFinder {
 
         try {
             this.proc = spawnProcess(this.toolPath, ['server'], { env: process.env, stdio: 'pipe' });
+            const proc = this.proc;
 
-            if (!this.proc.stdout || !this.proc.stderr || !this.proc.stdin) {
+            if (!proc.stdout || !proc.stderr || !proc.stdin) {
                 throw new Error('Failed to create stdio streams for PET process');
             }
 
-            this.proc.stdout.pipe(readable, { end: false });
-            this.proc.stderr.on('data', (data) => this.outputChannel.error(`[pet] ${data.toString()}`));
-            writable.pipe(this.proc.stdin, { end: false });
+            proc.stdout.pipe(readable, { end: false });
+            proc.stderr.on('data', (data) => this.outputChannel.error(`[pet] ${data.toString()}`));
+            writable.pipe(proc.stdin, { end: false });
 
-            // Handle process exit - mark as exited so pending requests fail fast
-            this.proc.on('exit', (code, signal) => {
-                this.processExited = true;
-                // Preserve a more-specific reason (e.g. rpc_*) if one was already recorded before the kill.
-                if (this.processExitReason === undefined) {
-                    this.processExitReason = `process_exit:${code ?? 'null'}:${signal ?? 'none'}`;
-                }
+            // Handle process exit - mark as exited so pending requests fail fast.
+            // Guard by process identity: once a restart installs a replacement, a late exit from
+            // THIS (now superseded) child must not flip shared state, or the next request would
+            // restart and kill the healthy replacement.
+            proc.on('exit', (code, signal) => {
+                applyPetProcessExit(this.proc, proc, () => {
+                    this.processExited = true;
+                    // Preserve a more-specific reason (e.g. rpc_*) if one was already recorded before the kill.
+                    if (this.processExitReason === undefined) {
+                        this.processExitReason = `process_exit:${code ?? 'null'}:${signal ?? 'none'}`;
+                    }
+                });
                 if (code !== 0) {
                     this.outputChannel.error(
                         `[pet] Python Environment Tools exited unexpectedly with code ${code}, signal ${signal}`,
@@ -747,15 +779,16 @@ class NativePythonFinderImpl implements NativePythonFinder {
             });
 
             // Handle process errors (e.g., ENOENT if executable not found)
-            this.proc.on('error', (err) => {
-                this.processExited = true;
-                if (this.processExitReason === undefined) {
-                    this.processExitReason = 'process_error';
-                }
+            proc.on('error', (err) => {
+                applyPetProcessExit(this.proc, proc, () => {
+                    this.processExited = true;
+                    if (this.processExitReason === undefined) {
+                        this.processExitReason = 'process_error';
+                    }
+                });
                 this.outputChannel.error('[pet] Process error:', err);
             });
 
-            const proc = this.proc;
             this.startDisposables.push({
                 dispose: () => {
                     try {
