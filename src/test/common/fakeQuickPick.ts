@@ -18,7 +18,21 @@ import { mockedVSCodeNamespaces } from '../unittests';
  * `accept`/`triggerButton`/`cancel` helpers to drive user interactions deterministically.
  */
 export class FakeQuickPick<T extends QuickPickItem> {
-    public items: readonly T[] = [];
+    private _items: readonly T[] = [];
+    /**
+     * Models VS Code's real behavior: assigning `items` moves focus to the first item and clears the
+     * (multi-select) selection. Callers that need to preserve the active/selected item must re-apply
+     * it *after* assigning items — which is exactly what the `showQuickPickWithButtons` controller
+     * does. Modeling this faithfully prevents false-positive "preserves by reference" tests.
+     */
+    public get items(): readonly T[] {
+        return this._items;
+    }
+    public set items(value: readonly T[]) {
+        this._items = value;
+        this.activeItems = value.length > 0 ? [value[0]] : [];
+        this.selectedItems = [];
+    }
     public activeItems: readonly T[] = [];
     public selectedItems: readonly T[] = [];
     public value = '';
