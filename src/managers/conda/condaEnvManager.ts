@@ -124,10 +124,15 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 },
                 async () => {
                     const refreshed = await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this);
-                    // `undefined` means discovery failed — keep any known-good collection and
-                    // emit nothing. A successful (possibly empty) array is applied normally.
+                    // `undefined` means discovery threw/rejected. Keep any known-good collection
+                    // and never emit removals, but still restore persisted global/workspace
+                    // selections (they resolve independently of discovery). A successful (possibly
+                    // empty) array is applied normally.
                     if (refreshed === undefined) {
-                        traceVerbose('Conda discovery failed during initialization; leaving collection unchanged.');
+                        traceVerbose(
+                            'Conda discovery failed during initialization; preserving collection and restoring persisted selections.',
+                        );
+                        await this.preserveCollectionOnFailedDiscovery();
                         return;
                     }
                     this.collection = refreshed;
@@ -321,11 +326,14 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 async () => {
                     this.log.info('Refreshing Conda Environments');
                     const refreshed = await refreshCondaEnvs(true, this.nativeFinder, this.api, this.log, this);
-                    // `undefined` signals a discovery failure (e.g. native finder error). Preserve
-                    // the last known-good collection and emit no changes so a transient failure does
-                    // not remove environments. A successful empty array still removes stale envs below.
+                    // `undefined` signals a discovery failure (native finder threw/rejected).
+                    // Preserve the last known-good collection and emit no removals so a transient
+                    // failure does not delete environments, but still restore persisted selections
+                    // via loadEnvMap (emitting adds only for any newly resolved persisted envs).
+                    // A successful empty array still removes stale envs below.
                     if (refreshed === undefined) {
                         this.log.warn('Conda refresh failed; preserving previously discovered environments.');
+                        await this.preserveCollectionOnFailedDiscovery();
                         return;
                     }
                     const discard = this.collection.map((c) => c);
@@ -357,10 +365,15 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
             startBackgroundInit: () =>
                 withProgress({ location: ProgressLocation.Window, title: CondaStrings.condaDiscovering }, async () => {
                     const refreshed = await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this);
-                    // `undefined` means discovery failed — keep any known-good collection and
-                    // emit nothing. A successful (possibly empty) array is applied normally.
+                    // `undefined` means discovery threw/rejected. Keep any known-good collection and
+                    // never emit removals, but still restore persisted global/workspace selections
+                    // via loadEnvMap (emitting adds only for newly resolved persisted envs). A
+                    // successful (possibly empty) array is applied normally.
                     if (refreshed === undefined) {
-                        traceVerbose('Conda background discovery failed; leaving collection unchanged.');
+                        traceVerbose(
+                            'Conda background discovery failed; preserving collection and restoring persisted selections.',
+                        );
+                        await this.preserveCollectionOnFailedDiscovery();
                         return;
                     }
                     this.collection = refreshed;
@@ -504,6 +517,24 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
 
     async clearCache(): Promise<void> {
         await clearCondaCache();
+    }
+
+    /**
+     * Handles a discovery failure (`refreshCondaEnvs` returned `undefined`) without discarding
+     * the last known-good collection. The existing collection is preserved and `loadEnvMap()`
+     * still runs so persisted global/workspace selections are restored/updated. Because
+     * `loadEnvMap()` can append independently-resolved persisted environments, only the newly
+     * appended environments are emitted as additions; removals are never emitted on this path.
+     */
+    private async preserveCollectionOnFailedDiscovery(): Promise<void> {
+        const existing = new Set(this.collection);
+        await this.loadEnvMap();
+        const added = this.collection.filter((env) => !existing.has(env));
+        if (added.length > 0) {
+            this._onDidChangeEnvironments.fire(
+                added.map((environment) => ({ environment, kind: EnvironmentChangeKind.add })),
+            );
+        }
     }
 
     private async loadEnvMap() {
