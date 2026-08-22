@@ -3,13 +3,19 @@
 
 import assert from 'node:assert';
 import {
+    backoffThenCheckBudget,
     clampTimeoutToRemaining,
+    computeCliFallbackPathBudgetMs,
     computeRefreshOperationBudgetMs,
+    computeServerRefreshBudgetMs,
     Deadline,
     MIN_STAGE_BUDGET_MS,
     MonotonicClock,
     REFRESH_OPERATION_BUDGET_MS,
     RefreshBudgetExceededError,
+    retryWouldStarveCliFallbackMs,
+    RpcTimeoutError,
+    toBudgetError,
 } from '../../../managers/common/nativePythonFinder';
 
 // A small mutable monotonic clock so all deadline math is deterministic (no wall-clock/perf.now()).
@@ -32,23 +38,152 @@ suite('Bounded refresh latency — operation budget', () => {
     const MAX_CONFIGURE_TIMEOUT_MS = 60_000;
     const REFRESH_TIMEOUT_MS = 30_000;
     const RESOLVE_TIMEOUT_MS = 30_000;
+    const CLI_FALLBACK_TIMEOUT_MS = 120_000;
     const RESTART_BACKOFF_BASE_MS = 1_000;
     const MAX_RESTART_ATTEMPTS = 3;
+    const maxRestartBackoffMs = RESTART_BACKOFF_BASE_MS * Math.pow(2, MAX_RESTART_ATTEMPTS - 1); // 4s
 
-    test('computeRefreshOperationBudgetMs equals the attained worst-case successful path (184s)', () => {
-        const maxRestartBackoffMs = RESTART_BACKOFF_BASE_MS * Math.pow(2, MAX_RESTART_ATTEMPTS - 1); // 4s
+    test('computeServerRefreshBudgetMs equals the attained worst-case successful server path (184s)', () => {
         const failingAttemptMs = MAX_CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS; // 60 + 30 = 90s
         const succeedingAttemptMs =
             maxRestartBackoffMs + CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS + RESOLVE_TIMEOUT_MS; // 4 + 30 + 30 + 30 = 94s
         const expected = failingAttemptMs + succeedingAttemptMs; // 184s
 
         assert.strictEqual(expected, 184_000, 'sanity: hand arithmetic should be 184000ms');
-        assert.strictEqual(computeRefreshOperationBudgetMs(), 184_000);
-        assert.strictEqual(REFRESH_OPERATION_BUDGET_MS, 184_000);
+        assert.strictEqual(computeServerRefreshBudgetMs(), 184_000);
+    });
+
+    test('computeCliFallbackPathBudgetMs reserves one worst server attempt + transition + full CLI scan (214s)', () => {
+        const worstServerAttemptMs = MAX_CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS; // 90s
+        const expected = worstServerAttemptMs + maxRestartBackoffMs + CLI_FALLBACK_TIMEOUT_MS; // 90 + 4 + 120 = 214s
+
+        assert.strictEqual(expected, 214_000, 'sanity: hand arithmetic should be 214000ms');
+        assert.strictEqual(computeCliFallbackPathBudgetMs(), 214_000);
+    });
+
+    test('computeRefreshOperationBudgetMs is the max of the server and CLI-fallback paths (214s)', () => {
+        assert.strictEqual(
+            computeRefreshOperationBudgetMs(),
+            Math.max(computeServerRefreshBudgetMs(), computeCliFallbackPathBudgetMs()),
+        );
+        assert.strictEqual(computeRefreshOperationBudgetMs(), 214_000);
+        assert.strictEqual(REFRESH_OPERATION_BUDGET_MS, 214_000);
+    });
+
+    test('the operation budget is bounded — not an arbitrary stack of every pathological timeout', () => {
+        // It must never exceed the larger of the two reachable successful paths.
+        assert.ok(REFRESH_OPERATION_BUDGET_MS <= 214_000, 'budget should not exceed the CLI-fallback path');
+        // And it must be large enough to fund a full CLI enumeration reserve.
+        assert.ok(REFRESH_OPERATION_BUDGET_MS >= CLI_FALLBACK_TIMEOUT_MS, 'budget must cover a full CLI scan');
     });
 
     test('MIN_STAGE_BUDGET_MS floor is 1s', () => {
         assert.strictEqual(MIN_STAGE_BUDGET_MS, 1_000);
+    });
+});
+
+suite('Bounded refresh latency — retryWouldStarveCliFallbackMs', () => {
+    const CONFIGURE_TIMEOUT_MS = 30_000;
+    const REFRESH_TIMEOUT_MS = 30_000;
+    const CLI_FALLBACK_TIMEOUT_MS = 120_000;
+    const MIN_STAGE_BUDGET = 1_000;
+    const maxRestartBackoffMs = 4_000;
+    // worstRetryCost (4 + 30 + 30 = 64s) + cliReserve (120 + 1 = 121s) = 185s threshold.
+    const threshold = maxRestartBackoffMs + CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS + CLI_FALLBACK_TIMEOUT_MS + MIN_STAGE_BUDGET;
+
+    test('threshold is 185s from the existing constants', () => {
+        assert.strictEqual(threshold, 185_000);
+    });
+
+    test('returns true when a retry would leave less than a full CLI enumeration reserve', () => {
+        assert.strictEqual(retryWouldStarveCliFallbackMs(threshold - 1), true);
+        assert.strictEqual(retryWouldStarveCliFallbackMs(124_000), true, 'after a 90s server attempt, skip to CLI');
+    });
+
+    test('returns false when there is ample budget for both another server attempt and the CLI reserve', () => {
+        assert.strictEqual(retryWouldStarveCliFallbackMs(threshold), false);
+        assert.strictEqual(retryWouldStarveCliFallbackMs(212_000), false, 'a fast early failure still allows a retry');
+    });
+
+    test('a valid 60s CLI scan remains fundable after a server failure while total latency stays bounded', () => {
+        // Worst realistic entry to the CLI fallback: a full failing server attempt consumed 90s of a
+        // fresh 214s budget, leaving 124s. The retry guard trips (124 < 185) so we skip straight to CLI.
+        const remainingAfterServerFailure = REFRESH_OPERATION_BUDGET_MS - (60_000 + 30_000); // 124s
+        assert.strictEqual(retryWouldStarveCliFallbackMs(remainingAfterServerFailure), true, 'must skip the retry');
+
+        // The CLI scan is clamped to the remaining budget; a 60s scan easily fits under the ~124s left,
+        // and the whole operation is still bounded by REFRESH_OPERATION_BUDGET_MS.
+        const { clock } = makeClock();
+        const dl = new Deadline(remainingAfterServerFailure, clock);
+        const cliScanTimeout = clampTimeoutToRemaining(CLI_FALLBACK_TIMEOUT_MS, dl, 'cli_find');
+        assert.ok(cliScanTimeout >= 60_000, 'a 60s CLI scan must be allowed after a server failure');
+        assert.ok(
+            60_000 + (90_000) <= REFRESH_OPERATION_BUDGET_MS,
+            'server failure (90s) + a 60s CLI scan stays within the operation budget',
+        );
+    });
+});
+
+suite('Bounded refresh latency — toBudgetError (deadline provenance)', () => {
+    test('returns undefined when there is no deadline (non-refresh callers stay unchanged)', () => {
+        const err = new RpcTimeoutError('configure', 30_000);
+        assert.strictEqual(toBudgetError(err, undefined, 'configure'), undefined);
+    });
+
+    test('returns undefined for an RpcTimeoutError while the deadline still has budget (genuine slow PET)', () => {
+        const { clock } = makeClock();
+        const dl = new Deadline(100_000, clock); // full budget remaining
+        const err = new RpcTimeoutError('refresh', 30_000);
+        assert.strictEqual(toBudgetError(err, dl, 'refresh'), undefined);
+    });
+
+    test('reclassifies an RpcTimeoutError as a budget error once the deadline is exhausted', () => {
+        const { clock, set } = makeClock();
+        const dl = new Deadline(100_000, clock);
+        set(99_900); // remaining 100 < floor → exhausted
+        const err = new RpcTimeoutError('configure', 100);
+        const budget = toBudgetError(err, dl, 'configure');
+        assert.ok(budget instanceof RefreshBudgetExceededError, 'a clamped timeout on an exhausted budget is a budget error');
+        assert.strictEqual(budget?.stage, 'configure');
+    });
+
+    test('does not reclassify a non-timeout error even when the deadline is exhausted', () => {
+        const { clock, set } = makeClock();
+        const dl = new Deadline(100_000, clock);
+        set(99_900);
+        assert.strictEqual(toBudgetError(new Error('boom'), dl, 'refresh'), undefined);
+    });
+});
+
+suite('Bounded refresh latency — backoffThenCheckBudget (restart recheck)', () => {
+    test('resolves without throwing when no deadline is supplied (resolve/non-refresh restart path)', async () => {
+        let slept = 0;
+        await backoffThenCheckBudget(1_000, undefined, async (ms) => {
+            slept += ms;
+        });
+        assert.strictEqual(slept, 1_000, 'the backoff wait still happens');
+    });
+
+    test('rejects with RefreshBudgetExceededError when the budget expires during the wait', async () => {
+        const { clock, advance } = makeClock();
+        const dl = new Deadline(4_000, clock); // 4s budget
+        // The injected sleep advances the clock past the deadline, mimicking a backoff that outlasts it.
+        await assert.rejects(
+            backoffThenCheckBudget(4_000, dl, async (ms) => {
+                advance(ms); // 4s elapses → remaining 0 < floor → exhausted
+            }),
+            RefreshBudgetExceededError,
+        );
+    });
+
+    test('resolves when budget remains after the (clamped) backoff', async () => {
+        const { clock, advance } = makeClock();
+        const dl = new Deadline(100_000, clock);
+        await backoffThenCheckBudget(4_000, dl, async (ms) => {
+            advance(ms); // only 4s of a 100s budget consumed
+        });
+        // No throw → restart may proceed to teardown/spawn.
+        assert.ok(dl.remainingMs() > MIN_STAGE_BUDGET_MS);
     });
 });
 
@@ -135,7 +270,7 @@ suite('Bounded refresh latency — clampTimeoutToRemaining', () => {
         // Mirrors how doRefreshAttempt threads one Deadline through its stages. We drive an injected
         // clock forward by however long each stage "took" and check what timeout the next stage gets.
         const { clock, set } = makeClock();
-        const dl = new Deadline(REFRESH_OPERATION_BUDGET_MS, clock); // 184s
+        const dl = new Deadline(REFRESH_OPERATION_BUDGET_MS, clock); // 214s
 
         // configure gets its full base timeout while lots of budget remains.
         assert.strictEqual(clampTimeoutToRemaining(30_000, dl, 'configure'), 30_000);
@@ -145,7 +280,7 @@ suite('Bounded refresh latency — clampTimeoutToRemaining', () => {
         assert.strictEqual(clampTimeoutToRemaining(30_000, dl, 'refresh'), 30_000);
         set(60_000); // refresh consumed 30s
 
-        // resolve still fits (124s remaining).
+        // resolve still fits (154s remaining of the 214s budget).
         assert.strictEqual(clampTimeoutToRemaining(30_000, dl, 'refresh_resolve'), 30_000);
 
         // Late in the operation only 20s remain → the next stage is clamped down.

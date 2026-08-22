@@ -42,7 +42,19 @@ interface IWorkItem<T> {
     expired: boolean;
     /** Timer that expires the item while it is still queued; cleared on dequeue/settle/stop. */
     expiryTimer?: ReturnType<typeof setTimeout>;
+    /**
+     * Absolute expiry time (per the queue clock) captured at enqueue. The expiry is enforced against
+     * this absolute deadline — not just the timer — so a delayed timer callback (event-loop stall)
+     * can never let an item that is already past its deadline start running: {@link WorkQueue.next}
+     * rechecks the clock before dequeuing.
+     */
+    expiresAt?: number;
+    /** Original expiry duration, retained for the {@link QueueTaskExpiredError} message. */
+    expiresInMs?: number;
 }
+
+/** Clock used for the queue's absolute expiry deadline. Injectable so tests can drive it. */
+export type QueueClock = () => number;
 
 export enum QueuePosition {
     back,
@@ -99,6 +111,21 @@ class WorkerImpl<T, R> implements Worker {
 class WorkQueue<T, R> {
     private readonly items: IWorkItem<T>[] = [];
     private readonly results: Map<IWorkItem<T>, Deferred<R>> = new Map();
+
+    /**
+     * @param now Clock backing the absolute expiry deadline. Defaults to `Date.now`; injectable so
+     *        tests can advance time independently of the (faked) expiry timer to exercise the
+     *        delayed-timer / event-loop-stall recheck path.
+     *
+     *        Note (intentional clock split): the queue's coarse expiry uses wall-clock `Date.now`,
+     *        while the finder's precise running-stage budget uses a monotonic `performance.now`
+     *        deadline. A backward wall-clock adjustment during a long queue wait could delay this
+     *        absolute recheck, but the relative `setTimeout` timer here and the monotonic deadline on
+     *        the running stages still bound the operation — so the split is acceptable belt-and-braces
+     *        rather than a correctness dependency. Callers may thread a monotonic clock if desired.
+     */
+    public constructor(private readonly now: QueueClock = Date.now) {}
+
     public add(item: T, position?: QueuePosition, expiresInMs?: number): Promise<R> {
         // Wrap the user provided item in a wrapper object. This will allow us to track multiple
         // submissions of the same item. For example, addToQueue(2), addToQueue(2). If we did not
@@ -119,11 +146,16 @@ class WorkQueue<T, R> {
         const deferred = createDeferred<R>();
         this.results.set(workItem, deferred);
 
-        // Optional expiration: reject the item if it is still queued when the timer fires.
-        // The timer is cleared the moment the item is dequeued (next()) or settled (completed()),
-        // so an item that has started running can never be expired.
+        // Optional expiration. Two guards enforce it so it holds even if the timer callback is
+        // delayed (event-loop stall): (1) an absolute `expiresAt` deadline, rechecked in next()
+        // before an item is allowed to run, and (2) a `setTimeout` that proactively expires the
+        // item while it is still queued. The timer is cleared the moment the item is dequeued
+        // (next()), settled (completed()) or the pool stops (clear()), so a running item can never
+        // be expired. Omitting `expiresInMs` preserves the original (unbounded) queueing behavior.
         if (expiresInMs !== undefined) {
-            workItem.expiryTimer = setTimeout(() => this.expire(workItem, expiresInMs), expiresInMs);
+            workItem.expiresInMs = expiresInMs;
+            workItem.expiresAt = this.now() + expiresInMs;
+            workItem.expiryTimer = setTimeout(() => this.expire(workItem), Math.max(0, expiresInMs));
         }
 
         return deferred.promise;
@@ -138,11 +170,28 @@ class WorkQueue<T, R> {
     }
 
     /**
-     * Expires a queued item: removes it from the queue and rejects its promise. No-op if the item
-     * has already been dequeued (running), already expired, or was already removed from the queue.
-     * This is the only place that transitions queued -> expired, so it settles at most once.
+     * Transitions a still-queued item to `expired` and rejects its promise, exactly once. Does not
+     * touch the queue array (callers remove the item first). No-op if the item has already started
+     * running or already expired, guaranteeing queued -> running | expired settles at most once.
      */
-    private expire(workItem: IWorkItem<T>, expiresInMs: number): void {
+    private settleExpired(workItem: IWorkItem<T>): void {
+        this.clearExpiry(workItem);
+        if (workItem.running || workItem.expired) {
+            return;
+        }
+        workItem.expired = true;
+        const deferred = this.results.get(workItem);
+        if (deferred !== undefined) {
+            this.results.delete(workItem);
+            deferred.reject(new QueueTaskExpiredError(workItem.expiresInMs ?? 0));
+        }
+    }
+
+    /**
+     * Timer-driven expiration: removes a still-queued item from the queue and rejects it. No-op if
+     * the item has already been dequeued (running), already expired, or was already removed.
+     */
+    private expire(workItem: IWorkItem<T>): void {
         this.clearExpiry(workItem);
         if (workItem.running || workItem.expired) {
             return;
@@ -152,13 +201,8 @@ class WorkQueue<T, R> {
             // Already dequeued or cleared; nothing to expire.
             return;
         }
-        workItem.expired = true;
         this.items.splice(index, 1);
-        const deferred = this.results.get(workItem);
-        if (deferred !== undefined) {
-            this.results.delete(workItem);
-            deferred.reject(new QueueTaskExpiredError(expiresInMs));
-        }
+        this.settleExpired(workItem);
     }
 
     public completed(workItem: IWorkItem<T>, result?: R, error?: Error): void {
@@ -175,18 +219,28 @@ class WorkQueue<T, R> {
     }
 
     public next(): IWorkItem<T> | undefined {
-        // Skip any item that expired while queued (defensive — expired items are removed on expiry).
         let workItem = this.items.shift();
-        while (workItem !== undefined && workItem.expired) {
-            workItem = this.items.shift();
-        }
-        if (workItem !== undefined) {
+        while (workItem !== undefined) {
+            if (workItem.expired) {
+                // Already expired via the timer; skip it (defensive — expired items are removed on expiry).
+                workItem = this.items.shift();
+                continue;
+            }
+            // Absolute-deadline recheck: even if the expiry timer has not fired yet (delayed timer
+            // callback / event-loop stall), never start an item whose deadline has already passed.
+            // The item has already been shifted off the queue, so settle it as expired and move on.
+            if (workItem.expiresAt !== undefined && this.now() >= workItem.expiresAt) {
+                this.settleExpired(workItem);
+                workItem = this.items.shift();
+                continue;
+            }
             // Mark as running and disarm expiration before the worker starts the item so that a
             // running item can never be expired (queued -> running is a one-way transition).
             workItem.running = true;
             this.clearExpiry(workItem);
+            return workItem;
         }
-        return workItem;
+        return undefined;
     }
 
     public clear(): void {
@@ -209,7 +263,7 @@ class WorkerPoolImpl<T, R> implements WorkerPool<T, R> {
     private readonly waitingWorkersUnblockQueue: { unblock(w: IWorkItem<T>): void; stop(): void }[] = [];
 
     // A collection that manages the work items.
-    private readonly queue = new WorkQueue<T, R>();
+    private readonly queue: WorkQueue<T, R>;
 
     // State of the pool manages via stop(), start()
     private stopProcessing = false;
@@ -218,7 +272,10 @@ class WorkerPoolImpl<T, R> implements WorkerPool<T, R> {
         private readonly workerFunc: WorkFunc<T, R>,
         private readonly numWorkers: number = 2,
         private readonly name: string = 'Worker',
-    ) {}
+        now?: QueueClock,
+    ) {
+        this.queue = new WorkQueue<T, R>(now);
+    }
 
     public addToQueue(item: T, position?: QueuePosition, expiresInMs?: number): Promise<R> {
         if (this.stopProcessing) {
@@ -238,9 +295,12 @@ class WorkerPoolImpl<T, R> implements WorkerPool<T, R> {
                 // and give the worker the newly added item.
                 worker.unblock(workItem);
             } else {
-                // Something is wrong, we should not be here. we just added an item to
-                // the queue. It should not be empty.
-                traceError('Work queue was empty immediately after adding item.');
+                // The item we just added was already past its expiry deadline (e.g. a non-positive
+                // expiresInMs makes its absolute deadline elapse immediately), so next() settled it
+                // as expired — rejecting the caller — and returned nothing. Re-park the worker we
+                // shifted so it stays available for future items instead of being stranded with a
+                // wait that never resolves.
+                this.waitingWorkersUnblockQueue.unshift(worker);
             }
         }
 
@@ -321,8 +381,9 @@ export function createRunningWorkerPool<T, R>(
     workerFunc: WorkFunc<T, R>,
     numWorkers?: number,
     name?: string,
+    now?: QueueClock,
 ): WorkerPool<T, R> {
-    const pool = new WorkerPoolImpl<T, R>(workerFunc, numWorkers, name);
+    const pool = new WorkerPoolImpl<T, R>(workerFunc, numWorkers, name, now);
     pool.start();
     return pool;
 }

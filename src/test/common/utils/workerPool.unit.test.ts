@@ -236,3 +236,195 @@ suite('WorkerPool — pending-task expiration', () => {
         }
     });
 });
+
+/**
+ * Absolute-deadline expiration tests.
+ *
+ * These decouple the queue's expiry *clock* from its expiry *timer*: `setTimeout` is faked by sinon,
+ * but the pool is given an injected `now` clock backed by a manually-advanced variable. Advancing the
+ * injected clock past an item's deadline *without* firing the sinon timer reproduces an event-loop
+ * stall / delayed timer callback and proves the absolute recheck in next() — not just the timer —
+ * enforces the deadline.
+ */
+suite('WorkerPool — absolute-deadline expiration', () => {
+    let clock: sinon.SinonFakeTimers;
+
+    setup(() => {
+        clock = sinon.useFakeTimers();
+        sinon.stub(logging, 'traceError');
+    });
+
+    teardown(() => {
+        clock.restore();
+        sinon.restore();
+    });
+
+    /**
+     * Builds a 1-worker pool with an injected clock. `setNow` mutates the clock the queue reads for
+     * its absolute `expiresAt` comparisons, independently of sinon's (faked) `setTimeout`.
+     */
+    function makeInjectedClockPool(): {
+        pool: WorkerPool<string, string>;
+        started: string[];
+        blockerGate: Deferred<string>;
+        setNow: (ms: number) => void;
+    } {
+        const started: string[] = [];
+        const blockerGate = createDeferred<string>();
+        let nowMs = 0;
+        const pool = createRunningWorkerPool<string, string>(
+            async (item: string): Promise<string> => {
+                started.push(item);
+                if (item === 'blocker') {
+                    return blockerGate.promise;
+                }
+                return item;
+            },
+            1,
+            'test-pool',
+            () => nowMs,
+        );
+        return {
+            pool,
+            started,
+            blockerGate,
+            setNow: (ms: number) => {
+                nowMs = ms;
+            },
+        };
+    }
+
+    test('event-loop stall: absolute recheck expires a queued item even when its timer is delayed', async () => {
+        const { pool, started, blockerGate, setNow } = makeInjectedClockPool();
+        try {
+            const pBlocker = pool.addToQueue('blocker');
+            pBlocker.catch(() => undefined);
+            await clock.tickAsync(0); // worker picks up and blocks on 'blocker'
+            assert.deepStrictEqual(started, ['blocker']);
+
+            // expiresAt = now(0) + 5000 = 5000. Timer armed via the (faked) setTimeout at t=5000.
+            const pExpire = pool.addToQueue('expireme', QueuePosition.back, 5_000);
+            const outcome = pExpire.then(
+                () => ({ ok: true as const }),
+                (e: unknown) => ({ ok: false as const, err: e }),
+            );
+
+            // Event-loop stall: the injected clock jumps PAST the deadline, but we never advance
+            // sinon to t=5000, so the expiry timer callback has NOT fired.
+            setNow(6_000);
+
+            // Free the worker. Its loop calls next(), which must observe now() >= expiresAt and
+            // expire the item via the absolute recheck rather than run it.
+            blockerGate.resolve('blocker');
+            await clock.tickAsync(0); // flush microtasks (worker continuation), NOT the 5s timer
+
+            const result = await outcome;
+            assert.strictEqual(result.ok, false, 'stalled-past-deadline item must be rejected, not run');
+            assert.ok(
+                !result.ok && result.err instanceof QueueTaskExpiredError,
+                'should reject with QueueTaskExpiredError',
+            );
+            assert.ok(!started.includes('expireme'), 'expired item must never execute despite a delayed timer');
+
+            // Later work still runs after an absolute-deadline expiry.
+            setNow(7_000);
+            const pLater = pool.addToQueue('later');
+            assert.strictEqual(await pLater, 'later', 'the pool keeps processing after an absolute-deadline expiry');
+            assert.ok(started.includes('later'));
+        } finally {
+            pool.stop();
+        }
+    });
+
+    test('boundary: an item whose deadline exactly equals now expires (>=) and does not run', async () => {
+        const { pool, started, blockerGate, setNow } = makeInjectedClockPool();
+        try {
+            const pBlocker = pool.addToQueue('blocker');
+            pBlocker.catch(() => undefined);
+            await clock.tickAsync(0);
+
+            const pExpire = pool.addToQueue('expireme', QueuePosition.back, 5_000); // expiresAt = 5000
+            const outcome = pExpire.then(
+                () => ({ ok: true as const }),
+                (e: unknown) => ({ ok: false as const, err: e }),
+            );
+
+            setNow(5_000); // exactly at the deadline
+            blockerGate.resolve('blocker');
+            await clock.tickAsync(0);
+
+            const result = await outcome;
+            assert.strictEqual(result.ok, false, 'an item exactly at its deadline must expire (>= boundary)');
+            assert.ok(!result.ok && result.err instanceof QueueTaskExpiredError);
+            assert.ok(!started.includes('expireme'));
+        } finally {
+            pool.stop();
+        }
+    });
+
+    test('next() skips a stalled-expired item and continues to the next valid queued item', async () => {
+        const { pool, started, blockerGate, setNow } = makeInjectedClockPool();
+        try {
+            const pBlocker = pool.addToQueue('blocker');
+            pBlocker.catch(() => undefined);
+            await clock.tickAsync(0);
+
+            // 'expireme' has a 5s deadline; 'keepme' has none and is queued behind it.
+            const pExpire = pool.addToQueue('expireme', QueuePosition.back, 5_000);
+            const expireOutcome = pExpire.then(
+                () => ({ ok: true as const }),
+                (e: unknown) => ({ ok: false as const, err: e }),
+            );
+            const pKeep = pool.addToQueue('keepme', QueuePosition.back);
+
+            // Stall past 'expireme's deadline without firing its timer.
+            setNow(6_000);
+            blockerGate.resolve('blocker');
+            await clock.tickAsync(0);
+
+            const result = await expireOutcome;
+            assert.strictEqual(result.ok, false, 'the stalled item should be expired');
+            assert.ok(!result.ok && result.err instanceof QueueTaskExpiredError);
+            assert.strictEqual(await pKeep, 'keepme', 'next() must continue to the next valid item after skipping an expired one');
+            assert.ok(!started.includes('expireme'), 'expired item never ran');
+            assert.ok(started.includes('keepme'), 'the following valid item ran');
+        } finally {
+            pool.stop();
+        }
+    });
+
+    test('enqueuing an already-expired item (non-positive expiresInMs) rejects it without stranding the parked worker', async () => {
+        // Empty pool → the single worker is parked. Enqueuing an item whose absolute deadline has
+        // already passed makes next() settle it as expired synchronously at enqueue, so unblock() is
+        // never called. The shifted worker must be re-parked, not stranded, so later work still runs.
+        const started: string[] = [];
+        const pool = createRunningWorkerPool<string, string>(
+            async (i: string) => {
+                started.push(i);
+                return i;
+            },
+            1,
+            'test-pool',
+        );
+        try {
+            const pExpired = pool.addToQueue('expired-now', QueuePosition.back, 0); // expiresAt = now → expires immediately
+            const outcome = pExpired.then(
+                () => ({ ok: true as const }),
+                (e: unknown) => ({ ok: false as const, err: e }),
+            );
+            await clock.tickAsync(0);
+
+            const result = await outcome;
+            assert.strictEqual(result.ok, false, 'a non-positive expiry must reject immediately');
+            assert.ok(!result.ok && result.err instanceof QueueTaskExpiredError);
+            assert.ok(!started.includes('expired-now'), 'the already-expired item never ran');
+
+            // The worker must have been re-parked: a subsequent normal item still runs.
+            const pLater = pool.addToQueue('later');
+            assert.strictEqual(await pLater, 'later', 'worker was re-parked and still processes new work');
+            assert.ok(started.includes('later'));
+        } finally {
+            pool.stop();
+        }
+    });
+});

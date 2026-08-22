@@ -20,7 +20,7 @@ suite('Error Classifier', () => {
         });
 
         test('should classify a QueueTaskExpiredError as a timeout (rpc_timeout)', () => {
-            const errorType = classifyError(new QueueTaskExpiredError(184_000));
+            const errorType = classifyError(new QueueTaskExpiredError(214_000));
             assert.strictEqual(errorType, 'rpc_timeout');
             assert.ok(isTimeoutErrorType(errorType), 'queue expiration should record as a timeout');
         });
