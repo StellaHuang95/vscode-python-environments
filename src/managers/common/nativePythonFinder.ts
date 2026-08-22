@@ -11,7 +11,7 @@ import { getExtension } from '../../common/extension.apis';
 import { traceError, traceVerbose, traceWarn } from '../../common/logging';
 import { StopWatch } from '../../common/stopWatch';
 import { EventNames } from '../../common/telemetry/constants';
-import { classifyError, isTimeoutErrorType } from '../../common/telemetry/errorClassifier';
+import { classifyError, isPetConnectionLostError, isTimeoutErrorType } from '../../common/telemetry/errorClassifier';
 import { sendTelemetryEvent } from '../../common/telemetry/sender';
 import { untildify, untildifyArray } from '../../common/utils/pathUtils';
 import { isWindows } from '../../common/utils/platformUtils';
@@ -287,6 +287,22 @@ export class RpcTimeoutError extends Error {
     }
 }
 
+/**
+ * Error thrown when an operation is attempted on a finder that has already been disposed.
+ *
+ * A disposed finder must never spawn a PET server/CLI process, restart, retry, or fall back to the
+ * JSON CLI. Every lifecycle chokepoint (public in-flight requests, `ensureProcessRunning`, restart
+ * before/after its backoff, `start`, and the CLI fallbacks) throws this so an in-flight or
+ * post-dispose caller settles exactly once with a precise, recognizable error instead of leaking a
+ * replacement process or timer.
+ */
+export class NativePythonFinderDisposedError extends Error {
+    constructor() {
+        super('Python Environment Tools (PET) finder has been disposed.');
+        this.name = this.constructor.name;
+    }
+}
+
 /** Retries only JSON-RPC timeout failures; all other errors propagate immediately. */
 export async function retryRpcTimeout<T>(
     request: () => Promise<T>,
@@ -342,7 +358,15 @@ async function sendRequestWithTimeout<T>(
     }
 }
 
-class NativePythonFinderImpl implements NativePythonFinder {
+/**
+ * @internal Concrete {@link NativePythonFinder} implementation.
+ *
+ * Exported only as a test seam so unit tests can drive the real JSON-RPC wiring in
+ * {@link NativePythonFinderImpl.start} against a fake child process (there is no other
+ * injection point for the spawned PET server). It is intentionally NOT part of the public
+ * extension API — production code must construct it via {@link createNativePythonFinder}.
+ */
+export class NativePythonFinderImpl implements NativePythonFinder {
     private connection: rpc.MessageConnection;
     private readonly pool: WorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>;
     private cache: Map<string, NativeInfo[]> = new Map();
@@ -357,6 +381,14 @@ class NativePythonFinderImpl implements NativePythonFinder {
     private startFailed: boolean = false;
     private restartAttempts: number = 0;
     private isRestarting: boolean = false;
+    private disposed: boolean = false;
+    /**
+     * Cancels an in-progress `restart()` backoff wait. Set while `restart()` is parked on its
+     * exponential-backoff timer and cleared once the wait completes. `dispose()` calls this so a
+     * disposal during the backoff window unblocks the wait immediately (clearing the timer so none
+     * leaks) — `restart()` then re-checks `disposed` and aborts instead of spawning a replacement.
+     */
+    private cancelRestartBackoff: (() => void) | undefined = undefined;
     private processExitReason: string | undefined = undefined;
     private readonly configureRetry = new ConfigureRetryState();
     /**
@@ -384,6 +416,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
     public async resolve(executable: string): Promise<NativeEnvInfo> {
         const sw = new StopWatch();
         try {
+            this.throwIfDisposed();
             await this.ensureProcessRunning();
             try {
                 await this.configure();
@@ -403,19 +436,28 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 });
                 return environment;
             } catch (ex) {
-                // On resolve timeout or connection error (not configure — configure handles its own timeout),
-                // kill the hung process so next request triggers restart
-                if ((ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError) {
-                    const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
+                // On resolve timeout or a recoverable connection loss (crash mid-request; not
+                // configure — configure handles its own timeout), kill the hung/dead process so the
+                // next request triggers a restart.
+                if (
+                    (ex instanceof RpcTimeoutError && ex.method !== 'configure') ||
+                    this.isRecoverableConnectionLoss(ex)
+                ) {
+                    const reason = ex instanceof RpcTimeoutError ? 'timed out' : 'crashed';
                     this.outputChannel.warn(`[pet] Resolve request ${reason}, killing process for restart`);
                     this.killProcess();
                     this.processExited = true;
                     this.processExitReason =
-                        ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_resolve_timeout';
+                        ex instanceof RpcTimeoutError ? 'rpc_resolve_timeout' : 'rpc_connection_error';
                 }
                 throw ex;
             }
         } catch (ex) {
+            // A disposal that interrupted this in-flight resolve is intentional teardown, not a
+            // recoverable failure: settle once with the precise error and never fall back to CLI.
+            if (ex instanceof NativePythonFinderDisposedError) {
+                throw ex;
+            }
             const errorType = classifyError(ex);
             sendTelemetryEvent(
                 EventNames.PET_RESOLVE,
@@ -437,11 +479,41 @@ class NativePythonFinderImpl implements NativePythonFinder {
     }
 
     /**
+     * True when `ex` is a PET connection-loss error that recovery logic should treat as a
+     * recoverable crash (kill + restart + retry). Delegates the error-shape check to the shared
+     * {@link isPetConnectionLostError} classifier, then filters out self-inflicted losses:
+     *  - `isRestarting`: restart() disposes the old connection, rejecting its in-flight requests
+     *    with PendingResponseRejected. Those stale rejections must NOT trigger a second restart or
+     *    kill the freshly-started replacement child.
+     *  - `disposed`: dispose() disposes the connection during extension shutdown; that rejection is
+     *    intentional teardown, not a crash to recover from.
+     */
+    private isRecoverableConnectionLoss(ex: unknown): boolean {
+        return !this.disposed && !this.isRestarting && isPetConnectionLostError(ex);
+    }
+
+    /**
+     * Fail-fast guard for the dispose race. Throws {@link NativePythonFinderDisposedError} when the
+     * finder has been disposed so no lifecycle path spawns a process, restarts, retries, or runs a
+     * CLI fallback after teardown. Placed at every such chokepoint (public in-flight entry points,
+     * `ensureProcessRunning`, `restart` before/after its backoff, `start`, and the CLI fallbacks).
+     */
+    private throwIfDisposed(): void {
+        if (this.disposed) {
+            throw new NativePythonFinderDisposedError();
+        }
+    }
+
+    /**
      * Ensures the PET process is running. If it has exited or failed, attempts to restart
      * with exponential backoff up to MAX_RESTART_ATTEMPTS times.
      * @throws Error if the process cannot be started after all retry attempts
      */
     private async ensureProcessRunning(): Promise<void> {
+        // A disposed finder must never spawn/restart — fail fast so in-flight resolve()/refresh()
+        // callers settle promptly with a precise disposed error.
+        this.throwIfDisposed();
+
         // Process is running fine
         if (!this.startFailed && !this.processExited) {
             return;
@@ -468,8 +540,15 @@ class NativePythonFinderImpl implements NativePythonFinder {
     /**
      * Kills the current PET process (if running) and starts a fresh one.
      * Implements exponential backoff between restart attempts.
+     *
+     * Single-flight precondition: callers reach this only through {@link ensureProcessRunning},
+     * whose `isRestarting` guard ensures at most one `restart()` is ever in progress (and thus at
+     * most one parked on the backoff below). `cancelRestartBackoff` therefore tracks a single
+     * pending timer; a second concurrent restart would overwrite it and leak the first timer.
      */
     private async restart(): Promise<void> {
+        // Fail fast if disposed before we do any teardown/spawn work.
+        this.throwIfDisposed();
         this.isRestarting = true;
         this.restartAttempts++;
         const attempt = this.restartAttempts;
@@ -490,8 +569,24 @@ class NativePythonFinderImpl implements NativePythonFinder {
             this.startDisposables.forEach((d) => d.dispose());
             this.startDisposables = [];
 
-            // Wait with exponential backoff before restarting
-            await new Promise((resolve) => setTimeout(resolve, backoffMs));
+            // Wait with exponential backoff before restarting. The wait is cancelable so a dispose()
+            // during this window unblocks immediately (and clears the timer so none leaks); the
+            // post-backoff throwIfDisposed() below then aborts the restart before any spawn.
+            await new Promise<void>((resolve) => {
+                const timer = setTimeout(() => {
+                    this.cancelRestartBackoff = undefined;
+                    resolve();
+                }, backoffMs);
+                this.cancelRestartBackoff = () => {
+                    clearTimeout(timer);
+                    this.cancelRestartBackoff = undefined;
+                    resolve();
+                };
+            });
+
+            // If the finder was disposed while we were waiting out the backoff, abort now — never
+            // spawn a replacement PET process that nothing would ever dispose.
+            this.throwIfDisposed();
 
             // Reset state flags
             this.processExited = false;
@@ -517,6 +612,12 @@ class NativePythonFinderImpl implements NativePythonFinder {
             // Reset restart attempts on successful start (process didn't immediately fail)
             // We'll reset this only after a successful request completes
         } catch (ex) {
+            // An abort due to disposal is intentional teardown, not a restart failure: don't emit
+            // error telemetry/logs, just surface the precise error to the (in-flight) caller.
+            if (ex instanceof NativePythonFinderDisposedError) {
+                this.outputChannel.info('[pet] Restart aborted: finder disposed');
+                throw ex;
+            }
             sendTelemetryEvent(
                 EventNames.PET_PROCESS_RESTART,
                 { duration: sw.elapsedTime, attempt },
@@ -534,12 +635,20 @@ class NativePythonFinderImpl implements NativePythonFinder {
             );
             throw ex;
         } finally {
+            // Backoff is over (fired, canceled, or start() threw) — drop any stale cancel hook.
+            this.cancelRestartBackoff = undefined;
             this.isRestarting = false;
         }
     }
 
     /**
      * Attempts to kill the PET process. Used during restart and timeout recovery.
+     *
+     * Note: this clears `this.proc`, so the killed child's `exit` handler in {@link start} will
+     * hit the `this.proc === proc` identity guard and intentionally NOT set `this.processExited`
+     * (it still tears down that child's streams). Callers that rely on a subsequent restart MUST
+     * set `this.processExited = true` themselves — as resolve(), configure(), doRefresh() and
+     * doRefreshAttempt() already do.
      */
     private killProcess(): void {
         if (this.proc && this.proc.exitCode === null) {
@@ -560,6 +669,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
     }
 
     public async refresh(hardRefresh: boolean, options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
+        this.throwIfDisposed();
         if (hardRefresh) {
             return this.handleHardRefresh(options);
         }
@@ -638,6 +748,13 @@ class NativePythonFinderImpl implements NativePythonFinder {
     }
 
     public dispose() {
+        // Mark disposed BEFORE tearing anything down so the connection-close rejections triggered
+        // by disposing startDisposables/connection below are recognized as intentional shutdown and
+        // never mistaken for a recoverable crash (see isRecoverableConnectionLoss).
+        this.disposed = true;
+        // Unblock any in-flight restart() parked on its backoff timer so it re-checks `disposed` and
+        // aborts immediately instead of spawning a replacement PET process after teardown.
+        this.cancelRestartBackoff?.();
         this.pool.stop();
         this.startDisposables.forEach((d) => d.dispose());
         this.connection.dispose();
@@ -665,6 +782,9 @@ class NativePythonFinderImpl implements NativePythonFinder {
     }
 
     private start(): rpc.MessageConnection {
+        // Never spawn a PET server for a disposed finder (immediately before spawn), so a stale
+        // restart or any future caller can't leak a process past teardown.
+        this.throwIfDisposed();
         this.outputChannel.info(`[pet] Starting Python Locator ${this.toolPath} server`);
 
         // jsonrpc package cannot handle messages coming through too quickly.
@@ -673,24 +793,77 @@ class NativePythonFinderImpl implements NativePythonFinder {
         const readable = new PassThrough();
         const writable = new PassThrough();
 
-        try {
-            this.proc = spawnProcess(this.toolPath, ['server'], { env: process.env, stdio: 'pipe' });
+        // Resources owned by THIS child/connection. `this.startDisposables` is pointed at this
+        // array immediately below (so a spawn/wiring failure later still leaves the kill disposable
+        // reachable for cleanup) so restart()/dispose() tear down the current child. The closures
+        // here keep referencing this child's array even after a later restart() swaps the shared
+        // field for a new one, so a dead child only ever closes its own resources.
+        const localDisposables: Disposable[] = [];
+        this.startDisposables = localDisposables;
 
-            if (!this.proc.stdout || !this.proc.stderr || !this.proc.stdin) {
+        // Ending the readable stream makes StreamMessageReader observe EOF, which fires the
+        // connection close handler and (via localDisposables below) disposes the connection so
+        // any in-flight requests reject promptly instead of waiting out their 30-60s timeouts.
+        // Idempotent so the exit/error handlers and explicit disposal can all call it safely.
+        let streamsEnded = false;
+        // Captured once the child is spawned so endStreams() can detach its stdout before ending
+        // `readable`. `exit` can fire while stdout still has buffered bytes queued for `readable`;
+        // if stdout stayed piped, ending `readable` first would make those late bytes a write to an
+        // already-ended stream (ERR_STREAM_WRITE_AFTER_END), which escapes once the reader's own
+        // error handler is torn down.
+        let childStdout: NodeJS.ReadableStream | undefined;
+        const endStreams = () => {
+            if (streamsEnded) {
+                return;
+            }
+            streamsEnded = true;
+            // Detach BEFORE ending so no late bytes can be written to the ended streams. Both
+            // unpipes are no-ops if the pipe was never established or already removed, keeping this
+            // safe under duplicate exit/error/dispose calls.
+            childStdout?.unpipe(readable);
+            writable.unpipe();
+            readable.end();
+            writable.end();
+        };
+
+        try {
+            // spawnProcess()'s stdio:'pipe' overload returns non-null stdio streams. Capture the
+            // child locally so the termination handlers below act on THIS child even after
+            // `this.proc` is cleared by killProcess() or replaced by restart().
+            const proc = spawnProcess(this.toolPath, ['server'], { env: process.env, stdio: 'pipe' });
+            this.proc = proc;
+
+            if (!proc.stdout || !proc.stderr || !proc.stdin) {
                 throw new Error('Failed to create stdio streams for PET process');
             }
 
-            this.proc.stdout.pipe(readable, { end: false });
-            this.proc.stderr.on('data', (data) => this.outputChannel.error(`[pet] ${data.toString()}`));
-            writable.pipe(this.proc.stdin, { end: false });
+            // Remember the child's stdout so endStreams() can unpipe it before ending `readable`.
+            childStdout = proc.stdout;
+            proc.stdout.pipe(readable, { end: false });
+            proc.stderr.on('data', (data) => this.outputChannel.error(`[pet] ${data.toString()}`));
+            writable.pipe(proc.stdin, { end: false });
+
+            // Shared teardown for when THIS child goes away (exit or spawn/runtime error). Both
+            // events can fire; endStreams() is idempotent and the shared-state mutation is guarded.
+            const handleChildTermination = (reason: string) => {
+                // Always close this child's streams so its connection disposes and pending
+                // requests reject — even if `this.proc` was already cleared/replaced.
+                endStreams();
+                // Only mutate shared exit state while this child is still the active one; a stale
+                // old child must never flip flags that now belong to a live replacement.
+                if (this.proc === proc) {
+                    this.processExited = true;
+                    // Preserve a more-specific reason (e.g. rpc_*) if one was already recorded
+                    // before the kill.
+                    if (this.processExitReason === undefined) {
+                        this.processExitReason = reason;
+                    }
+                }
+            };
 
             // Handle process exit - mark as exited so pending requests fail fast
-            this.proc.on('exit', (code, signal) => {
-                this.processExited = true;
-                // Preserve a more-specific reason (e.g. rpc_*) if one was already recorded before the kill.
-                if (this.processExitReason === undefined) {
-                    this.processExitReason = `process_exit:${code ?? 'null'}:${signal ?? 'none'}`;
-                }
+            proc.on('exit', (code, signal) => {
+                handleChildTermination(`process_exit:${code ?? 'null'}:${signal ?? 'none'}`);
                 if (code !== 0) {
                     this.outputChannel.error(
                         `[pet] Python Environment Tools exited unexpectedly with code ${code}, signal ${signal}`,
@@ -699,16 +872,12 @@ class NativePythonFinderImpl implements NativePythonFinder {
             });
 
             // Handle process errors (e.g., ENOENT if executable not found)
-            this.proc.on('error', (err) => {
-                this.processExited = true;
-                if (this.processExitReason === undefined) {
-                    this.processExitReason = 'process_error';
-                }
+            proc.on('error', (err) => {
+                handleChildTermination('process_error');
                 this.outputChannel.error('[pet] Process error:', err);
             });
 
-            const proc = this.proc;
-            this.startDisposables.push({
+            localDisposables.push({
                 dispose: () => {
                     try {
                         if (proc.exitCode === null) {
@@ -742,12 +911,9 @@ class NativePythonFinderImpl implements NativePythonFinder {
             new rpc.StreamMessageReader(readable),
             new rpc.StreamMessageWriter(writable),
         );
-        this.startDisposables.push(
+        localDisposables.push(
             connection,
-            new Disposable(() => {
-                readable.end();
-                writable.end();
-            }),
+            new Disposable(() => endStreams()),
             connection.onError((ex) => {
                 this.outputChannel.error('[pet] Connection Error:', ex);
             }),
@@ -772,7 +938,10 @@ class NativePythonFinderImpl implements NativePythonFinder {
             }),
             connection.onNotification('telemetry', (data) => this.outputChannel.info('[pet] Telemetry: ', data)),
             connection.onClose(() => {
-                this.startDisposables.forEach((d) => d.dispose());
+                // Dispose only THIS child's resources. Never touch `this.startDisposables`, which
+                // may already point at a replacement connection created by a later restart() — a
+                // stale close must not tear down the live connection.
+                localDisposables.forEach((d) => d.dispose());
             }),
         );
 
@@ -852,12 +1021,13 @@ class NativePythonFinderImpl implements NativePythonFinder {
             } catch (ex) {
                 lastError = ex;
 
-                // Retry on timeout or connection errors (PET hung or crashed mid-request)
+                // Retry on timeout or a recoverable connection loss (PET hung or crashed mid-request)
                 const isRetryable =
-                    (ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError;
+                    (ex instanceof RpcTimeoutError && ex.method !== 'configure') ||
+                    this.isRecoverableConnectionLoss(ex);
                 if (isRetryable) {
                     if (attempt < MAX_REFRESH_RETRIES) {
-                        const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
+                        const reason = ex instanceof RpcTimeoutError ? 'timed out' : 'crashed';
                         this.outputChannel.warn(
                             `[pet] Refresh ${reason} (attempt ${attempt + 1}/${MAX_REFRESH_RETRIES + 1}), restarting and retrying...`,
                         );
@@ -865,7 +1035,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
                         this.killProcess();
                         this.processExited = true;
                         this.processExitReason =
-                            ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
+                            ex instanceof RpcTimeoutError ? 'rpc_refresh_timeout' : 'rpc_connection_error';
                         continue;
                     }
                     // Final attempt failed
@@ -997,15 +1167,19 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 },
                 ex instanceof Error ? ex : undefined,
             );
-            // On refresh timeout or connection error (not configure — configure handles its own timeout),
-            // kill the hung process so next request triggers restart
-            if ((ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError) {
-                const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
+            // On refresh timeout or a recoverable connection loss (crash mid-request; not configure —
+            // configure handles its own timeout), kill the hung/dead process so the retry above (or
+            // the next request) triggers a restart.
+            if (
+                (ex instanceof RpcTimeoutError && ex.method !== 'configure') ||
+                this.isRecoverableConnectionLoss(ex)
+            ) {
+                const reason = ex instanceof RpcTimeoutError ? 'timed out' : 'crashed';
                 this.outputChannel.warn(`[pet] PET process ${reason}, killing for restart`);
                 this.killProcess();
                 this.processExited = true;
                 this.processExitReason =
-                    ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
+                    ex instanceof RpcTimeoutError ? 'rpc_refresh_timeout' : 'rpc_connection_error';
             }
             this.outputChannel.error('[pet] Error refreshing', ex);
             throw ex;
@@ -1115,9 +1289,11 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * Used to decide whether to fall back to CLI mode.
      * Does NOT return true while a restart is in progress — the server is not exhausted
      * if it is still mid-restart (concurrent callers must not bypass to CLI prematurely).
+     * Also never true once disposed: a disposed finder must not spawn a CLI fallback process.
      */
     private isServerExhausted(): boolean {
         return (
+            !this.disposed &&
             !this.isRestarting &&
             this.restartAttempts >= MAX_RESTART_ATTEMPTS &&
             (this.startFailed || this.processExited)
@@ -1206,6 +1382,8 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * @returns NativeInfo[] containing managers and environments, same as server mode.
      */
     private async refreshViaJsonCli(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
+        // Hard stop before spawning any CLI process: a disposed finder never runs the fallback.
+        this.throwIfDisposed();
         const config = await this.buildConfigurationOptions();
         // venvFolders must be included explicitly as search paths when options is Uri[],
         // mirroring getRefreshOptions() server-mode behaviour (searchPaths may override environmentDirectories).
@@ -1303,6 +1481,8 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * @throws Error if PET cannot identify the environment or if the output cannot be parsed.
      */
     private async resolveViaJsonCli(executable: string): Promise<NativeEnvInfo> {
+        // Hard stop before spawning any CLI process: a disposed finder never runs the fallback.
+        this.throwIfDisposed();
         const args = ['resolve', executable, '--json'];
         if (this.cacheDirectory) {
             args.push('--cache-directory', this.cacheDirectory.fsPath);

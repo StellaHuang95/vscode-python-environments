@@ -28,6 +28,27 @@ export function isTimeoutErrorType(errorType: DiscoveryErrorType): boolean {
 }
 
 /**
+ * Returns true when `ex` indicates the PET JSON-RPC connection was lost mid-request. This is the
+ * single source of truth for "PET connection loss" and covers BOTH shapes it can take:
+ *  - {@link rpc.ConnectionError}: the transport itself failed.
+ *  - {@link rpc.ResponseError} with {@link rpc.ErrorCodes.PendingResponseRejected}: an in-flight
+ *    request was rejected because the connection was disposed. Ending a dead child's streams
+ *    disposes its connection, so a crash now surfaces as this rejection rather than a
+ *    ConnectionError — recovery and telemetry must treat the two identically.
+ *
+ * NOTE: This is a pure classifier and cannot tell an *intentional* disposal (extension shutdown or
+ * an in-progress restart) apart from a crash. Callers that decide whether to restart/retry (as
+ * opposed to merely categorizing for telemetry) MUST additionally gate on their own lifecycle
+ * state so a self-inflicted disposal is not mistaken for a recoverable crash.
+ */
+export function isPetConnectionLostError(ex: unknown): boolean {
+    return (
+        ex instanceof rpc.ConnectionError ||
+        (ex instanceof rpc.ResponseError && ex.code === rpc.ErrorCodes.PendingResponseRejected)
+    );
+}
+
+/**
  * Classifies an error into a telemetry-safe category for the `errorType` property.
  * Does NOT include raw error messages — only the category.
  */
@@ -49,8 +70,12 @@ export function classifyError(ex: unknown): DiscoveryErrorType {
         }
     }
 
-    // JSON-RPC connection errors (e.g., PET process died mid-request, connection closed/disposed)
-    if (ex instanceof rpc.ConnectionError) {
+    // JSON-RPC connection loss: the PET process died mid-request (ConnectionError) or an in-flight
+    // request was rejected because the connection was disposed during teardown (ResponseError with
+    // PendingResponseRejected). Both mean the same thing for telemetry, so classify them together —
+    // and BEFORE the generic ResponseError branch below, otherwise a dispose-driven rejection would
+    // be mislabeled as a plain rpc_error.
+    if (isPetConnectionLostError(ex)) {
         return 'connection_error';
     }
 
