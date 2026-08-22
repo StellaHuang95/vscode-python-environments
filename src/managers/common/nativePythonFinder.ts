@@ -42,6 +42,7 @@ const MAX_RESTART_ATTEMPTS = 3;
 const RESTART_BACKOFF_BASE_MS = 1_000; // 1 second base, exponential: 1s, 2s, 4s
 const MAX_CONFIGURE_TIMEOUTS_BEFORE_KILL = 2; // Kill on the 2nd consecutive timeout
 const MAX_REFRESH_RETRIES = 1; // Retry refresh once after timeout
+const KILL_PROCESS_GRACE_PERIOD_MS = 500; // Grace after SIGTERM before escalating to SIGKILL
 
 /**
  * Computes the configure timeout with exponential backoff.
@@ -342,6 +343,57 @@ async function sendRequestWithTimeout<T>(
     }
 }
 
+/**
+ * Minimal view of a child process that {@link killPetProcessWithGrace} needs. Declaring only
+ * the members actually used keeps the helper (and its tests) decoupled from the full
+ * `ChildProcess` surface.
+ */
+type KillablePetProcess = Pick<ChildProcess, 'kill' | 'exitCode'>;
+
+/**
+ * Terminates a PET child process, transferring ownership out of its holder *before* signalling
+ * so a concurrent restart can spawn a replacement without this delayed force-kill targeting it.
+ *
+ * The current child is read via `getProc` and the holder is cleared synchronously via
+ * `clearProc`, then SIGTERM is delivered. If the *captured* child is still running after
+ * `graceMs`, SIGKILL is sent — but only ever to that captured child, never to whatever the
+ * holder may point at later (e.g. a restart's fresh process). This is the ownership guarantee
+ * the previous implementation lacked: its delayed callback re-read the mutable field, which
+ * had already been cleared (losing the original) or reassigned (risking killing a replacement).
+ *
+ * Exported for unit testing only; it is not part of the extension's public API.
+ *
+ * @param getProc Reads the holder's current child process.
+ * @param clearProc Relinquishes the holder's reference to the child process.
+ * @param outputChannel Channel used for info/error logging.
+ * @param graceMs Grace period after SIGTERM before escalating to SIGKILL.
+ */
+export function killPetProcessWithGrace(
+    getProc: () => KillablePetProcess | undefined,
+    clearProc: () => void,
+    outputChannel: Pick<LogOutputChannel, 'info' | 'error'>,
+    graceMs: number = KILL_PROCESS_GRACE_PERIOD_MS,
+): void {
+    // Capture the current child and relinquish ownership immediately. A restart may assign a
+    // fresh process right after this returns; the delayed SIGKILL below must never target it.
+    const proc = getProc();
+    clearProc();
+    if (proc && proc.exitCode === null) {
+        try {
+            outputChannel.info('[pet] Killing hung/crashed PET process');
+            proc.kill('SIGTERM');
+            // Give it a moment to terminate gracefully, then force kill the captured child.
+            setTimeout(() => {
+                if (proc.exitCode === null) {
+                    proc.kill('SIGKILL');
+                }
+            }, graceMs);
+        } catch (ex) {
+            outputChannel.error('[pet] Error killing process:', ex);
+        }
+    }
+}
+
 class NativePythonFinderImpl implements NativePythonFinder {
     private connection: rpc.MessageConnection;
     private readonly pool: WorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>;
@@ -540,23 +592,19 @@ class NativePythonFinderImpl implements NativePythonFinder {
 
     /**
      * Attempts to kill the PET process. Used during restart and timeout recovery.
+     *
+     * Ownership of the child is transferred to {@link killPetProcessWithGrace}, which clears
+     * `this.proc` before signalling so a subsequent restart can spawn a replacement without the
+     * delayed SIGKILL targeting it.
      */
     private killProcess(): void {
-        if (this.proc && this.proc.exitCode === null) {
-            try {
-                this.outputChannel.info('[pet] Killing hung/crashed PET process');
-                this.proc.kill('SIGTERM');
-                // Give it a moment to terminate gracefully, then force kill
-                setTimeout(() => {
-                    if (this.proc && this.proc.exitCode === null) {
-                        this.proc.kill('SIGKILL');
-                    }
-                }, 500);
-            } catch (ex) {
-                this.outputChannel.error('[pet] Error killing process:', ex);
-            }
-        }
-        this.proc = undefined;
+        killPetProcessWithGrace(
+            () => this.proc,
+            () => {
+                this.proc = undefined;
+            },
+            this.outputChannel,
+        );
     }
 
     public async refresh(hardRefresh: boolean, options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
