@@ -282,7 +282,15 @@ export async function getDefaultGlobalVenvLocation(): Promise<Uri> {
     return Uri.file(dir);
 }
 
-function getVenvFoldersSetting(): string[] {
+/**
+ * Reads the configured global virtual-environment folder roots from the `python.venvFolders`
+ * setting. This is the same setting the native finder adds to its search paths during a scoped
+ * discovery, so callers can rely on it to identify which discovered/known environments are global
+ * (and therefore must not be treated as workspace-owned during a folder-scoped refresh).
+ *
+ * @returns The configured venv folder roots, or an empty array when the setting is unset.
+ */
+export function getVenvFoldersSetting(): string[] {
     const settings = getConfiguration('python');
     return settings.get<string[]>('venvFolders', []);
 }

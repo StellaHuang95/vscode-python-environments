@@ -2,7 +2,7 @@ import assert from 'node:assert';
 import * as path from 'node:path';
 import * as sinon from 'sinon';
 import { Uri } from 'vscode';
-import { getResourceUri, isPathInside, normalizePath } from '../../common/utils/pathUtils';
+import { getResourceUri, isPathInside, normalizePath, toNormalizedPathKey } from '../../common/utils/pathUtils';
 import * as utils from '../../common/utils/platformUtils';
 
 suite('Path Utilities', () => {
@@ -176,6 +176,50 @@ suite('Path Utilities', () => {
                 this.skip();
             }
             assert.strictEqual(isPathInside('C:\\Workspaces\\App', 'c:\\workspaces\\app\\.venv\\Scripts\\python.exe'), true);
+        });
+    });
+
+    suite('toNormalizedPathKey', () => {
+        let isWindowsStub: sinon.SinonStub;
+
+        setup(() => {
+            isWindowsStub = sinon.stub(utils, 'isWindows');
+        });
+
+        teardown(() => {
+            sinon.restore();
+        });
+
+        test('equals normalizePath for an already-absolute path', () => {
+            isWindowsStub.returns(false);
+            const abs = path.join(path.parse(process.cwd()).root, 'workspaces', 'app');
+            assert.strictEqual(toNormalizedPathKey(abs), normalizePath(abs));
+        });
+
+        test('resolves relative segments before normalizing', () => {
+            isWindowsStub.returns(false);
+            const abs = path.join(path.parse(process.cwd()).root, 'workspaces', 'app');
+            // Build the string by hand (path.join would pre-collapse the `..`) so the `..` segment
+            // is only resolved by toNormalizedPathKey's internal path.resolve.
+            const withDotDot = `${abs}${path.sep}pkg${path.sep}..`;
+            assert.strictEqual(toNormalizedPathKey(withDotDot), normalizePath(abs));
+        });
+
+        test('produces identical keys for differently-cased Windows paths', function () {
+            if (process.platform !== 'win32') {
+                this.skip();
+            }
+            isWindowsStub.returns(true);
+            assert.strictEqual(
+                toNormalizedPathKey('C:\\Workspaces\\App'),
+                toNormalizedPathKey('c:\\workspaces\\app'),
+            );
+        });
+
+        test('uses forward slashes as separators', () => {
+            isWindowsStub.returns(false);
+            const key = toNormalizedPathKey(path.join(path.parse(process.cwd()).root, 'a', 'b', 'c'));
+            assert.strictEqual(key.includes('\\'), false);
         });
     });
 });

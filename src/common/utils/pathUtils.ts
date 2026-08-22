@@ -86,6 +86,20 @@ export function isPathInside(scopeFsPath: string, candidateFsPath: string): bool
     );
 }
 
+/**
+ * Produces a single, canonical key for a filesystem path suitable for identity comparisons,
+ * de-duplication, and use as a map key. The path is made absolute with {@link path.resolve} (so
+ * relative segments and, on Windows, drive letters are resolved consistently) and then normalized
+ * with {@link normalizePath} (forward slashes everywhere, lower-cased on Windows). No filesystem
+ * access is performed, so symlinks are intentionally not resolved.
+ *
+ * @param fsPath The filesystem path to canonicalize.
+ * @returns The absolute, normalized key for the path.
+ */
+export function toNormalizedPathKey(fsPath: string): string {
+    return normalizePath(path.resolve(fsPath));
+}
+
 export function getResourceUri(resourcePath: string, root?: string): Uri | undefined {
     try {
         if (!resourcePath) {
