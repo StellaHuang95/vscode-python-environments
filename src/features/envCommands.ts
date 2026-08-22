@@ -464,9 +464,13 @@ export async function setEnvironmentCommand(
                 const globalEnvManager = em.getEnvironmentManager(undefined);
                 // Seed the recommendation synchronously so the picker opens immediately; the
                 // authoritative value is resolved after the picker is shown via resolveRecommended.
-                // The last-known cache is scope-keyed, not manager-keyed, so only seed an entry the
-                // current global manager actually owns — a stale env from a since-changed manager
-                // would be unowned and silently ignored by setEnvironments on selection.
+                // The last-known cache is scope-keyed ('global'), not manager-keyed, so it can hold
+                // an env owned by a manager that is no longer the current one. Only seed an entry the
+                // current global manager owns, so the synchronous seed matches what the authoritative
+                // resolveRecommended (globalEnvManager.get()) will return and the pre-streaming
+                // semantics (recommended was always the current manager's env). An unowned stale seed
+                // is at best inconsistent and, if its manager has since been unregistered, is silently
+                // dropped by setEnvironments on selection.
                 const lastKnownGlobal = globalEnvManager ? em.getLastKnownEnvironment(undefined) : undefined;
                 const recommended =
                     globalEnvManager && lastKnownGlobal?.envId.managerId === globalEnvManager.id
@@ -495,9 +499,12 @@ export async function setEnvironmentCommand(
         const canRecommend = projectEnvManagers.length === 1 && uris.length === 1;
         // Seed synchronously from the last-known environment so the picker opens immediately; the
         // authoritative value is resolved after the picker is shown via resolveRecommended. The
-        // last-known cache is scope-keyed, not manager-keyed, so only seed an entry owned by the
-        // current project manager — a stale env from a since-changed manager would be unowned and
-        // silently ignored by setEnvironments on selection.
+        // last-known cache is scope-keyed (project URI), not manager-keyed, so it can hold an env
+        // owned by a manager that is no longer the current one. Only seed an entry the current
+        // project manager owns, so the synchronous seed matches what the authoritative
+        // resolveRecommended (projectEnvManagers[0].get()) will return and the pre-streaming
+        // semantics. An unowned stale seed is at best inconsistent and, if its manager has since
+        // been unregistered, is silently dropped by setEnvironments on selection.
         const lastKnownProject = canRecommend ? em.getLastKnownEnvironment(uris[0]) : undefined;
         const recommended =
             canRecommend && lastKnownProject?.envId.managerId === projectEnvManagers[0].id
