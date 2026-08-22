@@ -609,7 +609,9 @@ export interface IEventNamePropertyMapping {
     */
     [EventNames.PET_JSON_CLI_FALLBACK]: {
         operation: 'refresh' | 'resolve';
-        result: 'success' | 'error';
+        // 'partial' = enumeration completed but the operation budget was spent before every
+        // incomplete environment could be enriched (all discovered records are still returned).
+        result: 'success' | 'error' | 'partial';
     };
 
     /* __GDPR__

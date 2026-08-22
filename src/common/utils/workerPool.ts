@@ -4,6 +4,19 @@
 import { traceError } from '../logging';
 import { createDeferred, Deferred } from './deferred';
 
+/**
+ * Error used to reject a queued work item that expired before a worker could dequeue it.
+ *
+ * Only pending (still-queued) items can expire. Once an item has been dequeued and started
+ * running it can no longer expire, so a task that actually executed never rejects with this.
+ */
+export class QueueTaskExpiredError extends Error {
+    constructor(expiresInMs: number) {
+        super(`Queued task expired after ${expiresInMs}ms before it could start`);
+        this.name = this.constructor.name;
+    }
+}
+
 interface Worker {
     /**
      * Start processing of items.
@@ -23,6 +36,12 @@ type PostResult<T, R> = (item: T, result?: R, err?: Error) => void;
 
 interface IWorkItem<T> {
     item: T;
+    /** True once the item has been dequeued for processing. A running item can no longer expire. */
+    running: boolean;
+    /** True once the item expired while still queued. An expired item never runs. */
+    expired: boolean;
+    /** Timer that expires the item while it is still queued; cleared on dequeue/settle/stop. */
+    expiryTimer?: ReturnType<typeof setTimeout>;
 }
 
 export enum QueuePosition {
@@ -36,9 +55,13 @@ export interface WorkerPool<T, R> extends Worker {
      * @method addToQueue
      * @param {T} item: Item to process
      * @param {QueuePosition} position: Add items to the front or back of the queue.
+     * @param {number} expiresInMs: Optional. When provided, the item is rejected with
+     *        {@link QueueTaskExpiredError} if it is still queued after this many milliseconds,
+     *        and is guaranteed never to execute. Omitting it preserves the original (unbounded)
+     *        queueing behavior.
      * @returns A promise that when resolved gets the result from running the worker function.
      */
-    addToQueue(item: T, position?: QueuePosition): Promise<R>;
+    addToQueue(item: T, position?: QueuePosition, expiresInMs?: number): Promise<R>;
 }
 
 class WorkerImpl<T, R> implements Worker {
@@ -76,14 +99,14 @@ class WorkerImpl<T, R> implements Worker {
 class WorkQueue<T, R> {
     private readonly items: IWorkItem<T>[] = [];
     private readonly results: Map<IWorkItem<T>, Deferred<R>> = new Map();
-    public add(item: T, position?: QueuePosition): Promise<R> {
+    public add(item: T, position?: QueuePosition, expiresInMs?: number): Promise<R> {
         // Wrap the user provided item in a wrapper object. This will allow us to track multiple
         // submissions of the same item. For example, addToQueue(2), addToQueue(2). If we did not
         // wrap this, then from the map both submissions will look the same. Since this is a generic
         // worker pool, we do not know if we can resolve both using the same promise. So, a better
         // approach is to ensure each gets a unique promise, and let the worker function figure out
         // how to handle repeat submissions.
-        const workItem: IWorkItem<T> = { item };
+        const workItem: IWorkItem<T> = { item, running: false, expired: false };
         if (position === QueuePosition.front) {
             this.items.unshift(workItem);
         } else {
@@ -96,29 +119,84 @@ class WorkQueue<T, R> {
         const deferred = createDeferred<R>();
         this.results.set(workItem, deferred);
 
+        // Optional expiration: reject the item if it is still queued when the timer fires.
+        // The timer is cleared the moment the item is dequeued (next()) or settled (completed()),
+        // so an item that has started running can never be expired.
+        if (expiresInMs !== undefined) {
+            workItem.expiryTimer = setTimeout(() => this.expire(workItem, expiresInMs), expiresInMs);
+        }
+
         return deferred.promise;
     }
 
+    /** Clears the expiry timer for an item, if any. Idempotent. */
+    private clearExpiry(workItem: IWorkItem<T>): void {
+        if (workItem.expiryTimer !== undefined) {
+            clearTimeout(workItem.expiryTimer);
+            workItem.expiryTimer = undefined;
+        }
+    }
+
+    /**
+     * Expires a queued item: removes it from the queue and rejects its promise. No-op if the item
+     * has already been dequeued (running), already expired, or was already removed from the queue.
+     * This is the only place that transitions queued -> expired, so it settles at most once.
+     */
+    private expire(workItem: IWorkItem<T>, expiresInMs: number): void {
+        this.clearExpiry(workItem);
+        if (workItem.running || workItem.expired) {
+            return;
+        }
+        const index = this.items.indexOf(workItem);
+        if (index < 0) {
+            // Already dequeued or cleared; nothing to expire.
+            return;
+        }
+        workItem.expired = true;
+        this.items.splice(index, 1);
+        const deferred = this.results.get(workItem);
+        if (deferred !== undefined) {
+            this.results.delete(workItem);
+            deferred.reject(new QueueTaskExpiredError(expiresInMs));
+        }
+    }
+
     public completed(workItem: IWorkItem<T>, result?: R, error?: Error): void {
+        this.clearExpiry(workItem);
         const deferred = this.results.get(workItem);
         if (deferred !== undefined) {
             this.results.delete(workItem);
             if (error !== undefined) {
                 deferred.reject(error);
+            } else {
+                deferred.resolve(result);
             }
-            deferred.resolve(result);
         }
     }
 
     public next(): IWorkItem<T> | undefined {
-        return this.items.shift();
+        // Skip any item that expired while queued (defensive — expired items are removed on expiry).
+        let workItem = this.items.shift();
+        while (workItem !== undefined && workItem.expired) {
+            workItem = this.items.shift();
+        }
+        if (workItem !== undefined) {
+            // Mark as running and disarm expiration before the worker starts the item so that a
+            // running item can never be expired (queued -> running is a one-way transition).
+            workItem.running = true;
+            this.clearExpiry(workItem);
+        }
+        return workItem;
     }
 
     public clear(): void {
         this.results.forEach((v: Deferred<R>, k: IWorkItem<T>, map: Map<IWorkItem<T>, Deferred<R>>) => {
+            this.clearExpiry(k);
             v.reject(Error('Queue stopped processing'));
             map.delete(k);
         });
+        // Drop any remaining queued wrappers so nothing lingers after stop().
+        this.items.length = 0;
     }
 }
 
@@ -142,14 +220,14 @@ class WorkerPoolImpl<T, R> implements WorkerPool<T, R> {
         private readonly name: string = 'Worker',
     ) {}
 
-    public addToQueue(item: T, position?: QueuePosition): Promise<R> {
+    public addToQueue(item: T, position?: QueuePosition, expiresInMs?: number): Promise<R> {
         if (this.stopProcessing) {
             throw Error('Queue is stopped');
         }
 
         // This promise when resolved should return the processed result of the item
         // being added to the queue.
-        const deferred = this.queue.add(item, position);
+        const deferred = this.queue.add(item, position, expiresInMs);
 
         const worker = this.waitingWorkersUnblockQueue.shift();
         if (worker) {
