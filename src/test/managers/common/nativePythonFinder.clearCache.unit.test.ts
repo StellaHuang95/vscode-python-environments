@@ -6,6 +6,7 @@ import * as sinon from 'sinon';
 import { ExtensionContext, LogOutputChannel, Uri } from 'vscode';
 import * as logging from '../../../common/logging';
 import * as telemetrySender from '../../../common/telemetry/sender';
+import { EventNames } from '../../../common/telemetry/constants';
 import { PythonProjectApi } from '../../../api';
 import {
     ConfigurationOptions,
@@ -461,6 +462,53 @@ suite('NativePythonFinderImpl hard-refresh coalescing vs clearCache', () => {
         await p2;
         await p1;
         assert.strictEqual(cache.getValid('all', configB), resultsB, 'the newer scan populates the entry');
+    });
+
+    // Regression for the pre-queue config-build error observability. Building the effective config was
+    // moved out of the worker's try/catch (to drive coalescing + soft validation), so a settings-read
+    // failure must still be recorded as a PET_REFRESH error and logged, exactly as when the build lived
+    // inside doRefreshAttempt — otherwise config-read failures become silent.
+    function findPetRefreshError(): sinon.SinonSpyCall | undefined {
+        const telemetry = telemetrySender.sendTelemetryEvent as sinon.SinonStub;
+        return telemetry
+            .getCalls()
+            .find(
+                (c) =>
+                    c.args[0] === EventNames.PET_REFRESH &&
+                    (c.args[2] as { result?: string } | undefined)?.result === 'error',
+            );
+    }
+
+    test('a hard refresh whose configuration build fails emits PET_REFRESH error telemetry and propagates', async () => {
+        const finder = createFinder();
+        const buildErr = new Error('settings read failed');
+        stubConfig(finder).rejects(buildErr);
+        const addToQueue = stubQueue(finder);
+
+        await assert.rejects(finder.refresh(true), /settings read failed/, 'the config-build error must propagate');
+        assert.strictEqual(addToQueue.callCount, 0, 'no scan may be queued when the config build fails');
+
+        const errEvent = findPetRefreshError();
+        assert.ok(errEvent, 'a PET_REFRESH error event must be sent when the hard config build fails');
+        assert.strictEqual(errEvent!.args[3], buildErr, 'the build error must be attached to the telemetry event');
+        assert.ok(
+            (outputChannel.error as sinon.SinonStub).calledWith('[pet] Error refreshing', buildErr),
+            'the config-build failure must be logged as an "Error refreshing"',
+        );
+    });
+
+    test('a soft refresh whose configuration build fails emits PET_REFRESH error telemetry and propagates', async () => {
+        const finder = createFinder();
+        const buildErr = new Error('soft settings read failed');
+        stubConfig(finder).rejects(buildErr);
+        const addToQueue = stubQueue(finder);
+
+        await assert.rejects(finder.refresh(false), /soft settings read failed/, 'the config-build error must propagate');
+        assert.strictEqual(addToQueue.callCount, 0, 'no scan may be queued when the soft config build fails');
+
+        const errEvent = findPetRefreshError();
+        assert.ok(errEvent, 'a PET_REFRESH error event must be sent when the soft config build fails');
+        assert.strictEqual(errEvent!.args[3], buildErr, 'the build error must be attached to the telemetry event');
     });
 
     test('refresh(false) returns a same-config soft hit and queues a fresh scan when the config changed', async () => {

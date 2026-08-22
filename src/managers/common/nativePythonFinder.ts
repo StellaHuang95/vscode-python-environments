@@ -651,9 +651,10 @@ export class NativePythonFinderImpl implements NativePythonFinder {
         // Capture the ONE effective configuration for this whole hard operation up front (settings
         // reads only, no discovery I/O). The soft path passes the config it already built; a direct
         // hard refresh builds it here. This single config drives the coalescing decision, the
-        // `configure` payload, and the cached result tag — no mid-refresh rebuild, no drift. Build
-        // errors propagate to the caller (we never proceed with an unverifiable config).
-        const effectiveConfig = configuration ?? (await this.buildConfigurationOptions());
+        // `configure` payload, and the cached result tag — no mid-refresh rebuild, no drift. A build
+        // failure is logged + recorded as a PET_REFRESH error (via buildRefreshConfiguration) and
+        // rethrown — we never proceed with an unverifiable config, and the failure stays observable.
+        const effectiveConfig = configuration ?? (await this.buildRefreshConfiguration());
 
         const inFlight = this.inFlightRefreshes.get(key);
         // Only coalesce with an in-flight refresh from the CURRENT generation AND the SAME effective
@@ -751,11 +752,12 @@ export class NativePythonFinderImpl implements NativePythonFinder {
         // EXACT same inputs as `configure`, so the result reflects precisely what a hard refresh would
         // send to PET. A soft hit is valid only when this key's saved configuration still matches, so
         // any workspace/search-path/tool-path change forces a fresh scan. Read errors that
-        // buildConfigurationOptions surfaces (e.g. the `python.*` tool-path settings) propagate to the
-        // caller; the search-path inspect() reads intentionally degrade to empty arrays exactly as
-        // `configure` does, which keeps soft validation consistent with what discovery would actually
-        // search rather than serving a hit that disagrees with a fresh scan.
-        const configuration = await this.buildConfigurationOptions();
+        // buildConfigurationOptions surfaces (e.g. the `python.*` tool-path settings) are logged +
+        // recorded as a PET_REFRESH error (via buildRefreshConfiguration) and rethrown to the caller,
+        // preserving refresh observability; the search-path inspect() reads intentionally degrade to
+        // empty arrays exactly as `configure` does, which keeps soft validation consistent with what
+        // discovery would actually search rather than serving a hit that disagrees with a fresh scan.
+        const configuration = await this.buildRefreshConfiguration();
         const cacheResult = this.cache.getValid(key, configuration);
         if (cacheResult) {
             if (!options) {
@@ -1363,6 +1365,47 @@ export class NativePythonFinderImpl implements NativePythonFinder {
             poetryExecutable: getPythonSettingAndUntildify<string>('poetryPath'),
             cacheDirectory: this.cacheDirectory?.fsPath,
         };
+    }
+
+    /**
+     * Builds the effective configuration for a user-visible refresh while preserving the refresh
+     * error observability that previously lived inside {@link doRefreshAttempt}. handleHardRefresh /
+     * handleSoftRefresh now build the config up front — before the scan is queued — so it can drive
+     * coalescing and soft-cache validation; that moved the build outside the worker's try/catch. To
+     * avoid silently dropping a settings-read failure (e.g. an untildify error on the `python.*`
+     * tool-path settings), a build error here is logged as an "Error refreshing" and recorded as a
+     * PET_REFRESH error event — matching the pre-refactor behavior — before being rethrown so the
+     * caller still sees it. Emitted at most once per refresh (the config is built once and threaded
+     * through every retry), unlike the old per-attempt build.
+     */
+    private async buildRefreshConfiguration(): Promise<ConfigurationOptions> {
+        const sw = new StopWatch();
+        try {
+            return await this.buildConfigurationOptions();
+        } catch (ex) {
+            const errorType = classifyError(ex);
+            sendTelemetryEvent(
+                EventNames.PET_REFRESH,
+                getRefreshTelemetryMeasures({
+                    duration: sw.elapsedTime,
+                    nativeInfo: [],
+                    condaKind: NativePythonEnvironmentKind.conda,
+                    unresolvedCount: 0,
+                    workspaceDirCount: undefined,
+                    searchPathCount: undefined,
+                    attempt: 0,
+                    refreshPerformance: undefined,
+                }),
+                {
+                    result: isTimeoutErrorType(errorType) ? 'timeout' : 'error',
+                    errorType,
+                    ...this.getPetInfoProperties(),
+                },
+                ex instanceof Error ? ex : undefined,
+            );
+            this.outputChannel.error('[pet] Error refreshing', ex);
+            throw ex;
+        }
     }
 
     /**
