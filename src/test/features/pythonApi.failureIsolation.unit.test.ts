@@ -255,6 +255,25 @@ suite('PythonEnvironmentApiImpl - manager failure isolation', () => {
             assert.ok(errorLoggedFor('m2'), 'failing manager id should be logged for the global scope');
         });
 
+        test('partial success where the only surviving manager has no environments resolves with [] (logged, not thrown)', async () => {
+            // Deliberate partial-success policy: when at least one manager succeeds, the result is the
+            // union of the successful managers' environments — even if that union is empty. The failing
+            // manager is logged (per-manager traceError) rather than thrown, so an empty result here is
+            // intentional, not a masked discovery failure. Total failure (every manager rejecting) still
+            // throws AggregateEnvironmentError, which the sibling test covers.
+            const err = new Error('global-owner boom');
+            currentManagers = [makeManager('m1', { getError: err }), makeManager('m2', { envs: [] })];
+
+            const result = await api.getEnvironments('global');
+
+            assert.deepStrictEqual(
+                result,
+                [],
+                'a surviving manager with no environments yields an empty (not thrown) result',
+            );
+            assert.ok(errorLoggedFor('m1'), 'the failing manager id should still be logged');
+        });
+
         test('total failure: throws AggregateEnvironmentError with all reasons', async () => {
             const err1 = new Error('global-first');
             const err2 = new Error('global-second');
