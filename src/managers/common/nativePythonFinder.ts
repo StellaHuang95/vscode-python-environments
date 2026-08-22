@@ -22,13 +22,13 @@ import {
     shouldRetainPetInfo,
     type RefreshPerformance,
 } from './petTelemetry';
-import { noop } from './utils';
 
 // Timeout constants for JSON-RPC requests (in milliseconds)
 const CONFIGURE_TIMEOUT_MS = 30_000; // 30 seconds for configuration
 const MAX_CONFIGURE_TIMEOUT_MS = 60_000; // Max configure timeout after retries (60s)
 const REFRESH_TIMEOUT_MS = 30_000; // 30 seconds for full refresh (with 1 retry = 60s max)
 const RESOLVE_TIMEOUT_MS = 30_000; // 30 seconds for single resolve
+const CLEAR_TIMEOUT_MS = 30_000; // 30 seconds for the `clear` cache request (bounded so Clear Cache never hangs)
 const INFO_TIMEOUT_MS = 2_000; // `info` is a const lookup on PET; 2s is generous
 const INFO_REQUEST_ATTEMPTS = 3; // Retry early startup timeouts without blocking PET operations
 
@@ -244,6 +244,16 @@ export interface NativePythonFinder extends Disposable {
      * @param executable
      */
     resolve(executable: string): Promise<NativeEnvInfo>;
+    /**
+     * Clears all discovery caches owned by the finder:
+     *  - the in-memory result cache (and blocks in-flight refreshes from repopulating it),
+     *  - the live PET server's in-memory + on-disk cache (via the `clear` JSON-RPC request), and
+     *  - the on-disk PET cache directory as a fallback when no live server is available.
+     *
+     * The next refresh performs a full rediscovery. Rejects if the on-disk cache directory cannot
+     * be cleared and no live server handled the clear.
+     */
+    clearCache(): Promise<void>;
 }
 interface NativeLog {
     level: string;
@@ -342,10 +352,14 @@ async function sendRequestWithTimeout<T>(
     }
 }
 
-class NativePythonFinderImpl implements NativePythonFinder {
+/**
+ * Concrete {@link NativePythonFinder} backed by the PET JSON-RPC server (with a CLI fallback).
+ * Exported for unit testing; use {@link createNativePythonFinder} to construct one normally.
+ */
+export class NativePythonFinderImpl implements NativePythonFinder {
     private connection: rpc.MessageConnection;
-    private readonly pool: WorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>;
-    private cache: Map<string, NativeInfo[]> = new Map();
+    private readonly pool: WorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, RefreshResult>;
+    private readonly cache = new DiscoveryResultCache();
     /**
      * Tracks in-flight hard refreshes by cache key so concurrent callers share a
      * single PET scan instead of queueing duplicate work.
@@ -374,7 +388,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
         private readonly cacheDirectory?: Uri,
     ) {
         this.connection = this.start();
-        this.pool = createRunningWorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>(
+        this.pool = createRunningWorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, RefreshResult>(
             async (options) => await this.doRefresh(options),
             1,
             'NativeRefresh-task',
@@ -589,6 +603,10 @@ class NativePythonFinderImpl implements NativePythonFinder {
             return inFlight;
         }
 
+        // Capture the cache generation at the moment this hard refresh begins. If an explicit
+        // clearCache() advances the generation before the refresh completes, the result must NOT
+        // repopulate the cache (the clear would otherwise be silently undone).
+        const generationAtStart = this.cache.generation;
         this.cache.delete(key);
         if (!options) {
             this.outputChannel.debug('[Finder] Refreshing all environments');
@@ -601,13 +619,19 @@ class NativePythonFinderImpl implements NativePythonFinder {
         // failure starts a fresh attempt, matching today's behavior.
         const refreshPromise = this.pool
             .addToQueue(options)
-            .then((result) => {
-                if (!result || !Array.isArray(result)) {
-                    this.outputChannel.warn(`[pet] Worker pool returned invalid result type: ${typeof result}`);
+            .then((refreshResult) => {
+                const results = refreshResult?.results;
+                if (!results || !Array.isArray(results)) {
+                    this.outputChannel.warn(
+                        `[pet] Worker pool returned invalid result type: ${typeof refreshResult}`,
+                    );
                     return [] as NativeInfo[];
                 }
-                this.cache.set(key, result);
-                return result;
+                // Tag the entry with the exact configuration used to produce it so a later soft
+                // refresh can detect setting changes. The set is a no-op when the generation has
+                // advanced (an explicit clear ran while this refresh was in flight).
+                this.cache.set(key, refreshResult.configuration, results, generationAtStart);
+                return results;
             })
             .finally(() => {
                 this.inFlightRefreshes.delete(key);
@@ -619,22 +643,79 @@ class NativePythonFinderImpl implements NativePythonFinder {
 
     private async handleSoftRefresh(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
         const key = this.getKey(options);
-        const cacheResult = this.cache.get(key);
-        // Validate cache integrity - if cached value is not a valid array, do a hard refresh
-        if (!cacheResult || !Array.isArray(cacheResult)) {
-            if (cacheResult !== undefined) {
-                this.outputChannel.warn(`[pet] Cache contained invalid data type: ${typeof cacheResult}`);
-                this.cache.delete(key);
+        // Build the effective configuration from current settings (no discovery I/O). A soft hit is
+        // only valid when this key's saved configuration still matches. Configuration-build errors
+        // propagate — we must never serve a stale hit when we cannot verify the current config.
+        const configuration = await this.buildConfigurationOptions();
+        const cacheResult = this.cache.getValid(key, configuration);
+        if (cacheResult) {
+            if (!options) {
+                this.outputChannel.debug('[Finder] Returning cached environments for all');
+            } else {
+                this.outputChannel.debug(`[Finder] Returning cached environments for key: ${key}`);
             }
-            return this.handleHardRefresh(options);
+            return cacheResult;
         }
 
-        if (!options) {
-            this.outputChannel.debug('[Finder] Returning cached environments for all');
-        } else {
-            this.outputChannel.debug(`[Finder] Returning cached environments for key: ${key}`);
+        // Miss: no entry, stale generation, or the effective configuration changed for this key.
+        return this.handleHardRefresh(options);
+    }
+
+    public async clearCache(): Promise<void> {
+        // 1) Invalidate in-memory results and advance the generation. Advancing first guarantees any
+        //    hard refresh that began before this call cannot repopulate the map afterwards (its
+        //    tagged generation no longer matches). Clearing after the bump covers a refresh whose
+        //    `set` landed just before the bump.
+        this.cache.clear();
+        // Force a fresh `configure` on the next refresh: the live `clear` also drops PET's in-memory
+        // config-derived caches, so skipping configure via configurationEquals could be unsafe. The
+        // generation bump above also makes configure() refuse to write back a stale lastConfiguration
+        // if it is in flight while we run (see configure()), so this reset cannot be silently undone.
+        this.lastConfiguration = undefined;
+
+        // 2) Clear the live PET server's IN-MEMORY cache when a process is running. PET's `clear`
+        //    request wipes both its in-memory cache and its configured on-disk cacheDirectory. We do
+        //    NOT restart/spawn a process here — if none is running, the on-disk clear below suffices.
+        //    The request is bounded by a timeout so Clear Cache never waits indefinitely. A failure is
+        //    surfaced but not fatal: the on-disk clear below still empties our directory.
+        let liveClearSucceeded = false;
+        const serverLive = !this.startFailed && !this.processExited && this.proc !== undefined;
+        if (serverLive) {
+            try {
+                await sendRequestWithTimeout(this.connection, 'clear', {}, CLEAR_TIMEOUT_MS);
+                liveClearSucceeded = true;
+                this.outputChannel.info('[pet] Cleared native discovery cache via live server');
+            } catch (ex) {
+                this.outputChannel.warn('[pet] Live `clear` request failed; relying on on-disk clear', ex);
+            }
         }
-        return cacheResult;
+
+        // 3) Empty OUR known on-disk cache directory. This is an additional layer, not merely a
+        //    fallback: PET only learns this directory via a `configure` payload, so before the first
+        //    refresh a live `clear` may target PET's default location instead of ours, which would let
+        //    a previous session's cache survive. emptyDir is idempotent, so clearing it here is safe
+        //    even when the live clear already removed it. When the live clear did NOT authoritatively
+        //    succeed this is the PRIMARY clear mechanism, so failures are propagated; when the live
+        //    clear already succeeded this sweep is defense-in-depth, so a transient failure is logged
+        //    but not surfaced (the cache is already cleared and the command should still succeed).
+        if (this.cacheDirectory) {
+            try {
+                await fs.emptyDir(this.cacheDirectory.fsPath);
+                this.outputChannel.info('[pet] Cleared on-disk PET cache directory');
+            } catch (ex) {
+                if (liveClearSucceeded) {
+                    this.outputChannel.warn(
+                        '[pet] Redundant on-disk cache clear failed after a successful live clear; ignoring',
+                        ex,
+                    );
+                } else {
+                    this.outputChannel.error('[pet] Failed to clear on-disk PET cache directory', ex);
+                    throw ex;
+                }
+            }
+        } else if (!liveClearSucceeded) {
+            this.outputChannel.warn('[pet] No live server and no cache directory configured; nothing to clear.');
+        }
     }
 
     public dispose() {
@@ -843,12 +924,18 @@ class NativePythonFinderImpl implements NativePythonFinder {
         };
     }
 
-    private async doRefresh(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
+    private async doRefresh(options?: NativePythonEnvironmentKind | Uri[]): Promise<RefreshResult> {
+        // Capture ONE effective configuration for the whole hard operation and reuse it for every
+        // attempt, the CLI fallback, and the returned tag. This avoids time-of-check/time-of-use
+        // drift where settings change mid-refresh and the cached entry is tagged with a config that
+        // differs from the one actually sent to `configure`. Build errors propagate to the caller.
+        const configuration = await this.buildConfigurationOptions();
         let lastError: unknown;
 
         for (let attempt = 0; attempt <= MAX_REFRESH_RETRIES; attempt++) {
             try {
-                return await this.doRefreshAttempt(options, attempt);
+                const results = await this.doRefreshAttempt(options, attempt, configuration);
+                return { results, configuration };
             } catch (ex) {
                 lastError = ex;
 
@@ -874,7 +961,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 // Non-timeout errors or final timeout — check if server is fully exhausted
                 if (this.isServerExhausted()) {
                     this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh');
-                    return this.refreshViaJsonCli(options);
+                    return { results: await this.refreshViaJsonCli(options, configuration), configuration };
                 }
                 throw ex;
             }
@@ -883,7 +970,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
         // Should not reach here, but TypeScript needs this
         if (this.isServerExhausted()) {
             this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh (final)');
-            return this.refreshViaJsonCli(options);
+            return { results: await this.refreshViaJsonCli(options, configuration), configuration };
         }
         throw lastError;
     }
@@ -891,6 +978,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
     private async doRefreshAttempt(
         options: NativePythonEnvironmentKind | Uri[] | undefined,
         attempt: number,
+        configuration: ConfigurationOptions,
     ): Promise<NativeInfo[]> {
         await this.ensureProcessRunning();
         const disposables: Disposable[] = [];
@@ -899,12 +987,9 @@ class NativePythonFinderImpl implements NativePythonFinder {
         const sw = new StopWatch();
         let unresolvedCount = 0;
         let refreshPerf: RefreshPerformance | undefined;
-        let workspaceDirCount: number | undefined;
-        let searchPathCount: number | undefined;
+        const workspaceDirCount: number | undefined = configuration.workspaceDirectories.length;
+        const searchPathCount: number | undefined = configuration.environmentDirectories.length;
         try {
-            const configuration = await this.buildConfigurationOptions();
-            workspaceDirCount = configuration.workspaceDirectories.length;
-            searchPathCount = configuration.environmentDirectories.length;
             await this.configure(configuration);
             const refreshOptions = this.getRefreshOptions(options);
             disposables.push(
@@ -1023,11 +1108,18 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * Must be invoked when ever there are changes to any data related to the configuration details.
      */
     private async configure(options?: ConfigurationOptions) {
+        // Capture the cache generation before any await. clearCache() advances the generation and
+        // resets lastConfiguration to force a fresh `configure` after wiping PET's caches. Without
+        // this guard, a configure already in flight could write its (pre-clear) config back after
+        // that reset, silently re-enabling the configure-skip and leaving the freshly-cleared PET
+        // server running unconfigured. If a clear lands while we are in flight we skip caching
+        // lastConfiguration so the next refresh reconfigures.
+        const generationAtStart = this.cache.generation;
         const configuration = options ?? (await this.buildConfigurationOptions());
         const workspaceDirCount = configuration.workspaceDirectories.length;
         const envDirCount = configuration.environmentDirectories.length;
         // No need to send a configuration request if there are no changes.
-        if (this.lastConfiguration && this.configurationEquals(configuration, this.lastConfiguration)) {
+        if (this.lastConfiguration && configurationEquals(configuration, this.lastConfiguration)) {
             this.outputChannel.debug('[pet] configure: No changes detected, skipping configuration update.');
             sendTelemetryEvent(
                 EventNames.PET_CONFIGURE,
@@ -1048,8 +1140,17 @@ class NativePythonFinderImpl implements NativePythonFinder {
         const retryCount = this.configureRetry.timeoutCount;
         try {
             await sendRequestWithTimeout(this.connection, 'configure', configuration, timeoutMs);
-            // Only cache after success so failed/timed-out calls will retry
-            this.lastConfiguration = configuration;
+            // Only cache after success so failed/timed-out calls will retry. Skip the cache when a
+            // clearCache() ran while this configure was in flight (generation advanced), so the next
+            // refresh reconfigures the freshly-cleared PET server instead of short-circuiting via
+            // configurationEquals.
+            if (this.cache.generation === generationAtStart) {
+                this.lastConfiguration = configuration;
+            } else {
+                this.outputChannel.debug(
+                    '[pet] configure: cache was cleared during configure; not caching lastConfiguration',
+                );
+            }
             this.configureRetry.onSuccess();
             sendTelemetryEvent(
                 EventNames.PET_CONFIGURE,
@@ -1203,10 +1304,15 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * Spawns PET as a one-shot subprocess and parses the JSON output.
      *
      * @param options Optional kind filter or URI search paths (same semantics as refresh()).
+     * @param config The effective configuration captured for this refresh operation. Passing it in
+     *   (rather than rebuilding) keeps the CLI fallback consistent with the server-mode `configure`
+     *   call and the cache tag, avoiding time-of-check/time-of-use drift.
      * @returns NativeInfo[] containing managers and environments, same as server mode.
      */
-    private async refreshViaJsonCli(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
-        const config = await this.buildConfigurationOptions();
+    private async refreshViaJsonCli(
+        options: NativePythonEnvironmentKind | Uri[] | undefined,
+        config: ConfigurationOptions,
+    ): Promise<NativeInfo[]> {
         // venvFolders must be included explicitly as search paths when options is Uri[],
         // mirroring getRefreshOptions() server-mode behaviour (searchPaths may override environmentDirectories).
         const venvFolders = getPythonSettingAndUntildify<string[]>('venvFolders') ?? [];
@@ -1348,46 +1454,6 @@ class NativePythonFinderImpl implements NativePythonFinder {
         });
         return parsed;
     }
-
-    /**
-     * Compares two ConfigurationOptions objects for equality.
-     * Uses property-by-property comparison to avoid issues with JSON.stringify
-     * (property order, undefined values serialization).
-     */
-    private configurationEquals(a: ConfigurationOptions, b: ConfigurationOptions): boolean {
-        // Compare simple optional string properties
-        if (a.condaExecutable !== b.condaExecutable) {
-            return false;
-        }
-        if (a.pipenvExecutable !== b.pipenvExecutable) {
-            return false;
-        }
-        if (a.poetryExecutable !== b.poetryExecutable) {
-            return false;
-        }
-        if (a.cacheDirectory !== b.cacheDirectory) {
-            return false;
-        }
-
-        // Compare array properties using sorted comparison to handle order differences
-        const arraysEqual = (arr1: string[], arr2: string[]): boolean => {
-            if (arr1.length !== arr2.length) {
-                return false;
-            }
-            const sorted1 = [...arr1].sort();
-            const sorted2 = [...arr2].sort();
-            return sorted1.every((val, idx) => val === sorted2[idx]);
-        };
-
-        if (!arraysEqual(a.workspaceDirectories, b.workspaceDirectories)) {
-            return false;
-        }
-        if (!arraysEqual(a.environmentDirectories, b.environmentDirectories)) {
-            return false;
-        }
-
-        return true;
-    }
 }
 
 export type ConfigurationOptions = {
@@ -1398,6 +1464,154 @@ export type ConfigurationOptions = {
     poetryExecutable: string | undefined;
     cacheDirectory?: string;
 };
+
+/**
+ * A single result-cache result plus the effective configuration used to produce it and the cache
+ * generation that was current when it was stored. See {@link DiscoveryResultCache}.
+ */
+export interface RefreshResult {
+    results: NativeInfo[];
+    configuration: ConfigurationOptions;
+}
+
+/**
+ * Compares two {@link ConfigurationOptions} objects for equality.
+ *
+ * Uses property-by-property comparison (not JSON.stringify) to avoid issues with property order and
+ * undefined-value serialization. Array properties are compared order-independently. This is the same
+ * equality used to decide whether PET needs a fresh `configure`, reused to validate soft-cache hits.
+ *
+ * @param a First configuration.
+ * @param b Second configuration.
+ * @returns true when the two configurations would produce identical PET discovery behavior.
+ */
+export function configurationEquals(a: ConfigurationOptions, b: ConfigurationOptions): boolean {
+    // Compare simple optional string properties
+    if (a.condaExecutable !== b.condaExecutable) {
+        return false;
+    }
+    if (a.pipenvExecutable !== b.pipenvExecutable) {
+        return false;
+    }
+    if (a.poetryExecutable !== b.poetryExecutable) {
+        return false;
+    }
+    if (a.cacheDirectory !== b.cacheDirectory) {
+        return false;
+    }
+
+    // Compare array properties using sorted comparison to handle order differences
+    const arraysEqual = (arr1: string[], arr2: string[]): boolean => {
+        if (arr1.length !== arr2.length) {
+            return false;
+        }
+        const sorted1 = [...arr1].sort();
+        const sorted2 = [...arr2].sort();
+        return sorted1.every((val, idx) => val === sorted2[idx]);
+    };
+
+    if (!arraysEqual(a.workspaceDirectories, b.workspaceDirectories)) {
+        return false;
+    }
+    if (!arraysEqual(a.environmentDirectories, b.environmentDirectories)) {
+        return false;
+    }
+
+    return true;
+}
+
+interface DiscoveryCacheEntry {
+    configuration: ConfigurationOptions;
+    results: NativeInfo[];
+    generation: number;
+}
+
+/**
+ * In-memory cache of native discovery results, keyed by refresh scope (`all` / kind / URI list).
+ *
+ * Each entry is tagged with the effective {@link ConfigurationOptions} used to produce it, so a soft
+ * lookup is only a hit when that key's saved configuration still matches the current one. This lets
+ * unrelated scopes (e.g. an `all` refresh vs a `Conda`-kind refresh) coexist without invalidating one
+ * another, while a settings change that affects PET discovery invalidates exactly the affected keys.
+ *
+ * A monotonic {@link generation} is advanced on every {@link clear}. Stores from a hard refresh that
+ * began before a clear are rejected, so an explicit clear is never silently undone by an in-flight
+ * refresh repopulating the map.
+ */
+export class DiscoveryResultCache {
+    private readonly entries = new Map<string, DiscoveryCacheEntry>();
+    private currentGeneration = 0;
+
+    /** The current cache generation. Advanced by {@link clear}. */
+    get generation(): number {
+        return this.currentGeneration;
+    }
+
+    /** Number of stored entries (primarily for tests/diagnostics). */
+    get size(): number {
+        return this.entries.size;
+    }
+
+    /**
+     * Returns cached results for `key` only when the entry exists, belongs to the current generation,
+     * and its saved configuration equals `configuration`. Any other case is a miss (returns undefined)
+     * so the caller falls through to a hard refresh. A stale-generation entry is dropped on access.
+     *
+     * @param key Refresh-scope cache key.
+     * @param configuration Current effective configuration to validate the entry against.
+     */
+    getValid(key: string, configuration: ConfigurationOptions): NativeInfo[] | undefined {
+        const entry = this.entries.get(key);
+        if (!entry) {
+            return undefined;
+        }
+        if (entry.generation !== this.currentGeneration) {
+            this.entries.delete(key);
+            return undefined;
+        }
+        if (!configurationEquals(entry.configuration, configuration)) {
+            return undefined;
+        }
+        return entry.results;
+    }
+
+    /**
+     * Stores `results` for `key`, tagged with the exact `configuration` used to produce them.
+     *
+     * The store is rejected (returns false, no mutation) when `generationAtStart` no longer matches the
+     * current generation — i.e. a {@link clear} ran after the producing hard refresh began. This is the
+     * race guard that keeps a clear from being undone by an already in-flight refresh.
+     *
+     * @param key Refresh-scope cache key.
+     * @param configuration Effective configuration used to produce `results`.
+     * @param results Discovery results to cache.
+     * @param generationAtStart The generation captured when the producing refresh began.
+     * @returns true if stored; false if rejected because the generation advanced.
+     */
+    set(
+        key: string,
+        configuration: ConfigurationOptions,
+        results: NativeInfo[],
+        generationAtStart: number,
+    ): boolean {
+        if (generationAtStart !== this.currentGeneration) {
+            return false;
+        }
+        this.entries.set(key, { configuration, results, generation: this.currentGeneration });
+        return true;
+    }
+
+    /** Removes a single key (used before a hard refresh replaces it). */
+    delete(key: string): void {
+        this.entries.delete(key);
+    }
+
+    /** Empties all entries and advances the generation so in-flight refreshes cannot repopulate. */
+    clear(): void {
+        this.currentGeneration++;
+        this.entries.clear();
+    }
+}
 
 /**
  * Parses the stdout of `pet find --json` into a structured result.
@@ -1684,7 +1898,13 @@ export function getCacheDirectory(context: ExtensionContext): Uri {
 
 export async function clearCacheDirectory(context: ExtensionContext): Promise<void> {
     const cacheDirectory = getCacheDirectory(context);
-    await fs.emptyDir(cacheDirectory.fsPath).catch(noop);
+    try {
+        await fs.emptyDir(cacheDirectory.fsPath);
+        traceVerbose(`[pet] Cleared on-disk discovery cache directory: ${cacheDirectory.fsPath}`);
+    } catch (ex) {
+        traceError(`[pet] Failed to clear on-disk discovery cache directory: ${cacheDirectory.fsPath}`, ex);
+        throw ex;
+    }
 }
 
 export async function createNativePythonFinder(

@@ -107,6 +107,7 @@ import { registerSystemPythonFeatures } from './managers/builtin/main';
 import { SysPythonManager } from './managers/builtin/sysPythonManager';
 import {
     createNativePythonFinder,
+    clearCacheDirectory,
     getNativePythonToolsPathAndSource,
     getNativePythonToolsVersion,
     NativePythonFinder,
@@ -245,6 +246,11 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
     // Initialize terminal environment variable injection
     const terminalEnvVarInjector = new TerminalEnvVarInjector(context.environmentVariableCollection, envVarManager);
     context.subscriptions.push(terminalEnvVarInjector);
+
+    // Smallest possible outer handle to the single shared native finder. It is created lazily inside
+    // the deferred setup below, so the Clear Cache command reads it through this ref and falls back to
+    // clearing the on-disk cache directly when the command runs before the finder exists.
+    let sharedNativeFinder: NativePythonFinder | undefined;
 
     context.subscriptions.push(
         shellStartupVarsMgr,
@@ -390,7 +396,19 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
         commands.registerCommand('python-envs.clearCache', async () => {
             await clearPersistentState();
             await envManagers.clearCache(undefined);
-            await clearShellProfileCache(shellStartupProviders);
+            // Native discovery caches (finder in-memory map + live PET cache + on-disk cache dir).
+            // If the finder hasn't been created yet, clear the on-disk cache directory directly.
+            // Wrapped so a native/disk failure still propagates but does not skip the shell-profile
+            // cache cleanup below (each cache layer is cleared independently).
+            try {
+                if (sharedNativeFinder) {
+                    await sharedNativeFinder.clearCache();
+                } else {
+                    await clearCacheDirectory(context);
+                }
+            } finally {
+                await clearShellProfileCache(shellStartupProviders);
+            }
         }),
         ...(isInlineScriptsFeatureEnabled()
             ? [
@@ -657,6 +675,8 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
                 throw petError;
             }
             context.subscriptions.push(nativeFinder);
+            // Publish to the outer handle so the Clear Cache command can reach the live finder.
+            sharedNativeFinder = nativeFinder;
             const sysMgr = new SysPythonManager(nativeFinder, api, outputChannel);
             sysPythonManager.resolve(sysMgr);
             // Each manager registers independently — one failure must not block the others.
