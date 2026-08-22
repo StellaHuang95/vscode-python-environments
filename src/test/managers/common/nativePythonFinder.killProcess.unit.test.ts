@@ -27,8 +27,10 @@ suite('killPetProcessWithGrace (PET force-kill ownership)', () => {
         sinon.restore();
     });
 
-    function makeProc(exitCode: number | null = null): { exitCode: number | null; kill: sinon.SinonStub } {
-        return { exitCode, kill: sinon.stub().returns(true) };
+    function makeProc(
+        exitCode: number | null = null,
+    ): { exitCode: number | null; signalCode: NodeJS.Signals | null; kill: sinon.SinonStub } {
+        return { exitCode, signalCode: null, kill: sinon.stub().returns(true) };
     }
 
     test('sends SIGTERM to the running child and relinquishes ownership synchronously', () => {
@@ -86,6 +88,46 @@ suite('killPetProcessWithGrace (PET force-kill ownership)', () => {
         clock.tick(GRACE_MS);
 
         assert.ok(original.kill.calledOnceWithExactly('SIGTERM'), 'only SIGTERM, no SIGKILL for an exited child');
+    });
+
+    test('does not force-kill a child already terminated by a signal after SIGTERM (POSIX)', () => {
+        const original = makeProc(null);
+        let holder: typeof original | undefined = original;
+
+        killPetProcessWithGrace(
+            () => holder,
+            () => {
+                holder = undefined;
+            },
+            outputChannel,
+        );
+
+        assert.ok(original.kill.calledOnceWithExactly('SIGTERM'), 'SIGTERM sent immediately');
+        // POSIX: SIGTERM terminated the child, so exitCode stays null but signalCode is set.
+        original.signalCode = 'SIGTERM';
+        clock.tick(GRACE_MS);
+
+        assert.ok(!original.kill.calledWith('SIGKILL'), 'must not SIGKILL an already signal-terminated child');
+        assert.strictEqual(original.kill.callCount, 1, 'only the initial SIGTERM was sent');
+    });
+
+    test('does not signal a child that had already been signal-terminated, but still clears ownership', () => {
+        const original = makeProc(null);
+        original.signalCode = 'SIGKILL'; // exitCode === null but the process is already dead by signal.
+        let holder: typeof original | undefined = original;
+
+        killPetProcessWithGrace(
+            () => holder,
+            () => {
+                holder = undefined;
+            },
+            outputChannel,
+        );
+        clock.tick(GRACE_MS);
+
+        assert.strictEqual(holder, undefined, 'ownership cleared even when no signal is needed');
+        assert.strictEqual(original.kill.callCount, 0, 'no signals sent to an already signal-terminated child');
+        assert.ok(outputChannel.info.notCalled, 'no kill message logged when nothing is killed');
     });
 
     test('does not signal a child that had already exited, but still clears ownership', () => {

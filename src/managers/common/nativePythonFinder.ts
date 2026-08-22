@@ -347,8 +347,12 @@ async function sendRequestWithTimeout<T>(
  * Minimal view of a child process that {@link killPetProcessWithGrace} needs. Declaring only
  * the members actually used keeps the helper (and its tests) decoupled from the full
  * `ChildProcess` surface.
+ *
+ * `signalCode` is included alongside `exitCode` because on POSIX a child terminated by a signal
+ * reports `exitCode === null` with `signalCode` set (e.g. `'SIGTERM'`); both must be `null` for
+ * the process to still be running.
  */
-type KillablePetProcess = Pick<ChildProcess, 'kill' | 'exitCode'>;
+type KillablePetProcess = Pick<ChildProcess, 'kill' | 'exitCode' | 'signalCode'>;
 
 /**
  * Terminates a PET child process, transferring ownership out of its holder *before* signalling
@@ -378,13 +382,18 @@ export function killPetProcessWithGrace(
     // fresh process right after this returns; the delayed SIGKILL below must never target it.
     const proc = getProc();
     clearProc();
-    if (proc && proc.exitCode === null) {
+    // A process is still running only when it has neither exited (exitCode) nor been terminated by
+    // a signal (signalCode). On POSIX, SIGTERM leaves exitCode === null with signalCode set, so
+    // exitCode alone would misclassify an already-terminated child as still running.
+    if (proc && proc.exitCode === null && proc.signalCode === null) {
         try {
             outputChannel.info('[pet] Killing hung/crashed PET process');
             proc.kill('SIGTERM');
-            // Give it a moment to terminate gracefully, then force kill the captured child.
+            // Give it a moment to terminate gracefully, then force kill the captured child — but
+            // only if it is still running. If SIGTERM already terminated it, signalCode is set and
+            // sending SIGKILL would force-signal an already-dead process.
             setTimeout(() => {
-                if (proc.exitCode === null) {
+                if (proc.exitCode === null && proc.signalCode === null) {
                     proc.kill('SIGKILL');
                 }
             }, graceMs);
@@ -408,9 +417,9 @@ export function killPetProcessWithGrace(
  *
  * @returns true when the event applied to the active child, false when ignored as stale.
  */
-export function applyPetProcessExit(
-    currentProc: KillablePetProcess | undefined,
-    eventProc: KillablePetProcess,
+export function applyPetProcessExit<T extends object>(
+    currentProc: T | undefined,
+    eventProc: T,
     markExited: () => void,
 ): boolean {
     if (currentProc !== eventProc) {
@@ -418,6 +427,58 @@ export function applyPetProcessExit(
     }
     markExited();
     return true;
+}
+
+/**
+ * Minimal event surface of a PET child process that the lifecycle wiring listens on. Restricting
+ * the type to the `exit`/`error` events actually used lets the wiring be unit-tested by emitting
+ * from a bare `EventEmitter`, without constructing a real child process.
+ */
+interface PetProcessEventSource {
+    on(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+    on(event: 'error', listener: (err: Error) => void): unknown;
+}
+
+/**
+ * Wires a freshly-spawned PET child's `exit`/`error` events into the finder's restart state.
+ *
+ * Both handlers are identity-guarded via {@link applyPetProcessExit}: `getActiveProc` is read when
+ * the event fires and compared against the `proc` the handler was registered for, so a late event
+ * from a child a restart has already superseded cannot flip `processExited` (which would make the
+ * next request restart — and kill — the healthy replacement). `markExited` records the exit reason;
+ * callers keep the first, most-specific reason. Diagnostic logging runs regardless of the guard,
+ * matching the pre-existing behaviour of surfacing unexpected exits and process errors.
+ *
+ * Extracted and exported for unit testing only; it is not part of the extension's public API.
+ *
+ * @param proc The child process whose lifecycle events are being wired.
+ * @param getActiveProc Reads the finder's currently-active child, for the identity guard.
+ * @param markExited Records that the active child exited, given a reason string.
+ * @param outputChannel Channel used for error logging.
+ */
+export function registerPetProcessLifecycleHandlers(
+    proc: PetProcessEventSource,
+    getActiveProc: () => PetProcessEventSource | undefined,
+    markExited: (reason: string) => void,
+    outputChannel: Pick<LogOutputChannel, 'error'>,
+): void {
+    // Mark as exited so pending requests fail fast — but only for the active child.
+    proc.on('exit', (code, signal) => {
+        applyPetProcessExit(getActiveProc(), proc, () =>
+            markExited(`process_exit:${code ?? 'null'}:${signal ?? 'none'}`),
+        );
+        if (code !== 0) {
+            outputChannel.error(
+                `[pet] Python Environment Tools exited unexpectedly with code ${code}, signal ${signal}`,
+            );
+        }
+    });
+
+    // Handle process errors (e.g., ENOENT if executable not found).
+    proc.on('error', (err) => {
+        applyPetProcessExit(getActiveProc(), proc, () => markExited('process_error'));
+        outputChannel.error('[pet] Process error:', err);
+    });
 }
 
 class NativePythonFinderImpl implements NativePythonFinder {
@@ -759,35 +820,21 @@ class NativePythonFinderImpl implements NativePythonFinder {
             proc.stderr.on('data', (data) => this.outputChannel.error(`[pet] ${data.toString()}`));
             writable.pipe(proc.stdin, { end: false });
 
-            // Handle process exit - mark as exited so pending requests fail fast.
-            // Guard by process identity: once a restart installs a replacement, a late exit from
-            // THIS (now superseded) child must not flip shared state, or the next request would
-            // restart and kill the healthy replacement.
-            proc.on('exit', (code, signal) => {
-                applyPetProcessExit(this.proc, proc, () => {
+            // Wire exit/error events into restart state. The identity guard inside the helper
+            // ensures a late event from THIS child, once a restart has installed a replacement,
+            // cannot flip shared state and trigger a restart that kills the healthy replacement.
+            registerPetProcessLifecycleHandlers(
+                proc,
+                () => this.proc,
+                (reason) => {
                     this.processExited = true;
                     // Preserve a more-specific reason (e.g. rpc_*) if one was already recorded before the kill.
                     if (this.processExitReason === undefined) {
-                        this.processExitReason = `process_exit:${code ?? 'null'}:${signal ?? 'none'}`;
+                        this.processExitReason = reason;
                     }
-                });
-                if (code !== 0) {
-                    this.outputChannel.error(
-                        `[pet] Python Environment Tools exited unexpectedly with code ${code}, signal ${signal}`,
-                    );
-                }
-            });
-
-            // Handle process errors (e.g., ENOENT if executable not found)
-            proc.on('error', (err) => {
-                applyPetProcessExit(this.proc, proc, () => {
-                    this.processExited = true;
-                    if (this.processExitReason === undefined) {
-                        this.processExitReason = 'process_error';
-                    }
-                });
-                this.outputChannel.error('[pet] Process error:', err);
-            });
+                },
+                this.outputChannel,
+            );
 
             this.startDisposables.push({
                 dispose: () => {

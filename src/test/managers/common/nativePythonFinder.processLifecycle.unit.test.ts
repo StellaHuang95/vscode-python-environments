@@ -1,6 +1,7 @@
 import assert from 'node:assert';
+import { EventEmitter } from 'node:events';
 import * as sinon from 'sinon';
-import { applyPetProcessExit } from '../../../managers/common/nativePythonFinder';
+import { applyPetProcessExit, registerPetProcessLifecycleHandlers } from '../../../managers/common/nativePythonFinder';
 
 /**
  * Regression tests for the PET process-lifecycle ownership guard.
@@ -115,5 +116,160 @@ suite('applyPetProcessExit (PET lifecycle ownership guard)', () => {
             'gen1 late exit is ignored once gen2 is active',
         );
         assert.strictEqual(state.processExited, false, 'gen2 remains healthy; no extra restart occurs');
+    });
+});
+
+/**
+ * Regression tests for the production wiring that `start()` installs. These exercise the exact
+ * exit/error handlers registered on the child (via a real `EventEmitter`), proving the handlers are
+ * attached, identity-guarded, reason-preserving, and log the way production expects — coverage the
+ * `applyPetProcessExit`-only tests above cannot provide because they bypass the registration.
+ */
+suite('registerPetProcessLifecycleHandlers (PET lifecycle wiring)', () => {
+    teardown(() => {
+        sinon.restore();
+    });
+
+    type LifecycleState = { processExited: boolean; processExitReason: string | undefined };
+
+    function makeState(): LifecycleState {
+        return { processExited: false, processExitReason: undefined };
+    }
+
+    // Mirrors the production markExited closure: marks exited and keeps the first (most-specific) reason.
+    function markExitedInto(state: LifecycleState): (reason: string) => void {
+        return (reason) => {
+            state.processExited = true;
+            if (state.processExitReason === undefined) {
+                state.processExitReason = reason;
+            }
+        };
+    }
+
+    test("wires the active child's exit into restart state and logs an unexpected exit", () => {
+        const active = new EventEmitter();
+        const state = makeState();
+        const outputChannel = { error: sinon.stub() };
+
+        registerPetProcessLifecycleHandlers(active, () => active, markExitedInto(state), outputChannel);
+        active.emit('exit', 1, null);
+
+        assert.strictEqual(state.processExited, true, 'active child exit marks the finder as exited');
+        assert.strictEqual(state.processExitReason, 'process_exit:1:none');
+        assert.ok(
+            outputChannel.error.calledOnceWith(
+                '[pet] Python Environment Tools exited unexpectedly with code 1, signal null',
+            ),
+            'a non-zero exit is surfaced',
+        );
+    });
+
+    test('a clean exit (code 0) of the active child is recorded without an error log', () => {
+        const active = new EventEmitter();
+        const state = makeState();
+        const outputChannel = { error: sinon.stub() };
+
+        registerPetProcessLifecycleHandlers(active, () => active, markExitedInto(state), outputChannel);
+        active.emit('exit', 0, null);
+
+        assert.strictEqual(state.processExited, true);
+        assert.strictEqual(state.processExitReason, 'process_exit:0:none');
+        assert.ok(outputChannel.error.notCalled, 'a clean exit is not logged as unexpected');
+    });
+
+    test('a signal-terminated active child (code null) records signal in the reason and is logged', () => {
+        const active = new EventEmitter();
+        const state = makeState();
+        const outputChannel = { error: sinon.stub() };
+
+        registerPetProcessLifecycleHandlers(active, () => active, markExitedInto(state), outputChannel);
+        // POSIX signal termination: exit fires with a null code and a signal name.
+        active.emit('exit', null, 'SIGTERM');
+
+        assert.strictEqual(state.processExited, true);
+        assert.strictEqual(state.processExitReason, 'process_exit:null:SIGTERM', 'null code and signal are recorded');
+        assert.ok(
+            outputChannel.error.calledOnceWith(
+                '[pet] Python Environment Tools exited unexpectedly with code null, signal SIGTERM',
+            ),
+            'a null-code (signalled) exit is surfaced',
+        );
+    });
+
+    test("wires the active child's error into restart state and logs it", () => {
+        const active = new EventEmitter();
+        const state = makeState();
+        const outputChannel = { error: sinon.stub() };
+
+        registerPetProcessLifecycleHandlers(active, () => active, markExitedInto(state), outputChannel);
+        const err = new Error('ENOENT');
+        active.emit('error', err);
+
+        assert.strictEqual(state.processExited, true);
+        assert.strictEqual(state.processExitReason, 'process_error');
+        assert.ok(outputChannel.error.calledOnceWith('[pet] Process error:', err));
+    });
+
+    test('exit then error on the active child is idempotent and preserves the first reason', () => {
+        const active = new EventEmitter();
+        const state = makeState();
+        const outputChannel = { error: sinon.stub() };
+
+        registerPetProcessLifecycleHandlers(active, () => active, markExitedInto(state), outputChannel);
+        active.emit('exit', 2, null);
+        active.emit('error', new Error('late error'));
+
+        assert.strictEqual(state.processExited, true);
+        assert.strictEqual(
+            state.processExitReason,
+            'process_exit:2:none',
+            'the first, most-specific reason is preserved across later events',
+        );
+    });
+
+    test("a superseded child's late exit does not touch the healthy replacement's state", () => {
+        const oldChild = new EventEmitter();
+        const replacement = new EventEmitter();
+        const oldState = makeState();
+        const replacementState = makeState();
+        const outputChannel = { error: sinon.stub() };
+
+        // Both children have handlers registered, but `replacement` is the finder's active child now.
+        registerPetProcessLifecycleHandlers(oldChild, () => replacement, markExitedInto(oldState), outputChannel);
+        registerPetProcessLifecycleHandlers(
+            replacement,
+            () => replacement,
+            markExitedInto(replacementState),
+            outputChannel,
+        );
+
+        // The superseded old child finally exits (non-zero, e.g. from the SIGKILL during restart).
+        oldChild.emit('exit', 137, 'SIGKILL');
+
+        assert.strictEqual(oldState.processExited, false, 'stale exit is ignored by the identity guard');
+        assert.strictEqual(
+            replacementState.processExited,
+            false,
+            'the healthy replacement is untouched, so no spurious restart is triggered',
+        );
+        // The diagnostic is still surfaced (pre-existing behaviour), but no shared state changed.
+        assert.ok(
+            outputChannel.error.calledOnceWith(
+                '[pet] Python Environment Tools exited unexpectedly with code 137, signal SIGKILL',
+            ),
+        );
+    });
+
+    test("a superseded child's late error does not touch the healthy replacement's state", () => {
+        const oldChild = new EventEmitter();
+        const replacement = new EventEmitter();
+        const oldState = makeState();
+        const outputChannel = { error: sinon.stub() };
+
+        registerPetProcessLifecycleHandlers(oldChild, () => replacement, markExitedInto(oldState), outputChannel);
+        oldChild.emit('error', new Error('stale error'));
+
+        assert.strictEqual(oldState.processExited, false, 'stale error is ignored by the identity guard');
+        assert.ok(outputChannel.error.calledOnce, 'the error is still logged as a diagnostic');
     });
 });
