@@ -9,6 +9,7 @@ import {
     computeRefreshOperationBudgetMs,
     computeServerRefreshBudgetMs,
     Deadline,
+    decideRefreshRetry,
     MIN_STAGE_BUDGET_MS,
     MonotonicClock,
     REFRESH_OPERATION_BUDGET_MS,
@@ -302,5 +303,128 @@ suite('Bounded refresh latency — RefreshBudgetExceededError', () => {
         assert.ok(err instanceof RefreshBudgetExceededError);
         assert.match(err.message, /restart/);
         assert.match(err.message, /budget exceeded/i);
+    });
+});
+
+suite('Bounded refresh latency — decideRefreshRetry (composed retry/CLI-fallback decision)', () => {
+    const MAX_REFRESH_RETRIES = 1;
+    // Remaining budget after a full 90s failing first server attempt on a fresh 214s budget.
+    const AFTER_ONE_SERVER_FAILURE = REFRESH_OPERATION_BUDGET_MS - 90_000; // 124_000
+    // Ample budget after a fast crash (well above the 185s starvation threshold).
+    const AMPLE = 212_000;
+
+    test('a budget error stops immediately: never retry, never fall back', () => {
+        const decision = decideRefreshRetry({
+            isBudgetError: true,
+            isRetryable: true,
+            attempt: 0,
+            maxRetries: MAX_REFRESH_RETRIES,
+            remainingMs: AMPLE,
+            serverExhausted: false,
+        });
+        assert.deepStrictEqual(decision, { kind: 'rethrow' });
+    });
+
+    test('a retryable failure with ample budget retries another server attempt', () => {
+        const decision = decideRefreshRetry({
+            isBudgetError: false,
+            isRetryable: true,
+            attempt: 0,
+            maxRetries: MAX_REFRESH_RETRIES,
+            remainingMs: AMPLE,
+            serverExhausted: false,
+        });
+        assert.deepStrictEqual(decision, { kind: 'retry' });
+    });
+
+    test('REGRESSION: a retryable failure that would starve the CLI budget falls back to the CLI, not a retry', () => {
+        // This is exactly the server-exhaustion → CLI-fallback path that the earlier 184s budget bug
+        // got wrong: after a 90s server failure (124s left < 185s threshold), another server attempt
+        // would consume the reserved CLI enumeration budget, so we must skip straight to the CLI.
+        assert.strictEqual(retryWouldStarveCliFallbackMs(AFTER_ONE_SERVER_FAILURE), true);
+        const decision = decideRefreshRetry({
+            isBudgetError: false,
+            isRetryable: true,
+            attempt: 0,
+            maxRetries: MAX_REFRESH_RETRIES,
+            remainingMs: AFTER_ONE_SERVER_FAILURE,
+            serverExhausted: false,
+        });
+        assert.deepStrictEqual(decision, { kind: 'cli-fallback', reason: 'starvation' });
+    });
+
+    test('a retryable failure with budget below one stage floor surfaces a budget error', () => {
+        const decision = decideRefreshRetry({
+            isBudgetError: false,
+            isRetryable: true,
+            attempt: 0,
+            maxRetries: MAX_REFRESH_RETRIES,
+            remainingMs: MIN_STAGE_BUDGET_MS - 1, // below the floor → exhausted
+            serverExhausted: false,
+        });
+        assert.deepStrictEqual(decision, { kind: 'budget-exceeded' });
+    });
+
+    test('the final retryable attempt falls back to the CLI once server mode is exhausted', () => {
+        const decision = decideRefreshRetry({
+            isBudgetError: false,
+            isRetryable: true,
+            attempt: MAX_REFRESH_RETRIES, // no retries left
+            maxRetries: MAX_REFRESH_RETRIES,
+            remainingMs: AMPLE,
+            serverExhausted: true,
+        });
+        assert.deepStrictEqual(decision, { kind: 'cli-fallback', reason: 'server-exhausted' });
+    });
+
+    test('the final attempt rethrows when server mode is not exhausted', () => {
+        const decision = decideRefreshRetry({
+            isBudgetError: false,
+            isRetryable: true,
+            attempt: MAX_REFRESH_RETRIES,
+            maxRetries: MAX_REFRESH_RETRIES,
+            remainingMs: AMPLE,
+            serverExhausted: false,
+        });
+        assert.deepStrictEqual(decision, { kind: 'rethrow' });
+    });
+
+    test('a non-retryable error falls back to the CLI iff server mode is exhausted, else rethrows', () => {
+        assert.deepStrictEqual(
+            decideRefreshRetry({
+                isBudgetError: false,
+                isRetryable: false,
+                attempt: 0,
+                maxRetries: MAX_REFRESH_RETRIES,
+                remainingMs: AMPLE,
+                serverExhausted: true,
+            }),
+            { kind: 'cli-fallback', reason: 'server-exhausted' },
+        );
+        assert.deepStrictEqual(
+            decideRefreshRetry({
+                isBudgetError: false,
+                isRetryable: false,
+                attempt: 0,
+                maxRetries: MAX_REFRESH_RETRIES,
+                remainingMs: AMPLE,
+                serverExhausted: false,
+            }),
+            { kind: 'rethrow' },
+        );
+    });
+
+    test('with no deadline (non-refresh path) a retryable mid-attempt failure always retries', () => {
+        // remainingMs === undefined: no budget-exceeded and no starvation fallback can fire, preserving
+        // the unbounded resolve/non-refresh behavior.
+        const decision = decideRefreshRetry({
+            isBudgetError: false,
+            isRetryable: true,
+            attempt: 0,
+            maxRetries: MAX_REFRESH_RETRIES,
+            remainingMs: undefined,
+            serverExhausted: false,
+        });
+        assert.deepStrictEqual(decision, { kind: 'retry' });
     });
 });

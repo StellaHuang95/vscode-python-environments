@@ -209,6 +209,71 @@ export function retryWouldStarveCliFallbackMs(remainingMs: number): boolean {
     return remainingMs < worstRetryCostMs + cliReserveMs;
 }
 
+/** The action `doRefresh` takes after a server refresh attempt fails. See {@link decideRefreshRetry}. */
+export type RefreshRetryAction =
+    | { kind: 'retry' } // kill + restart the process and try another server attempt
+    // stop server mode and fall back to the JSON CLI (an existing success path). `reason` records why,
+    // so the caller's log selection rides with the decision instead of re-deriving it:
+    //   'starvation'       — another server retry would consume the reserved CLI enumeration budget
+    //   'server-exhausted' — all restart attempts are used / the process is dead
+    | { kind: 'cli-fallback'; reason: 'starvation' | 'server-exhausted' }
+    | { kind: 'budget-exceeded' } // the operation budget can no longer fund another attempt
+    | { kind: 'rethrow' }; // surface the original error unchanged
+
+/** Inputs to {@link decideRefreshRetry}. All values are read once by the caller to avoid clock races. */
+export interface RefreshRetryDecisionInput {
+    /** The failure is already a {@link RefreshBudgetExceededError} (deadline provenance preserved upstream). */
+    isBudgetError: boolean;
+    /** A retryable transport failure (refresh-RPC timeout or connection error), not a configure error. */
+    isRetryable: boolean;
+    /** Zero-based index of the attempt that just failed. */
+    attempt: number;
+    /** Maximum additional retries ({@link MAX_REFRESH_RETRIES}). */
+    maxRetries: number;
+    /** Remaining operation budget in ms, or `undefined` when the caller supplied no deadline. */
+    remainingMs: number | undefined;
+    /** Whether server mode is fully exhausted (all restart attempts used / process dead). */
+    serverExhausted: boolean;
+}
+
+/**
+ * Pure decision for `doRefresh`'s post-failure control flow: retry another server attempt, fall back
+ * to the CLI, surface a budget error, or rethrow. Extracted from `doRefresh` so the *composed*
+ * retry/CLI-fallback/budget decision — not just the arithmetic helpers it builds on — is unit-testable
+ * without spawning a real PET process or exporting the finder implementation. The caller performs the
+ * side effects (logging, kill/restart, throwing) so this stays free of I/O.
+ *
+ * Ordering mirrors the original inline logic exactly:
+ *  1. A budget error stops immediately (never retry/fall back — the CLI shares the same deadline).
+ *  2. A retryable failure with retries left: fail fast if the budget is below one stage floor, else
+ *     fall back to the CLI when another attempt would starve the reserved CLI enumeration budget,
+ *     otherwise retry.
+ *  3. Otherwise (non-retryable, or the final attempt): fall back to the CLI iff server mode is
+ *     exhausted, else rethrow.
+ */
+export function decideRefreshRetry(input: RefreshRetryDecisionInput): RefreshRetryAction {
+    if (input.isBudgetError) {
+        return { kind: 'rethrow' };
+    }
+
+    if (input.isRetryable && input.attempt < input.maxRetries) {
+        // A deadline is present (refresh path) but can no longer fund another attempt.
+        if (input.remainingMs !== undefined && input.remainingMs < MIN_STAGE_BUDGET_MS) {
+            return { kind: 'budget-exceeded' };
+        }
+        // Another server attempt would consume the reserved CLI enumeration budget: fall back now.
+        if (input.remainingMs !== undefined && retryWouldStarveCliFallbackMs(input.remainingMs)) {
+            return { kind: 'cli-fallback', reason: 'starvation' };
+        }
+        return { kind: 'retry' };
+    }
+
+    if (input.serverExhausted) {
+        return { kind: 'cli-fallback', reason: 'server-exhausted' };
+    }
+    return { kind: 'rethrow' };
+}
+
 /** End-to-end budget for a single queued refresh operation. See {@link computeRefreshOperationBudgetMs}. */
 export const REFRESH_OPERATION_BUDGET_MS = computeRefreshOperationBudgetMs();
 
@@ -240,7 +305,7 @@ export class Deadline {
         return this.deadlineAt - this.now();
     }
 
-    /** True when the remaining budget is at or below `floorMs` (default {@link MIN_STAGE_BUDGET_MS}). */
+    /** True when the remaining budget is below `floorMs` (default {@link MIN_STAGE_BUDGET_MS}). */
     isExhausted(floorMs: number = MIN_STAGE_BUDGET_MS): boolean {
         return this.remainingMs() < floorMs;
     }
@@ -1167,39 +1232,51 @@ class NativePythonFinderImpl implements NativePythonFinder {
             } catch (ex) {
                 lastError = ex;
 
-                // Budget spent: stop immediately. Do not retry and do not fall back to the CLI —
-                // the CLI shares this same deadline and would only fail its own budget check.
-                if (ex instanceof RefreshBudgetExceededError) {
-                    this.outputChannel.warn(`[pet] Refresh operation budget exhausted (${ex.message}), aborting`);
-                    throw ex;
-                }
-
-                // Retry on timeout or connection errors (PET hung or crashed mid-request)
+                const isBudgetError = ex instanceof RefreshBudgetExceededError;
+                // Retry on timeout or connection errors (PET hung or crashed mid-request).
                 const isRetryable =
                     (ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError;
-                if (isRetryable) {
-                    if (attempt < MAX_REFRESH_RETRIES) {
-                        // Suppress the retry when the deadline can no longer fund another attempt so
-                        // we surface a budget error instead of burning the remaining time on a doomed
-                        // restart + retry that cannot complete.
-                        if (deadline?.isExhausted()) {
-                            this.outputChannel.warn(
-                                '[pet] Refresh budget exhausted after attempt failure, not retrying',
-                            );
-                            throw new RefreshBudgetExceededError('refresh_retry', deadline.remainingMs());
-                        }
-                        // Preserve the CLI enumeration budget: if another server attempt would leave
-                        // less than a full CLI scan of remaining budget, skip the retry and fall back
-                        // to the JSON CLI now (an existing successful path) rather than burning the
-                        // reserve on a retry that would then starve the CLI. doRefreshAttempt already
-                        // killed the process / set processExited for this retryable failure, so the
-                        // CLI fallback starts from a clean slate.
-                        if (deadline && retryWouldStarveCliFallbackMs(deadline.remainingMs())) {
+                // Read the remaining budget once so the decision and any budget error it produces
+                // observe the same clock sample. `remainingMs` / `isServerExhausted()` are pure,
+                // synchronous reads, so evaluating them eagerly for every caught error (rather than
+                // lazily per-branch as the original did) yields identical values with no side effects.
+                const remainingMs = deadline?.remainingMs();
+
+                // The final retryable attempt is logged before the (shared) server-exhausted check,
+                // matching the original inline ordering.
+                if (isRetryable && attempt >= MAX_REFRESH_RETRIES) {
+                    this.outputChannel.error(`[pet] Refresh failed after ${MAX_REFRESH_RETRIES + 1} attempts`);
+                }
+
+                const decision = decideRefreshRetry({
+                    isBudgetError,
+                    isRetryable,
+                    attempt,
+                    maxRetries: MAX_REFRESH_RETRIES,
+                    remainingMs,
+                    serverExhausted: this.isServerExhausted(),
+                });
+
+                switch (decision.kind) {
+                    case 'budget-exceeded':
+                        // The deadline can no longer fund another attempt: surface a budget error
+                        // instead of burning the remaining time on a doomed restart + retry.
+                        this.outputChannel.warn('[pet] Refresh budget exhausted after attempt failure, not retrying');
+                        throw new RefreshBudgetExceededError('refresh_retry', remainingMs ?? 0);
+                    case 'cli-fallback':
+                        if (decision.reason === 'starvation') {
+                            // Skipped the retry to preserve the reserved CLI enumeration budget.
+                            // doRefreshAttempt already killed the process / set processExited for this
+                            // retryable failure, so the CLI fallback starts from a clean slate.
                             this.outputChannel.warn(
                                 '[pet] Skipping server retry to preserve the CLI enumeration budget; falling back to JSON CLI',
                             );
-                            return await this.refreshViaJsonCli(options, deadline);
+                        } else {
+                            // Server mode is fully exhausted (all restart attempts used / process dead).
+                            this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh');
                         }
+                        return await this.refreshViaJsonCli(options, deadline);
+                    case 'retry': {
                         const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
                         this.outputChannel.warn(
                             `[pet] Refresh ${reason} (attempt ${attempt + 1}/${MAX_REFRESH_RETRIES + 1}), restarting and retrying...`,
@@ -1211,15 +1288,16 @@ class NativePythonFinderImpl implements NativePythonFinder {
                             ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
                         continue;
                     }
-                    // Final attempt failed
-                    this.outputChannel.error(`[pet] Refresh failed after ${MAX_REFRESH_RETRIES + 1} attempts`);
+                    case 'rethrow':
+                        // Budget errors stop immediately (the CLI shares this same deadline and would
+                        // only fail its own budget check); other non-retryable errors surface as-is.
+                        if (ex instanceof RefreshBudgetExceededError) {
+                            this.outputChannel.warn(
+                                `[pet] Refresh operation budget exhausted (${ex.message}), aborting`,
+                            );
+                        }
+                        throw ex;
                 }
-                // Non-timeout errors or final timeout — check if server is fully exhausted
-                if (this.isServerExhausted()) {
-                    this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh');
-                    return this.refreshViaJsonCli(options, deadline);
-                }
-                throw ex;
             }
         }
 
