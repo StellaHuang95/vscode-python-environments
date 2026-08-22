@@ -568,14 +568,18 @@ export class NativePythonFinderImpl implements NativePythonFinder {
      * Attempts to kill the PET process. Used during restart and timeout recovery.
      */
     private killProcess(): void {
-        if (this.proc && this.proc.exitCode === null) {
+        // Capture the process locally so the delayed SIGKILL still targets THIS process after we clear
+        // `this.proc` below. Reading `this.proc` inside the timeout would see `undefined` and skip the
+        // escalation, leaving a process that ignores SIGTERM alive.
+        const proc = this.proc;
+        if (proc && proc.exitCode === null) {
             try {
                 this.outputChannel.info('[pet] Killing hung/crashed PET process');
-                this.proc.kill('SIGTERM');
-                // Give it a moment to terminate gracefully, then force kill
+                proc.kill('SIGTERM');
+                // Give it a moment to terminate gracefully, then force kill.
                 setTimeout(() => {
-                    if (this.proc && this.proc.exitCode === null) {
-                        this.proc.kill('SIGKILL');
+                    if (proc.exitCode === null) {
+                        proc.kill('SIGKILL');
                     }
                 }, 500);
             } catch (ex) {

@@ -203,6 +203,37 @@ suite('NativePythonFinderImpl.clearCache', () => {
         assert.strictEqual(emptyDirStub.called, false);
     });
 
+    test('killProcess escalates to SIGKILL when the process ignores SIGTERM, even after this.proc is cleared', () => {
+        const finder = createFinder(Uri.file(path.join(os.tmpdir(), 'pet-kill-escalate')));
+        const internals = finder as unknown as {
+            proc: { exitCode: number | null; kill: sinon.SinonStub };
+            killProcess: () => void;
+        };
+        const proc = internals.proc; // capture before killProcess() nulls this.proc
+        const clock = sinon.useFakeTimers();
+        try {
+            internals.killProcess();
+
+            assert.ok(proc.kill.calledWith('SIGTERM'), 'SIGTERM should be sent immediately');
+            assert.strictEqual(
+                (finder as unknown as { proc: unknown }).proc,
+                undefined,
+                'this.proc should be cleared synchronously',
+            );
+            assert.strictEqual(proc.kill.calledWith('SIGKILL'), false, 'SIGKILL must wait for the grace period');
+
+            // The process ignored SIGTERM (exitCode stays null); advancing past the grace period must
+            // still escalate to SIGKILL on the CAPTURED process, not the already-cleared this.proc.
+            clock.tick(600);
+            assert.ok(
+                proc.kill.calledWith('SIGKILL'),
+                'SIGKILL should escalate for a process that ignores SIGTERM',
+            );
+        } finally {
+            clock.restore();
+        }
+    });
+
     suite('start-time bookkeeping', () => {
         test('start() is invoked exactly once per finder construction', () => {
             createFinder(Uri.file(path.join(os.tmpdir(), 'pet-clear-count')));
