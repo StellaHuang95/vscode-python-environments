@@ -815,6 +815,15 @@ export class NativePythonFinderImpl implements NativePythonFinder {
         //    (it creates the directory when absent), so running it unconditionally is safe, and a real
         //    failure means a previous session's cache may remain reachable on disk, which the caller
         //    must know about rather than see a false success.
+        //
+        //    Residual limit (documented): when the JSON-RPC server is fully exhausted, refreshes fall
+        //    back to a one-shot `pet find` CLI child (see refreshViaJsonCli) that is passed this same
+        //    `--cache-directory`. That child is transient and not tracked on the instance, so a CLI
+        //    fallback already in flight can re-write the directory after this sweep completes. The
+        //    generation guard still rejects its results from the extension-side map, but a later refresh
+        //    could read the re-written on-disk copy. We do not track/kill CLI children or block Clear
+        //    Cache on them (that would add lifecycle machinery and risk an unbounded wait); the next
+        //    explicit refresh reconfigures and rediscovers.
         if (this.cacheDirectory) {
             try {
                 await fs.emptyDir(this.cacheDirectory.fsPath);

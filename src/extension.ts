@@ -400,6 +400,13 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
             // If the finder hasn't been created yet, clear the on-disk cache directory directly.
             // Wrapped so a native/disk failure still propagates but does not skip the shell-profile
             // cache cleanup below (each cache layer is cleared independently).
+            //
+            // `sharedNativeFinder` is a snapshot. In the narrow window where this command runs while
+            // deferred setup is still constructing the finder, we take the disk-fallback branch; a
+            // finder that finishes constructing just afterwards could reload the on-disk cache on its
+            // first refresh. This is the documented pre-finder residual — we clear disk directly rather
+            // than block Clear Cache on finder construction (which could wait indefinitely), and the
+            // next explicit refresh reconfigures and rediscovers.
             try {
                 if (sharedNativeFinder) {
                     await sharedNativeFinder.clearCache();
