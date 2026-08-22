@@ -835,13 +835,28 @@ export async function resolveCondaPath(
     }
 }
 
+/**
+ * Discovers conda environments via the native finder.
+ *
+ * The return value distinguishes a thrown discovery failure from a successful result:
+ * - `undefined` means discovery failed because the native finder threw/rejected. Callers
+ *   should preserve any previously known-good collection instead of treating a transient
+ *   failure as "no environments".
+ * - An array (including `[]`) is an authoritative, successful result. An empty array means
+ *   conda genuinely has no environments (or conda is not installed) and stale environments
+ *   should be removed normally.
+ *
+ * The native finder already normalizes malformed worker output to an empty array before
+ * conda sees it, so the defensive non-array guard below preserves preexisting behavior and
+ * returns `[]` rather than signalling failure.
+ */
 export async function refreshCondaEnvs(
     hardRefresh: boolean,
     nativeFinder: NativePythonFinder,
     api: PythonEnvironmentApi,
     log: LogOutputChannel,
     manager: EnvironmentManager,
-): Promise<PythonEnvironment[]> {
+): Promise<PythonEnvironment[] | undefined> {
     log.info(`Refreshing conda environments (hardRefresh=${hardRefresh})`);
 
     let data: (NativeEnvInfo | NativeEnvManagerInfo)[];
@@ -850,7 +865,9 @@ export async function refreshCondaEnvs(
     } catch (error) {
         traceError('Failed to refresh native finder for conda environments', error);
         log.error(`Failed to refresh native finder: ${error instanceof Error ? error.message : String(error)}`);
-        return [];
+        // A thrown/rejected refresh is a discovery failure — signal it with `undefined` (not
+        // empty) so callers keep known-good data instead of removing environments transiently.
+        return undefined;
     }
 
     // Ensure data is a valid array before proceeding

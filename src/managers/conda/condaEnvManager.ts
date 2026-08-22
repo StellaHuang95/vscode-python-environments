@@ -20,7 +20,7 @@ import {
     SetEnvironmentScope,
 } from '../../api';
 import { CondaStrings } from '../../common/localize';
-import { traceError, traceInfo } from '../../common/logging';
+import { traceError, traceInfo, traceVerbose } from '../../common/logging';
 import { StopWatch } from '../../common/stopWatch';
 import { EventNames } from '../../common/telemetry/constants';
 import { classifyError } from '../../common/telemetry/errorClassifier';
@@ -123,8 +123,19 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                     title: CondaStrings.condaDiscovering,
                 },
                 async () => {
-                    this.collection =
-                        (await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this)) ?? [];
+                    const refreshed = await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this);
+                    // `undefined` means discovery threw/rejected. Keep any known-good collection
+                    // and never emit removals, but still restore persisted global/workspace
+                    // selections (they resolve independently of discovery). A successful (possibly
+                    // empty) array is applied normally.
+                    if (refreshed === undefined) {
+                        traceVerbose(
+                            'Conda discovery failed during initialization; preserving collection and restoring persisted selections.',
+                        );
+                        await this.preserveCollectionOnFailedDiscovery();
+                        return;
+                    }
+                    this.collection = refreshed;
                     await this.loadEnvMap();
 
                     this._onDidChangeEnvironments.fire(
@@ -314,8 +325,19 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 },
                 async () => {
                     this.log.info('Refreshing Conda Environments');
+                    const refreshed = await refreshCondaEnvs(true, this.nativeFinder, this.api, this.log, this);
+                    // `undefined` signals a discovery failure (native finder threw/rejected).
+                    // Preserve the last known-good collection and emit no removals so a transient
+                    // failure does not delete environments, but still restore persisted selections
+                    // via loadEnvMap (emitting adds only for any newly resolved persisted envs).
+                    // A successful empty array still removes stale envs below.
+                    if (refreshed === undefined) {
+                        this.log.warn('Conda refresh failed; preserving previously discovered environments.');
+                        await this.preserveCollectionOnFailedDiscovery();
+                        return;
+                    }
                     const discard = this.collection.map((c) => c);
-                    this.collection = (await refreshCondaEnvs(true, this.nativeFinder, this.api, this.log, this)) ?? [];
+                    this.collection = refreshed;
 
                     await this.loadEnvMap();
 
@@ -342,8 +364,19 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
             resolve: (p) => resolveCondaPath(p, this.nativeFinder, this.api, this.log, this),
             startBackgroundInit: () =>
                 withProgress({ location: ProgressLocation.Window, title: CondaStrings.condaDiscovering }, async () => {
-                    this.collection =
-                        (await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this)) ?? [];
+                    const refreshed = await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this);
+                    // `undefined` means discovery threw/rejected. Keep any known-good collection and
+                    // never emit removals, but still restore persisted global/workspace selections
+                    // via loadEnvMap (emitting adds only for newly resolved persisted envs). A
+                    // successful (possibly empty) array is applied normally.
+                    if (refreshed === undefined) {
+                        traceVerbose(
+                            'Conda background discovery failed; preserving collection and restoring persisted selections.',
+                        );
+                        await this.preserveCollectionOnFailedDiscovery();
+                        return;
+                    }
+                    this.collection = refreshed;
                     await this.loadEnvMap();
                     this._onDidChangeEnvironments.fire(
                         this.collection.map((e) => ({
@@ -354,6 +387,11 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 }),
         });
         if (fastResult) {
+            // Persist the fast-path-resolved environment into the collection/map immediately so a
+            // concurrent background discovery failure (whose own re-resolution may also fail)
+            // cannot lose it. Registration is silent: the discovery paths announce the collection,
+            // and failure recovery reuses this entry via normalized-path identity.
+            this.registerFastPathEnv(scope, fastResult.env);
             return fastResult.env;
         }
 
@@ -486,7 +524,64 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
         await clearCondaCache();
     }
 
-    private async loadEnvMap() {
+    /**
+     * Registers a fast-path-resolved environment into the collection and workspace map using
+     * normalized-path identity. The fast path can resolve a persisted selection and return it
+     * before background discovery finishes; without persisting it here, a subsequent background
+     * discovery failure (whose own re-resolution may also fail) would leave the collection/map
+     * empty and a later `get()` would return `undefined`. Reuses an existing collection entry by
+     * path identity to avoid duplicates. Silent by design: the discovery paths announce the
+     * collection, and failure recovery reuses this entry rather than re-resolving it.
+     *
+     * This registration is transient: a subsequent *successful* discovery is authoritative and
+     * replaces the collection wholesale. If that discovery no longer includes this environment
+     * (and the persisted selection no longer resolves), the entry is superseded without a
+     * `remove` event — symmetric with the silent add, and acceptable because the environment was
+     * never announced in the first place.
+     */
+    private registerFastPathEnv(scope: GetEnvironmentScope, env: PythonEnvironment): void {
+        if (!(scope instanceof Uri)) {
+            return;
+        }
+        const projectFsPath = getProjectFsPathForScope(this.api, scope);
+        if (!projectFsPath) {
+            return;
+        }
+        const existing = this.findEnvironmentByPath(env.environmentPath.fsPath);
+        if (!existing) {
+            this.collection.push(env);
+        }
+        this.fsPathToEnv.set(normalizePath(projectFsPath), existing ?? env);
+    }
+
+    /**
+     * Handles a discovery failure (`refreshCondaEnvs` returned `undefined`) without discarding
+     * the last known-good collection. The existing collection is preserved and `loadEnvMap()`
+     * still runs so persisted global/workspace selections are restored/updated. `loadEnvMap()`
+     * reports exactly the environments it appended, so this path emits `add` only for those — it
+     * never re-emits an environment that a concurrent `resolve()`/`create()` appended and already
+     * announced. Removals are never emitted here.
+     *
+     * This does not guarantee an environment is announced at most once globally: a concurrent
+     * *successful* discovery re-emits the whole collection (see `initialize` / `startBackgroundInit`),
+     * so a persisted env resolved by both paths can be announced twice. That is pre-existing and
+     * harmless — the success path already re-announces every entry on each discovery, so
+     * `onDidChangeEnvironments` consumers must treat `add` idempotently.
+     */
+    private async preserveCollectionOnFailedDiscovery(): Promise<void> {
+        const appended = await this.loadEnvMap();
+        if (appended.length > 0) {
+            this._onDidChangeEnvironments.fire(
+                appended.map((environment) => ({ environment, kind: EnvironmentChangeKind.add })),
+            );
+        }
+    }
+
+    private async loadEnvMap(): Promise<PythonEnvironment[]> {
+        // Track the environments this call itself appends to `this.collection`, so failure
+        // recovery can emit adds for exactly those (and not double-count a concurrent
+        // create/resolve that appended — and already announced — its own environment).
+        const appended: PythonEnvironment[] = [];
         this.globalEnv = undefined;
         this.fsPathToEnv.clear();
 
@@ -498,11 +593,20 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
 
             // If the environment is not found, resolve the fsPath. Could be portable conda.
             if (!this.globalEnv) {
-                this.globalEnv = await resolveCondaPath(fsPath, this.nativeFinder, this.api, this.log, this);
+                const resolved = await resolveCondaPath(fsPath, this.nativeFinder, this.api, this.log, this);
 
-                // If the environment is resolved, add it to the collection
-                if (this.globalEnv) {
-                    this.collection.push(this.globalEnv);
+                if (resolved) {
+                    // Re-check identity after the await: a concurrent create/resolve may have
+                    // appended the same environment while we were resolving. Reuse it instead
+                    // of pushing a duplicate collection entry.
+                    const concurrent = this.findEnvironmentByPath(resolved.environmentPath.fsPath);
+                    if (concurrent) {
+                        this.globalEnv = concurrent;
+                    } else {
+                        this.globalEnv = resolved;
+                        this.collection.push(resolved);
+                        appended.push(resolved);
+                    }
                 }
             }
         }
@@ -543,9 +647,16 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                     const resolved = await resolveCondaPath(env, this.nativeFinder, this.api, this.log, this);
 
                     if (resolved) {
-                        // If resolved add it to the collection
-                        this.fsPathToEnv.set(normalizedPath, resolved);
-                        this.collection.push(resolved);
+                        // Re-check identity after the await to avoid a duplicate collection
+                        // entry if a concurrent op appended the same environment while we were
+                        // resolving; reuse the existing instance when present.
+                        const concurrent = this.findEnvironmentByPath(resolved.environmentPath.fsPath);
+                        const toUse = concurrent ?? resolved;
+                        this.fsPathToEnv.set(normalizedPath, toUse);
+                        if (!concurrent) {
+                            this.collection.push(resolved);
+                            appended.push(resolved);
+                        }
                     } else {
                         this.log.error(`Failed to resolve conda environment: ${env}`);
                     }
@@ -568,6 +679,8 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 }
             }
         }
+
+        return appended;
     }
 
     private fromEnvMap(uri: Uri): PythonEnvironment | undefined {
