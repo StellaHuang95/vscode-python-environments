@@ -65,6 +65,27 @@ export function normalizePath(fsPath: string): string {
     return path1;
 }
 
+/**
+ * Determines whether `candidateFsPath` is the same path as, or nested inside, `scopeFsPath`.
+ *
+ * Both operands are passed through {@link path.resolve} so relative segments and (on Windows)
+ * drive letters are handled consistently across platforms, and {@link path.relative} is used so
+ * that sibling directories which merely share a name prefix — e.g. `.../app` vs `.../app-2` — are
+ * correctly treated as *outside* the scope. Containment is inclusive: when `candidateFsPath`
+ * resolves to `scopeFsPath` itself the function returns `true`.
+ *
+ * @param scopeFsPath Container path to test against (for example a workspace folder).
+ * @param candidateFsPath Path to test for containment.
+ * @returns `true` when `candidateFsPath` equals or is located under `scopeFsPath`.
+ */
+export function isPathInside(scopeFsPath: string, candidateFsPath: string): boolean {
+    const relative = path.relative(path.resolve(scopeFsPath), path.resolve(candidateFsPath));
+    return (
+        relative === '' ||
+        (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+    );
+}
+
 export function getResourceUri(resourcePath: string, root?: string): Uri | undefined {
     try {
         if (!resourcePath) {

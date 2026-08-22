@@ -25,7 +25,7 @@ import { PYTHON_EXTENSION_ID } from '../../common/constants';
 import { VenvManagerStrings } from '../../common/localize';
 import { traceError, traceWarn } from '../../common/logging';
 import { createDeferred, Deferred } from '../../common/utils/deferred';
-import { normalizePath } from '../../common/utils/pathUtils';
+import { normalizePath, isPathInside } from '../../common/utils/pathUtils';
 import { showErrorMessage, showInformationMessage, withProgress } from '../../common/window.apis';
 import { findParentIfFile } from '../../features/envCommands';
 import { getProjectFsPathForScope, tryFastPathGet } from '../common/fastPath';
@@ -48,6 +48,26 @@ import {
     setVenvForWorkspace,
     setVenvForWorkspaces,
 } from './venvUtils';
+
+/**
+ * Builds a comparable signature of an environment's user-facing metadata. Used during a scoped
+ * refresh to decide whether a rediscovered same-path environment represents a real change (for
+ * example a version bump) versus only a regenerated random {@link PythonEnvironment.envId}, which
+ * changes on every discovery. Non-primitive fields (execInfo, tooltip, iconPath, group) are
+ * intentionally excluded.
+ */
+function environmentMetadataSignature(env: PythonEnvironment): string {
+    return JSON.stringify([
+        env.name,
+        env.displayName,
+        env.shortDisplayName ?? '',
+        env.displayPath,
+        env.version,
+        env.description ?? '',
+        env.sysPrefix,
+        env.error ?? '',
+    ]);
+}
 
 export class VenvManager implements EnvironmentManager {
     private collection: PythonEnvironment[] = [];
@@ -318,32 +338,155 @@ export class VenvManager implements EnvironmentManager {
         title: string,
         location: ProgressLocation = ProgressLocation.Window,
     ): Promise<void> {
+        // A scoped refresh may be given a file Uri (per the RefreshEnvironmentsScope contract).
+        // Resolve it to the containing directory so discovery and the scoped merge both operate on
+        // a folder; otherwise nothing would be considered inside the scope and the refresh would be
+        // a silent no-op.
+        const scopeDir = scope ? await this.resolveScopeDirectory(scope) : undefined;
+
         await withProgress(
             {
                 location,
                 title,
             },
             async () => {
-                const discard = this.collection.map((env) => ({
-                    kind: EnvironmentChangeKind.remove,
-                    environment: env,
-                }));
-
-                this.collection =
+                const discovered =
                     (await findVirtualEnvironments(
                         hardRefresh,
                         this.nativeFinder,
                         this.api,
                         this.log,
                         this,
-                        scope ? [scope] : undefined,
+                        scopeDir ? [scopeDir] : undefined,
                     )) ?? [];
-                await this.loadEnvMap();
 
-                const added = this.collection.map((env) => ({ environment: env, kind: EnvironmentChangeKind.add }));
-                this._onDidChangeEnvironments.fire([...discard, ...added]);
+                if (scopeDir) {
+                    await this.applyScopedRefresh(scopeDir, discovered);
+                } else {
+                    await this.applyFullRefresh(discovered);
+                }
             },
         );
+    }
+
+    /**
+     * Resolves a refresh scope Uri to a directory. If the scope points at a file (allowed by the
+     * {@link RefreshEnvironmentsScope} contract) its parent directory is returned. If the path
+     * cannot be inspected (for example it no longer exists) the scope is returned unchanged and
+     * treated as a directory, preserving the previous best-effort behavior.
+     */
+    private async resolveScopeDirectory(scope: Uri): Promise<Uri> {
+        try {
+            return Uri.file(await findParentIfFile(scope.fsPath));
+        } catch {
+            return scope;
+        }
+    }
+
+    /**
+     * Replaces the entire environment collection with the freshly discovered environments.
+     *
+     * Used for unscoped (full) refreshes where discovery is authoritative for every environment.
+     * Fires a single event that removes every previously known environment and adds every
+     * discovered one.
+     */
+    private async applyFullRefresh(discovered: PythonEnvironment[]): Promise<void> {
+        const discard = this.collection.map((env) => ({
+            kind: EnvironmentChangeKind.remove,
+            environment: env,
+        }));
+
+        this.collection = discovered;
+        await this.loadEnvMap();
+
+        const added = this.collection.map((env) => ({ environment: env, kind: EnvironmentChangeKind.add }));
+        this._onDidChangeEnvironments.fire([...discard, ...added]);
+    }
+
+    /**
+     * Merges the results of a URI-scoped discovery into the existing collection without discarding
+     * environments that live outside the refreshed scope.
+     *
+     * A scoped refresh is authoritative only for the target scope. Environments belonging to other
+     * workspace folders (including projects nested under the refreshed directory) and to global
+     * locations (such as configured `python.venvFolders`) are retained untouched so that, for
+     * example, refreshing folder A in a multi-root workspace does not remove folder B's environment.
+     * Within the target scope the previous entries are replaced by the freshly discovered ones so
+     * stale environments are dropped and new/updated metadata stays authoritative. Results are
+     * deduplicated by normalized path, and change events are fired only for real changes within the
+     * target scope: additions, removals, and in-place metadata updates (emitted as a remove of the
+     * stale entry followed by an add of the fresh one). A rediscovered environment whose metadata is
+     * unchanged emits nothing even though discovery regenerates its random id.
+     */
+    private async applyScopedRefresh(scope: Uri, discovered: PythonEnvironment[]): Promise<void> {
+        const previous = this.collection;
+        const scopeFsPath = scope.fsPath;
+
+        // An environment belongs to the refreshed scope when its path is inside the scope directory
+        // AND it is not owned by a *different* workspace project. Multi-root workspaces may nest one
+        // project inside another (e.g. folder B living physically under folder A); a nested project's
+        // environment is unrelated to a folder A refresh and must be retained, not rebuilt or dropped.
+        // When no project owns the path (globals/`venvFolders`), fall back to pure path containment.
+        const isInScope = (env: PythonEnvironment): boolean => {
+            if (!isPathInside(scopeFsPath, env.environmentPath.fsPath)) {
+                return false;
+            }
+            const owner = this.api.getPythonProject(env.environmentPath);
+            return owner === undefined || normalizePath(owner.uri.fsPath) === normalizePath(scopeFsPath);
+        };
+
+        // Retain everything outside the refreshed scope: sibling folders, nested sibling projects,
+        // and global/`venvFolders` environments.
+        const retained = previous.filter((env) => !isInScope(env));
+
+        // Only discovery results inside the target scope are authoritative for this refresh. The
+        // native finder also searches configured `venvFolders` during a scoped refresh; those
+        // out-of-scope results are ignored here so global environments are neither churned nor
+        // duplicated. Deduplicate by normalized path in case the scope overlaps a venvFolder
+        // (last write wins).
+        const scopedByPath = new Map<string, PythonEnvironment>();
+        for (const env of discovered) {
+            if (isInScope(env)) {
+                scopedByPath.set(normalizePath(env.environmentPath.fsPath), env);
+            }
+        }
+
+        const previousByPath = new Map(previous.map((env) => [normalizePath(env.environmentPath.fsPath), env]));
+
+        this.collection = [...retained, ...scopedByPath.values()];
+        await this.loadEnvMap();
+
+        // Fire events only for actual changes within the target scope. Because out-of-scope
+        // environments are retained by path, they never appear as added or removed.
+        const currentByPath = new Map(
+            this.collection.map((env) => [normalizePath(env.environmentPath.fsPath), env]),
+        );
+
+        const changes: DidChangeEnvironmentsEventArgs = [];
+        for (const [key, env] of previousByPath) {
+            if (!currentByPath.has(key)) {
+                changes.push({ environment: env, kind: EnvironmentChangeKind.remove });
+            }
+        }
+        for (const [key, env] of currentByPath) {
+            const previousEnv = previousByPath.get(key);
+            if (!previousEnv) {
+                changes.push({ environment: env, kind: EnvironmentChangeKind.add });
+            } else if (
+                previousEnv !== env &&
+                environmentMetadataSignature(previousEnv) !== environmentMetadataSignature(env)
+            ) {
+                // Same path but the discovered metadata changed (e.g. a Python version bump).
+                // Express the in-place update as remove(old)+add(new) so views re-render. A pure id
+                // churn (identical metadata, only a new random envId) emits nothing.
+                changes.push({ environment: previousEnv, kind: EnvironmentChangeKind.remove });
+                changes.push({ environment: env, kind: EnvironmentChangeKind.add });
+            }
+        }
+
+        if (changes.length > 0) {
+            this._onDidChangeEnvironments.fire(changes);
+        }
     }
 
     async getEnvironments(scope: GetEnvironmentsScope): Promise<PythonEnvironment[]> {
