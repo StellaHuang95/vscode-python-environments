@@ -4,6 +4,7 @@ import * as sinon from 'sinon';
 import { reset, when } from 'ts-mockito';
 import { PythonEnvironment, PythonEnvironmentApi } from '../../../api';
 import * as logging from '../../../common/logging';
+import { EventNames } from '../../../common/telemetry/constants';
 import * as telemetrySender from '../../../common/telemetry/sender';
 import { createDeferred } from '../../../common/utils/deferred';
 import * as windowApis from '../../../common/window.apis';
@@ -25,6 +26,7 @@ import { mockedVSCodeNamespaces } from '../../unittests';
 suite('PipenvManager.initialize - retry after failure (swallow style)', () => {
     let getPipenvStub: sinon.SinonStub;
     let refreshPipenvStub: sinon.SinonStub;
+    let sendTelemetryStub: sinon.SinonStub;
 
     setup(() => {
         // pipenv reads `workspace.getConfiguration('python').get('pipenvPath')` inline;
@@ -38,7 +40,7 @@ suite('PipenvManager.initialize - retry after failure (swallow style)', () => {
         sinon.stub(pipenvUtils, 'getPipenvForGlobal').resolves(undefined);
         sinon.stub(pipenvUtils, 'clearPipenvCache').resolves();
         sinon.stub(commonUtils, 'notifyMissingManagerIfDefault').resolves();
-        sinon.stub(telemetrySender, 'sendTelemetryEvent');
+        sendTelemetryStub = sinon.stub(telemetrySender, 'sendTelemetryEvent');
         sinon.stub(windowApis, 'withProgress').callsFake(async (_options, task) => {
             return await (task as any)({ report: sinon.stub() }, { isCancellationRequested: false } as any);
         });
@@ -126,5 +128,26 @@ suite('PipenvManager.initialize - retry after failure (swallow style)', () => {
         // The reinit's successful state must survive, so no third discovery is triggered.
         await mgr.initialize();
         assert.strictEqual(refreshPipenvStub.callCount, 2, 'a failing run must not clobber a newer deferred');
+    });
+
+    test('telemetry failure in finally settles waiters and does not surface to callers', async () => {
+        refreshPipenvStub.resolves([]);
+        // The telemetry reporter throws while the manager settles its captured deferred.
+        sendTelemetryStub.withArgs(EventNames.MANAGER_LAZY_INIT).throws(new Error('telemetry boom'));
+
+        const mgr = createManager();
+
+        // The captured deferred is resolved before telemetry runs, so a telemetry failure must
+        // neither reject initialize() (swallow-style contract) nor leave a shared waiter hanging.
+        const results = await Promise.allSettled([mgr.initialize(), mgr.initialize()]);
+        assert.ok(
+            results.every((r) => r.status === 'fulfilled'),
+            'a telemetry failure must not reject or deadlock initialize()',
+        );
+        assert.strictEqual(refreshPipenvStub.callCount, 1, 'concurrent callers share one discovery run');
+
+        // Discovery succeeded, so the guard stays set — a telemetry failure must not force re-discovery.
+        await mgr.initialize();
+        assert.strictEqual(refreshPipenvStub.callCount, 1, 'a telemetry failure must not force re-discovery');
     });
 });

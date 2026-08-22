@@ -306,6 +306,29 @@ suite('CondaEnvManager.initialize - lazy registration flow', () => {
         assert.strictEqual(refreshCondaEnvsStub.callCount, 2, 'a fresh call retries after failure');
     });
 
+    test('telemetry failure in finally settles waiters and does not surface to callers', async () => {
+        getCondaStub.resolves('/usr/bin/conda');
+        constructSourcingStub.resolves({ toString: () => '' } as any);
+        refreshCondaEnvsStub.resolves([]);
+        // The telemetry reporter throws while the manager settles its captured deferred.
+        sendTelemetryStub.withArgs(EventNames.MANAGER_LAZY_INIT).throws(new Error('telemetry boom'));
+
+        const mgr = createManager();
+
+        // The captured deferred is resolved before telemetry runs, so a telemetry failure must
+        // neither reject initialize() (swallow-style contract) nor leave a shared waiter hanging.
+        const results = await Promise.allSettled([mgr.initialize(), mgr.initialize()]);
+        assert.ok(
+            results.every((r) => r.status === 'fulfilled'),
+            'a telemetry failure must not reject or deadlock initialize()',
+        );
+        assert.strictEqual(refreshCondaEnvsStub.callCount, 1, 'concurrent callers share one discovery run');
+
+        // Discovery succeeded, so the guard stays set — a telemetry failure must not force re-discovery.
+        await mgr.initialize();
+        assert.strictEqual(refreshCondaEnvsStub.callCount, 1, 'a telemetry failure must not force re-discovery');
+    });
+
     test('tool_not_found is treated as completed init and is not retried', async () => {
         // conda is absent (throws on every lookup) but discovery itself does not throw.
         getCondaStub.rejects(new Error('Conda not found'));

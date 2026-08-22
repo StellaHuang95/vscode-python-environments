@@ -172,14 +172,20 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 this._initialized = undefined;
             }
         } finally {
-            sendTelemetryEvent(EventNames.MANAGER_LAZY_INIT, stopWatch.elapsedTime, {
-                managerName: 'conda',
-                result,
-                envCount,
-                toolSource,
-                errorType,
-            });
+            // Settle the captured deferred first so a telemetry failure can neither deadlock
+            // concurrent waiters nor turn this swallow-style initialize() into a throwing one.
             initialized.resolve();
+            try {
+                sendTelemetryEvent(EventNames.MANAGER_LAZY_INIT, stopWatch.elapsedTime, {
+                    managerName: 'conda',
+                    result,
+                    envCount,
+                    toolSource,
+                    errorType,
+                });
+            } catch (telemetryEx) {
+                traceError('Failed to send conda manager initialization telemetry', telemetryEx);
+            }
         }
     }
 

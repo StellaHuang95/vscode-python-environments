@@ -3,6 +3,7 @@ import assert from 'assert';
 import * as sinon from 'sinon';
 import { PythonEnvironmentApi } from '../../../api';
 import * as logging from '../../../common/logging';
+import { EventNames } from '../../../common/telemetry/constants';
 import * as telemetrySender from '../../../common/telemetry/sender';
 import * as windowApis from '../../../common/window.apis';
 import { PythonProjectManager } from '../../../internal.api';
@@ -22,13 +23,14 @@ import * as pyenvUtils from '../../../managers/pyenv/pyenvUtils';
 suite('PyEnvManager.initialize - retry after failure (swallow style)', () => {
     let getPyenvStub: sinon.SinonStub;
     let refreshPyenvStub: sinon.SinonStub;
+    let sendTelemetryStub: sinon.SinonStub;
 
     setup(() => {
         getPyenvStub = sinon.stub(pyenvUtils, 'getPyenv').resolves('/usr/bin/pyenv');
         refreshPyenvStub = sinon.stub(pyenvUtils, 'refreshPyenv');
         sinon.stub(pyenvUtils, 'getPyenvForGlobal').resolves(undefined);
         sinon.stub(commonUtils, 'notifyMissingManagerIfDefault').resolves();
-        sinon.stub(telemetrySender, 'sendTelemetryEvent');
+        sendTelemetryStub = sinon.stub(telemetrySender, 'sendTelemetryEvent');
         sinon.stub(windowApis, 'withProgress').callsFake(async (_options, task) => {
             return await (task as any)({ report: sinon.stub() }, { isCancellationRequested: false } as any);
         });
@@ -91,5 +93,26 @@ suite('PyEnvManager.initialize - retry after failure (swallow style)', () => {
         await mgr.initialize();
 
         assert.strictEqual(refreshPyenvStub.callCount, 1, 'tool_not_found must not cause repeated discovery');
+    });
+
+    test('telemetry failure in finally settles waiters and does not surface to callers', async () => {
+        refreshPyenvStub.resolves([]);
+        // The telemetry reporter throws while the manager settles its captured deferred.
+        sendTelemetryStub.withArgs(EventNames.MANAGER_LAZY_INIT).throws(new Error('telemetry boom'));
+
+        const mgr = createManager();
+
+        // The captured deferred is resolved before telemetry runs, so a telemetry failure must
+        // neither reject initialize() (swallow-style contract) nor leave a shared waiter hanging.
+        const results = await Promise.allSettled([mgr.initialize(), mgr.initialize()]);
+        assert.ok(
+            results.every((r) => r.status === 'fulfilled'),
+            'a telemetry failure must not reject or deadlock initialize()',
+        );
+        assert.strictEqual(refreshPyenvStub.callCount, 1, 'concurrent callers share one discovery run');
+
+        // Discovery succeeded, so the guard stays set — a telemetry failure must not force re-discovery.
+        await mgr.initialize();
+        assert.strictEqual(refreshPyenvStub.callCount, 1, 'a telemetry failure must not force re-discovery');
     });
 });
