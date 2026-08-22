@@ -8,6 +8,7 @@ import { EnvironmentChangeKind, PythonEnvironmentApi, PythonProject } from '../.
 import * as logging from '../../../common/logging';
 import * as telemetrySender from '../../../common/telemetry/sender';
 import * as windowApis from '../../../common/window.apis';
+import { createDeferred } from '../../../common/utils/deferred';
 import * as commonUtils from '../../../managers/common/utils';
 import { NativePythonFinder } from '../../../managers/common/nativePythonFinder';
 import { CondaEnvManager } from '../../../managers/conda/condaEnvManager';
@@ -248,20 +249,134 @@ suite('CondaEnvManager - result preservation on discovery failure', () => {
         const second = await mgr.get(workspaceUri);
         assert.strictEqual(second, persistedEnv, 'persisted selection retained after settled init');
 
-        // Only genuine additions are emitted; never removals.
+        // Never a removal on a failed discovery. The persisted env may be announced by the
+        // background recovery, or silently registered by the fast path (whichever wins the
+        // race), so at most one add is expected for it — and never a duplicate.
         const removed = events.filter((e) => e.kind === EnvironmentChangeKind.remove);
         assert.strictEqual(removed.length, 0, 'no removals on failed background discovery');
-        const addedNames = [
-            ...new Set(
-                events.filter((e) => e.kind === EnvironmentChangeKind.add).map((e) => e.environment.name),
-            ),
-        ];
-        assert.deepStrictEqual(addedNames, ['wsenv'], 'only the restored persisted env is added');
-
-        // Collection/map remain usable.
-        assert.ok(
-            (await mgr.getEnvironments('all')).some((e) => e.name === 'wsenv'),
-            'restored persisted env is present in the collection',
+        const wsAdds = events.filter(
+            (e) => e.kind === EnvironmentChangeKind.add && e.environment.name === 'wsenv',
         );
+        assert.ok(wsAdds.length <= 1, `expected at most one add for the persisted env, got ${wsAdds.length}`);
+
+        // Collection/map remain usable and contain exactly one entry for the persisted env.
+        const wsInCollection = (await mgr.getEnvironments('all')).filter((e) => e.name === 'wsenv');
+        assert.strictEqual(wsInCollection.length, 1, 'exactly one collection entry for the persisted env');
+    });
+
+    test('fast get registers the resolved env so a failed background re-resolution cannot lose it', async () => {
+        // A workspace project with a persisted conda selection.
+        const workspaceUri = Uri.file(path.resolve('ws-conda-register'));
+        const project = { uri: workspaceUri } as PythonProject;
+        const api = {
+            getPythonProjects: sinon.stub().returns([project]),
+            getPythonProject: sinon.stub().returns(project),
+        } as any as PythonEnvironmentApi;
+        const mgr = new CondaEnvManager(
+            {} as NativePythonFinder,
+            api,
+            { info: sinon.stub(), error: sinon.stub(), warn: sinon.stub() } as any,
+        );
+
+        const persistedPath = Uri.file(path.resolve('ws-conda-register', '.conda')).fsPath;
+        const persistedEnv = makeEnv('wsreg', persistedPath, '3.10.0');
+        getCondaForWorkspaceStub.resolves(persistedPath);
+        sinon.stub(fs.promises, 'access').resolves();
+
+        // Hold background discovery until the fast path has resolved AND registered the env, so
+        // the (failing) recovery below runs strictly after registration.
+        const refreshGate = createDeferred<void>();
+        refreshCondaEnvsStub.callsFake(async () => {
+            await refreshGate.promise;
+            return undefined; // discovery fails
+        });
+        // The fast-path resolution succeeds; every later resolution fails. Without registration,
+        // the failed background re-resolution would drop the environment (data loss).
+        resolveCondaPathStub.onFirstCall().resolves(persistedEnv);
+        resolveCondaPathStub.resolves(undefined);
+
+        const events = collectEvents(mgr);
+
+        // First get: fast path resolves the env and registers it into the collection/map.
+        const first = await mgr.get(workspaceUri);
+        assert.strictEqual(first, persistedEnv, 'fast path returns the persisted env');
+
+        // Now allow the (failing) background discovery + recovery to run.
+        refreshGate.resolve();
+        await (mgr as any)._initialized?.promise;
+        await new Promise((resolve) => setImmediate(resolve));
+
+        // Recovery reused the registered env by identity instead of re-resolving it, so
+        // resolveCondaPath was called exactly once (the fast path). A second, failing call would
+        // otherwise have lost the environment.
+        assert.strictEqual(resolveCondaPathStub.callCount, 1, 'background recovery reused the registered env');
+
+        // Repeated get still returns the same environment.
+        const second = await mgr.get(workspaceUri);
+        assert.strictEqual(second, persistedEnv, 'persisted selection retained after a failed re-resolution');
+
+        // No removals, no duplicate add, and exactly one collection entry.
+        const removed = events.filter((e) => e.kind === EnvironmentChangeKind.remove);
+        assert.strictEqual(removed.length, 0, 'no removals');
+        const adds = events.filter((e) => e.kind === EnvironmentChangeKind.add && e.environment.name === 'wsreg');
+        assert.ok(adds.length <= 1, `expected at most one add, got ${adds.length}`);
+        const inCollection = (await mgr.getEnvironments('all')).filter((e) => e.name === 'wsreg');
+        assert.strictEqual(inCollection.length, 1, 'exactly one collection entry');
+    });
+
+    test('failed-discovery recovery does not duplicate a concurrent create/resolve append', async () => {
+        // A clean, successful initialization with nothing persisted.
+        refreshCondaEnvsStub.resolves([]);
+        getCondaForGlobalStub.resolves(undefined);
+
+        const mgr = createManager();
+        await mgr.initialize();
+        assert.strictEqual(resolveCondaPathStub.callCount, 0, 'precondition: no resolutions during clean init');
+
+        const events = collectEvents(mgr);
+
+        // Trigger a failed-discovery recovery whose loadEnvMap must restore a persisted global
+        // selection. Pause that resolution so a concurrent resolve() can append the same env.
+        const persistedGlobalPath = Uri.file(path.resolve('opt', 'miniconda3', 'envs', 'concurrent')).fsPath;
+        const persistedEnv = makeEnv('concurrent', persistedGlobalPath, '3.10.0');
+        getCondaForGlobalStub.resolves(persistedGlobalPath);
+        refreshCondaEnvsStub.resolves(undefined);
+
+        const resolveGate = createDeferred<void>();
+        const firstResolveReached = createDeferred<void>();
+        // The first resolveCondaPath call is loadEnvMap's global resolve: signal that it was
+        // reached, then block until released. Every later call (the concurrent resolve()) returns
+        // immediately. Awaiting `firstResolveReached` below makes ordering signal-based rather
+        // than timing-based, so no fixed pump/positional assumption can deadlock this test.
+        let resolveCallIndex = 0;
+        resolveCondaPathStub.callsFake(async () => {
+            const index = resolveCallIndex++;
+            if (index === 0) {
+                firstResolveReached.resolve();
+                await resolveGate.promise;
+            }
+            return persistedEnv;
+        });
+
+        // Kick off the recovery; it pauses inside loadEnvMap awaiting resolveGate.
+        const refreshPromise = mgr.refresh(undefined);
+        await firstResolveReached.promise;
+
+        // Concurrently, a resolve() appends the same environment and emits its own single add.
+        const resolved = await mgr.resolve(Uri.file(persistedGlobalPath));
+        assert.strictEqual(resolved, persistedEnv, 'concurrent resolve returns the environment');
+
+        // Release the paused recovery resolution; it must reuse the just-appended env by identity.
+        resolveGate.resolve();
+        await refreshPromise;
+
+        // Exactly one collection entry and exactly one raw add event — recovery emitted nothing
+        // extra for the concurrently-inserted environment.
+        const inCollection = (await mgr.getEnvironments('all')).filter((e) => e.name === 'concurrent');
+        assert.strictEqual(inCollection.length, 1, 'exactly one collection entry for the concurrent env');
+        const adds = events.filter((e) => e.kind === EnvironmentChangeKind.add && e.environment.name === 'concurrent');
+        assert.strictEqual(adds.length, 1, 'exactly one add event for the concurrent env');
+        const removed = events.filter((e) => e.kind === EnvironmentChangeKind.remove);
+        assert.strictEqual(removed.length, 0, 'no removals on the failed-discovery path');
     });
 });
