@@ -232,6 +232,46 @@ suite('PythonEnvironmentApiImpl - manager failure isolation', () => {
         });
     });
 
+    suite('getEnvironments(global)', () => {
+        test('partial success: one manager failing does not hide the others, and the scope is forwarded', async () => {
+            const globalEnv = makeEnv('global-one');
+            const scopeAware = {
+                id: 'm1',
+                displayName: 'm1',
+                // Only returns environments when queried with the 'global' scope, proving the scope
+                // is forwarded to each manager rather than hard-coded to 'all'.
+                getEnvironments: async (scope: unknown) => (scope === 'global' ? [globalEnv] : []),
+                refresh: async () => {},
+            } as unknown as InternalEnvironmentManager;
+            currentManagers = [scopeAware, makeManager('m2', { getError: new Error('m2 boom') })];
+
+            const result = await api.getEnvironments('global');
+
+            assert.deepStrictEqual(
+                result.map((e) => e.envId.id),
+                ['global-one'],
+                'global scope should return successful managers only and forward the scope',
+            );
+            assert.ok(errorLoggedFor('m2'), 'failing manager id should be logged for the global scope');
+        });
+
+        test('total failure: throws AggregateEnvironmentError with all reasons', async () => {
+            const err1 = new Error('global-first');
+            const err2 = new Error('global-second');
+            currentManagers = [makeManager('m1', { getError: err1 }), makeManager('m2', { getError: err2 })];
+
+            await assert.rejects(
+                () => api.getEnvironments('global'),
+                (err: unknown) => {
+                    assert.ok(err instanceof AggregateEnvironmentError, 'should throw AggregateEnvironmentError');
+                    assert.deepStrictEqual(err.errors, [err1, err2], 'should carry all reasons in manager order');
+                    return true;
+                },
+            );
+            assert.ok(errorLoggedFor('m1') && errorLoggedFor('m2'), 'both failures should be logged');
+        });
+    });
+
     suite('refreshEnvironments(undefined)', () => {
         test('partial success: completes even though one manager fails', async () => {
             let m3Refreshed = false;
