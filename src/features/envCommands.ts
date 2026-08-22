@@ -462,23 +462,13 @@ export async function setEnvironmentCommand(
                 }
             } else {
                 const globalEnvManager = em.getEnvironmentManager(undefined);
-                // Seed the recommendation synchronously so the picker opens immediately; the
-                // authoritative value is resolved after the picker is shown via resolveRecommended.
-                // The last-known cache is scope-keyed ('global'), not manager-keyed, so it can hold
-                // an env owned by a manager that is no longer the current one. Only seed an entry the
-                // current global manager owns, so the synchronous seed matches what the authoritative
-                // resolveRecommended (globalEnvManager.get()) will return and the pre-streaming
-                // semantics (recommended was always the current manager's env). An unowned stale seed
-                // is at best inconsistent and, if its manager has since been unregistered, is silently
-                // dropped by setEnvironments on selection.
-                const lastKnownGlobal = globalEnvManager ? em.getLastKnownEnvironment(undefined) : undefined;
-                const recommended =
-                    globalEnvManager && lastKnownGlobal?.envId.managerId === globalEnvManager.id
-                        ? lastKnownGlobal
-                        : undefined;
+                // Open the picker immediately with Browse/Create and the streaming manager sections; the
+                // recommended environment is resolved authoritatively after show via resolveRecommended
+                // (the global manager's get()), so a slow/pending get() never delays opening and no
+                // stale, ownership-ambiguous last-known value is guessed synchronously. A delegating
+                // manager returning a base/System environment is handled by the resolver like any other.
                 const selected = await pickEnvironment(em.managers, globalEnvManager ? [globalEnvManager] : [], {
                     projects: [],
-                    recommended,
                     resolveRecommended: globalEnvManager ? () => globalEnvManager.get(undefined) : undefined,
                     showBackButton: false,
                 });
@@ -497,22 +487,11 @@ export async function setEnvironmentCommand(
         const projects = wm.getProjects(uris).map((p) => p);
         const projectEnvManagers = em.getProjectEnvManagers(uris);
         const canRecommend = projectEnvManagers.length === 1 && uris.length === 1;
-        // Seed synchronously from the last-known environment so the picker opens immediately; the
-        // authoritative value is resolved after the picker is shown via resolveRecommended. The
-        // last-known cache is scope-keyed (project URI), not manager-keyed, so it can hold an env
-        // owned by a manager that is no longer the current one. Only seed an entry the current
-        // project manager owns, so the synchronous seed matches what the authoritative
-        // resolveRecommended (projectEnvManagers[0].get()) will return and the pre-streaming
-        // semantics. An unowned stale seed is at best inconsistent and, if its manager has since
-        // been unregistered, is silently dropped by setEnvironments on selection.
-        const lastKnownProject = canRecommend ? em.getLastKnownEnvironment(uris[0]) : undefined;
-        const recommended =
-            canRecommend && lastKnownProject?.envId.managerId === projectEnvManagers[0].id
-                ? lastKnownProject
-                : undefined;
+        // Open the picker immediately; the recommended environment is resolved authoritatively after
+        // show via resolveRecommended (the project manager's get()), so a slow/pending get() never
+        // delays opening and no stale, ownership-ambiguous last-known value is guessed synchronously.
         const selected = await pickEnvironment(em.managers, projectEnvManagers, {
             projects,
-            recommended,
             resolveRecommended: canRecommend ? () => projectEnvManagers[0].get(uris[0]) : undefined,
             showBackButton: uris.length > 1,
         });

@@ -43,13 +43,15 @@ function getIconPath(i: IconPath | undefined): QuickPickIcon {
 }
 
 interface EnvironmentPickOptions {
-    recommended?: PythonEnvironment;
     showBackButton?: boolean;
     projects: PythonProject[];
     /**
      * Optional async resolver for the recommended environment, run **after** the picker is shown so a
-     * slow default-manager `get()` never delays the picker from opening. Its result refines the
-     * synchronously-seeded {@link recommended} value via the streaming controller.
+     * slow default-manager `get()` never delays the picker from opening. It is the sole, authoritative
+     * source for the recommended item: the picker opens immediately with only Browse/Create and the
+     * streaming manager sections, and the recommended slot appears (deduplicated against the sections)
+     * once this resolves. A rejected or `undefined` result simply leaves no recommendation shown, and a
+     * delegating manager (e.g. Venv resolving to a System environment) is fully supported.
      */
     resolveRecommended?: () => Promise<PythonEnvironment | undefined>;
 }
@@ -240,9 +242,10 @@ export async function pickEnvironment(
         },
     ];
 
-    // The recommendation is seeded synchronously (typically from the last-known environment) so the
-    // picker opens immediately, then refined asynchronously by options.resolveRecommended after show.
-    let recommendedEnv: PythonEnvironment | undefined = options?.recommended;
+    // The recommendation is resolved asynchronously by options.resolveRecommended after the picker is
+    // shown (see onDidShow); nothing is seeded synchronously, so a slow, rejected, or delegating
+    // default-manager get() never delays opening nor forces a stale/ownership-ambiguous guess up front.
+    let recommendedEnv: PythonEnvironment | undefined;
     const recommendedSeparator: QuickPickItem = { label: Common.recommended, kind: QuickPickItemKind.Separator };
 
     // One canonical item object per environment identity, reused across rebuilds. When an
@@ -307,6 +310,7 @@ export async function pickEnvironment(
         manager: InternalEnvironmentManager,
         controller: QuickPickController<EnvironmentPickItem>,
     ): Promise<void> => {
+        let section: ManagerSection | undefined;
         try {
             const envs = await manager.getEnvironments('all');
             const deduped: { key: string; env: PythonEnvironment }[] = [];
@@ -319,20 +323,29 @@ export async function pickEnvironment(
                 localKeys.add(key);
                 deduped.push({ key, env });
             }
-            sections.set(manager.id, {
+            section = {
                 separator: {
                     label: manager.displayName,
                     kind: QuickPickItemKind.Separator,
                 },
                 envs: deduped,
-            });
+            };
         } catch (err) {
             traceError(
                 `[pickEnvironment] Failed to load environments for manager "${manager.id}"; section skipped.`,
                 err,
             );
         }
-        // Stream whatever has loaded so far; no-ops if the picker has already been closed.
+        // Once the picker has settled (accepted/back/cancelled/disposed) never touch shared section or
+        // canonical-item state: buildItems() rewrites canonical item objects in place, which would
+        // otherwise change the result of an already-accepted item. The synchronous work below is safe
+        // because nothing awaits between this guard and setItems().
+        if (controller.settled) {
+            return;
+        }
+        if (section) {
+            sections.set(manager.id, section);
+        }
         controller.setItems(buildItems());
     };
 
@@ -340,14 +353,23 @@ export async function pickEnvironment(
         if (!options?.resolveRecommended) {
             return;
         }
+        let resolved: PythonEnvironment | undefined;
         try {
-            // The resolver is authoritative for the recommendation, matching the pre-streaming
-            // behavior where the awaited manager.get() was the sole source: an undefined result
-            // clears a stale seed rather than leaving it shown.
-            recommendedEnv = await options.resolveRecommended();
+            // The resolver is the sole, authoritative source for the recommendation, matching the
+            // pre-streaming behavior where the awaited manager.get() was the only source. It runs after
+            // show so a slow get() never blocks opening; a rejected/undefined result leaves no
+            // recommendation. A delegating manager (e.g. Venv resolving to a System env) is fully
+            // supported: whatever env it returns becomes the recommendation, deduped against the
+            // sections by identity.
+            resolved = await options.resolveRecommended();
         } catch (err) {
             traceError('[pickEnvironment] Failed to resolve the recommended environment.', err);
         }
+        // See loadManager: never mutate canonical/section state or rebuild after the picker has settled.
+        if (controller.settled) {
+            return;
+        }
+        recommendedEnv = resolved;
         controller.setItems(buildItems());
     };
 

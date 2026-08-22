@@ -12,9 +12,9 @@ import { createDeferred } from '../../common/utils/deferred';
 import { InternalEnvironmentManager } from '../../internal.api';
 import { FakeQuickPick, flush, useFakeQuickPick } from './fakeQuickPick';
 
-function makeEnv(id: string, execPath: string, displayName = id): PythonEnvironment {
+function makeEnv(id: string, execPath: string, displayName = id, managerId = 'test-manager'): PythonEnvironment {
     return {
-        envId: { id, managerId: 'test-manager' },
+        envId: { id, managerId },
         name: id,
         displayName,
         displayPath: execPath,
@@ -142,17 +142,23 @@ suite('pickEnvironment - streaming environment sections', () => {
         await pick;
     });
 
-    test('recommended environment is not duplicated in its manager section', async () => {
-        const recommended = makeEnv('rec', '/p/rec', 'Recommended Env');
+    test('a recommended environment is not duplicated in its manager section (recommendation first)', async () => {
         const m1 = controllableManager('m1', 'One');
-        const pick = pickEnvironment([m1.manager], [], { projects: [], recommended });
+        const recDeferred = createDeferred<PythonEnvironment | undefined>();
+        const pick = pickEnvironment([m1.manager], [], {
+            projects: [],
+            resolveRecommended: () => recDeferred.promise,
+        });
 
-        assert.deepStrictEqual(labels(), [
-            ...STATIC_LABELS,
-            Common.recommended,
-            'Recommended Env',
-        ]);
+        // Opens with only Browse/Create; the recommendation is resolved asynchronously after show.
+        assert.deepStrictEqual(labels(), STATIC_LABELS);
 
+        // The recommendation resolves BEFORE the manager section.
+        recDeferred.resolve(makeEnv('rec', '/p/rec', 'Recommended Env'));
+        await flush();
+        assert.deepStrictEqual(labels(), [...STATIC_LABELS, Common.recommended, 'Recommended Env']);
+
+        // The manager then lists the same environment plus another; the recommended one is skipped.
         m1.resolve([makeEnv('rec-dup', '/p/rec'), makeEnv('other', '/p/other')]);
         await flush();
 
@@ -397,7 +403,7 @@ suite('pickEnvironment - streaming environment sections', () => {
             resolveRecommended: () => recDeferred.promise,
         });
 
-        // No recommended section yet (the synchronous seed was undefined).
+        // No recommended section yet (it is resolved asynchronously after show).
         assert.deepStrictEqual(labels(), STATIC_LABELS);
 
         m1.resolve([makeEnv('shared', '/p/shared', 'Shared Env'), makeEnv('other', '/p/other', 'Other')]);
@@ -461,32 +467,122 @@ suite('pickEnvironment - streaming environment sections', () => {
         await pick;
     });
 
-    test('an authoritative resolver returning undefined clears a stale seeded recommendation', async () => {
+    test('a recommendation resolver returning undefined shows no recommended section', async () => {
         const m1 = controllableManager('m1', 'One');
         const recDeferred = createDeferred<PythonEnvironment | undefined>();
         const pick = pickEnvironment([m1.manager], [], {
             projects: [],
-            recommended: makeEnv('stale', '/p/stale', 'Stale Rec'),
             resolveRecommended: () => recDeferred.promise,
         });
 
-        // The synchronous seed is shown as the recommendation immediately.
-        assert.deepStrictEqual(labels(), [...STATIC_LABELS, Common.recommended, 'Stale Rec']);
-
         m1.resolve([makeEnv('e1', '/p/e1', 'Env One')]);
         await flush();
+        assert.deepStrictEqual(labels(), [...STATIC_LABELS, 'One', 'Env One']);
 
-        // The authoritative resolver returns undefined: the stale seed is cleared, matching the
-        // pre-streaming behavior where the awaited manager.get() was the sole source.
+        // The authoritative resolver yields no recommendation: nothing is added at the top.
         recDeferred.resolve(undefined);
         await flush();
         assert.deepStrictEqual(
             labels(),
             [...STATIC_LABELS, 'One', 'Env One'],
-            'an undefined authoritative recommendation removes the stale seed',
+            'an undefined authoritative recommendation adds no recommended section',
         );
 
         fake.cancel();
         await pick;
+    });
+
+    test('an accepted item is not mutated by a late higher-priority duplicate (result cannot change)', async () => {
+        // Lower-priority Beta resolves first and publishes an env the user accepts; higher-priority
+        // Alpha then resolves LATE with the same identity. The accepted item's underlying environment
+        // must not be rewritten by the late completion (buildItems mutates canonical items in place).
+        const mA = controllableManager('mA', 'Alpha');
+        const mB = controllableManager('mB', 'Beta');
+        const pick = pickEnvironment([mA.manager, mB.manager], [], { projects: [] });
+
+        mB.resolve([makeEnv('beta-env', '/p/shared')]);
+        await flush();
+        const item = fake.items.find((i) => i.label === 'beta-env')!;
+        fake.accept(item);
+
+        // Higher-priority Alpha resolves after the accept; the guard must stop it mutating the result.
+        mA.resolve([makeEnv('alpha-env', '/p/shared')]);
+        await flush();
+
+        const result = await pick;
+        assert.strictEqual(
+            result?.envId.id,
+            'beta-env',
+            'the accepted environment must not change when a late higher-priority duplicate arrives',
+        );
+    });
+
+    test('an accepted item is not mutated by a late recommendation (result cannot change)', async () => {
+        // The user accepts a manager-section env; a late recommendation for the SAME identity then
+        // resolves. The recommendation completion must not rewrite the already-accepted item's result.
+        const m1 = controllableManager('m1', 'One');
+        const recDeferred = createDeferred<PythonEnvironment | undefined>();
+        const pick = pickEnvironment([m1.manager], [], {
+            projects: [],
+            resolveRecommended: () => recDeferred.promise,
+        });
+
+        m1.resolve([makeEnv('env-1', '/p/shared', 'Shared Env')]);
+        await flush();
+        const item = fake.items.find((i) => i.label === 'Shared Env')!;
+        fake.accept(item);
+
+        // A late recommendation for the same identity resolves after the accept.
+        recDeferred.resolve(makeEnv('env-1-rec', '/p/shared', 'Shared Env'));
+        await flush();
+
+        const result = await pick;
+        assert.strictEqual(
+            result?.envId.id,
+            'env-1',
+            'the accepted environment must not change when a late recommendation arrives',
+        );
+    });
+
+    test('a delegated recommendation (different managerId) still opens immediately and appears when resolved', async () => {
+        // VenvManager legitimately delegates: its get() can return a base/System environment whose
+        // managerId differs from the venv manager. With synchronous seeding removed there is no
+        // ownership gating, so the resolved delegated env must still open the picker without delay and
+        // then appear as the recommendation.
+        const venv = controllableManager('venv', 'Venv');
+        const recDeferred = createDeferred<PythonEnvironment | undefined>();
+        const pick = pickEnvironment([venv.manager], [], {
+            projects: [],
+            resolveRecommended: () => recDeferred.promise,
+        });
+
+        // Opens immediately with only Browse/Create despite the pending delegated get().
+        assert.ok(fake.shown, 'picker opens without awaiting the delegated recommendation');
+        assert.deepStrictEqual(labels(), STATIC_LABELS);
+
+        venv.resolve([]); // Venv lists no environments of its own.
+        await flush();
+
+        // The delegated System environment resolves late and must be shown as the recommendation.
+        const systemEnv = makeEnv(
+            'system-3.12',
+            '/usr/bin/python3.12',
+            'Python 3.12 (system)',
+            'ms-python.python:system',
+        );
+        recDeferred.resolve(systemEnv);
+        await flush();
+
+        assert.deepStrictEqual(
+            labels(),
+            [...STATIC_LABELS, Common.recommended, 'Python 3.12 (system)'],
+            'a delegated System environment must appear as the recommendation',
+        );
+
+        // Accepting it returns the delegated environment, with its own (System) managerId, unchanged.
+        fake.accept(fake.items.find((i) => i.label === 'Python 3.12 (system)')!);
+        const result = await pick;
+        assert.strictEqual(result?.envId.id, 'system-3.12');
+        assert.strictEqual(result?.envId.managerId, 'ms-python.python:system');
     });
 });
