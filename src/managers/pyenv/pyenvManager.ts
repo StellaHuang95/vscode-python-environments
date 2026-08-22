@@ -81,7 +81,8 @@ export class PyEnvManager implements EnvironmentManager, Disposable {
         if (this._initialized) {
             return this._initialized.promise;
         }
-        this._initialized = createDeferred();
+        const initialized = createDeferred<void>();
+        this._initialized = initialized;
         const stopWatch = new StopWatch();
         let result: 'success' | 'tool_not_found' | 'error' = 'success';
         let envCount = 0;
@@ -128,15 +129,26 @@ export class PyEnvManager implements EnvironmentManager, Disposable {
             result = 'error';
             errorType = classifyError(ex);
             traceError('Pyenv lazy initialization failed', ex);
+            // Discovery threw: clear the guard so a later call can retry initialization, but only
+            // if this run still owns it (don't clobber a deferred a concurrent reset installed).
+            if (this._initialized === initialized) {
+                this._initialized = undefined;
+            }
         } finally {
-            sendTelemetryEvent(EventNames.MANAGER_LAZY_INIT, stopWatch.elapsedTime, {
-                managerName: 'pyenv',
-                result,
-                envCount,
-                toolSource,
-                errorType,
-            });
-            this._initialized.resolve();
+            // Settle the captured deferred first so a telemetry failure can neither deadlock
+            // concurrent waiters nor turn this swallow-style initialize() into a throwing one.
+            initialized.resolve();
+            try {
+                sendTelemetryEvent(EventNames.MANAGER_LAZY_INIT, stopWatch.elapsedTime, {
+                    managerName: 'pyenv',
+                    result,
+                    envCount,
+                    toolSource,
+                    errorType,
+                });
+            } catch (telemetryEx) {
+                traceError('Failed to send pyenv manager initialization telemetry', telemetryEx);
+            }
         }
     }
 
@@ -192,6 +204,7 @@ export class PyEnvManager implements EnvironmentManager, Disposable {
             setInitialized: (deferred) => {
                 this._initialized = deferred;
             },
+            getInitialized: () => this._initialized,
             scope,
             label: 'pyenv',
             getProjectFsPath: (s) => getProjectFsPathForScope(this.api, s),

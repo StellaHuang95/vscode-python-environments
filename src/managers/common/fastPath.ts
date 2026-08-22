@@ -18,6 +18,13 @@ export interface FastPathOptions {
     initialized: Deferred<void> | undefined;
     /** Updates the manager's _initialized deferred. */
     setInitialized: (initialized: Deferred<void> | undefined) => void;
+    /**
+     * Reads the manager's current _initialized deferred. Used to make background-init failure
+     * resets ownership-aware: the guard is only cleared if it still points at the deferred THIS
+     * fast-path run installed, so a stale failure can never erase a newer successful
+     * initialization (e.g. a concurrent clearCache()+init or a newer fast-path run).
+     */
+    getInitialized: () => Deferred<void> | undefined;
     /** The scope passed to get(). */
     scope: GetEnvironmentScope;
     /** Label for log messages, e.g. 'venv', 'conda'. */
@@ -101,14 +108,21 @@ export async function tryFastPathGet(opts: FastPathOptions): Promise<FastPathRes
                 () => deferredRef.resolve(),
                 (err) => {
                     traceError(`[${opts.label}] Background initialization failed:`, err);
-                    // Allow subsequent get()/initialize() calls to retry after a background init failure.
-                    opts.setInitialized(undefined);
+                    // Allow subsequent get()/initialize() calls to retry after a background init
+                    // failure — but only clear the guard if it still points at the deferred THIS
+                    // run installed. A newer initialization may have already replaced it, and a
+                    // stale failure must not erase that newer (possibly successful) state.
+                    if (opts.getInitialized() === deferredRef) {
+                        opts.setInitialized(undefined);
+                    }
                     deferredRef.resolve();
                 },
             );
         } catch (syncErr) {
             traceError(`[${opts.label}] Background initialization threw synchronously:`, syncErr);
-            opts.setInitialized(undefined);
+            if (opts.getInitialized() === deferredRef) {
+                opts.setInitialized(undefined);
+            }
             deferredRef.resolve();
         }
     }
