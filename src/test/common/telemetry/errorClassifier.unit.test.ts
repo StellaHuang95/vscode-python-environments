@@ -2,7 +2,7 @@ import assert from 'node:assert';
 import { CancellationError } from 'vscode';
 import * as rpc from 'vscode-jsonrpc/node';
 import { BaseError } from '../../../common/errors/types';
-import { classifyError, isTimeoutErrorType } from '../../../common/telemetry/errorClassifier';
+import { classifyError, isPetConnectionLostError, isTimeoutErrorType } from '../../../common/telemetry/errorClassifier';
 import { RpcTimeoutError } from '../../../managers/common/nativePythonFinder';
 
 suite('Error Classifier', () => {
@@ -86,6 +86,16 @@ suite('Error Classifier', () => {
             assert.strictEqual(classifyError(new rpc.ResponseError(-32601, 'Method not found')), 'rpc_error');
         });
 
+        test('should classify PendingResponseRejected ResponseError as connection_error', () => {
+            // Ending a dead PET child's streams disposes the connection, which rejects in-flight
+            // requests with this code rather than a ConnectionError. It must be treated as a
+            // connection loss, NOT a generic rpc_error, so recovery/telemetry stay accurate.
+            assert.strictEqual(
+                classifyError(new rpc.ResponseError(rpc.ErrorCodes.PendingResponseRejected, 'Pending response rejected')),
+                'connection_error',
+            );
+        });
+
         test('should classify BaseError subclasses as already_registered', () => {
             // Using a concrete subclass to test (BaseError is abstract)
             class TestRegisteredError extends BaseError {
@@ -127,6 +137,34 @@ suite('Error Classifier', () => {
                 classifyError(new Error('Failed to create stdio streams for PET process')),
                 'process_crash',
             );
+        });
+    });
+
+    suite('isPetConnectionLostError', () => {
+        test('recognizes JSON-RPC ConnectionError (transport failure)', () => {
+            assert.strictEqual(
+                isPetConnectionLostError(new rpc.ConnectionError(rpc.ConnectionErrors.Closed, 'closed')),
+                true,
+            );
+            assert.strictEqual(
+                isPetConnectionLostError(new rpc.ConnectionError(rpc.ConnectionErrors.Disposed, 'disposed')),
+                true,
+            );
+        });
+
+        test('recognizes PendingResponseRejected ResponseError (connection disposed mid-request)', () => {
+            assert.strictEqual(
+                isPetConnectionLostError(new rpc.ResponseError(rpc.ErrorCodes.PendingResponseRejected, 'rejected')),
+                true,
+            );
+        });
+
+        test('does NOT match other ResponseError codes or unrelated errors', () => {
+            assert.strictEqual(isPetConnectionLostError(new rpc.ResponseError(-32600, 'Invalid request')), false);
+            assert.strictEqual(isPetConnectionLostError(new RpcTimeoutError('refresh', 30000)), false);
+            assert.strictEqual(isPetConnectionLostError(new Error('boom')), false);
+            assert.strictEqual(isPetConnectionLostError('nope'), false);
+            assert.strictEqual(isPetConnectionLostError(undefined), false);
         });
     });
 

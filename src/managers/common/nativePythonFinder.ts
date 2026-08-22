@@ -11,7 +11,7 @@ import { getExtension } from '../../common/extension.apis';
 import { traceError, traceVerbose, traceWarn } from '../../common/logging';
 import { StopWatch } from '../../common/stopWatch';
 import { EventNames } from '../../common/telemetry/constants';
-import { classifyError, isTimeoutErrorType } from '../../common/telemetry/errorClassifier';
+import { classifyError, isPetConnectionLostError, isTimeoutErrorType } from '../../common/telemetry/errorClassifier';
 import { sendTelemetryEvent } from '../../common/telemetry/sender';
 import { untildify, untildifyArray } from '../../common/utils/pathUtils';
 import { isWindows } from '../../common/utils/platformUtils';
@@ -365,6 +365,7 @@ export class NativePythonFinderImpl implements NativePythonFinder {
     private startFailed: boolean = false;
     private restartAttempts: number = 0;
     private isRestarting: boolean = false;
+    private disposed: boolean = false;
     private processExitReason: string | undefined = undefined;
     private readonly configureRetry = new ConfigureRetryState();
     /**
@@ -411,15 +412,19 @@ export class NativePythonFinderImpl implements NativePythonFinder {
                 });
                 return environment;
             } catch (ex) {
-                // On resolve timeout or connection error (not configure — configure handles its own timeout),
-                // kill the hung process so next request triggers restart
-                if ((ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError) {
-                    const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
+                // On resolve timeout or a recoverable connection loss (crash mid-request; not
+                // configure — configure handles its own timeout), kill the hung/dead process so the
+                // next request triggers a restart.
+                if (
+                    (ex instanceof RpcTimeoutError && ex.method !== 'configure') ||
+                    this.isRecoverableConnectionLoss(ex)
+                ) {
+                    const reason = ex instanceof RpcTimeoutError ? 'timed out' : 'crashed';
                     this.outputChannel.warn(`[pet] Resolve request ${reason}, killing process for restart`);
                     this.killProcess();
                     this.processExited = true;
                     this.processExitReason =
-                        ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_resolve_timeout';
+                        ex instanceof RpcTimeoutError ? 'rpc_resolve_timeout' : 'rpc_connection_error';
                 }
                 throw ex;
             }
@@ -442,6 +447,20 @@ export class NativePythonFinderImpl implements NativePythonFinder {
             }
             throw ex;
         }
+    }
+
+    /**
+     * True when `ex` is a PET connection-loss error that recovery logic should treat as a
+     * recoverable crash (kill + restart + retry). Delegates the error-shape check to the shared
+     * {@link isPetConnectionLostError} classifier, then filters out self-inflicted losses:
+     *  - `isRestarting`: restart() disposes the old connection, rejecting its in-flight requests
+     *    with PendingResponseRejected. Those stale rejections must NOT trigger a second restart or
+     *    kill the freshly-started replacement child.
+     *  - `disposed`: dispose() disposes the connection during extension shutdown; that rejection is
+     *    intentional teardown, not a crash to recover from.
+     */
+    private isRecoverableConnectionLoss(ex: unknown): boolean {
+        return !this.disposed && !this.isRestarting && isPetConnectionLostError(ex);
     }
 
     /**
@@ -652,6 +671,10 @@ export class NativePythonFinderImpl implements NativePythonFinder {
     }
 
     public dispose() {
+        // Mark disposed BEFORE tearing anything down so the connection-close rejections triggered
+        // by disposing startDisposables/connection below are recognized as intentional shutdown and
+        // never mistaken for a recoverable crash (see isRecoverableConnectionLoss).
+        this.disposed = true;
         this.pool.stop();
         this.startDisposables.forEach((d) => d.dispose());
         this.connection.dispose();
@@ -700,11 +723,22 @@ export class NativePythonFinderImpl implements NativePythonFinder {
         // any in-flight requests reject promptly instead of waiting out their 30-60s timeouts.
         // Idempotent so the exit/error handlers and explicit disposal can all call it safely.
         let streamsEnded = false;
+        // Captured once the child is spawned so endStreams() can detach its stdout before ending
+        // `readable`. `exit` can fire while stdout still has buffered bytes queued for `readable`;
+        // if stdout stayed piped, ending `readable` first would make those late bytes a write to an
+        // already-ended stream (ERR_STREAM_WRITE_AFTER_END), which escapes once the reader's own
+        // error handler is torn down.
+        let childStdout: NodeJS.ReadableStream | undefined;
         const endStreams = () => {
             if (streamsEnded) {
                 return;
             }
             streamsEnded = true;
+            // Detach BEFORE ending so no late bytes can be written to the ended streams. Both
+            // unpipes are no-ops if the pipe was never established or already removed, keeping this
+            // safe under duplicate exit/error/dispose calls.
+            childStdout?.unpipe(readable);
+            writable.unpipe();
             readable.end();
             writable.end();
         };
@@ -720,6 +754,8 @@ export class NativePythonFinderImpl implements NativePythonFinder {
                 throw new Error('Failed to create stdio streams for PET process');
             }
 
+            // Remember the child's stdout so endStreams() can unpipe it before ending `readable`.
+            childStdout = proc.stdout;
             proc.stdout.pipe(readable, { end: false });
             proc.stderr.on('data', (data) => this.outputChannel.error(`[pet] ${data.toString()}`));
             writable.pipe(proc.stdin, { end: false });
@@ -902,12 +938,13 @@ export class NativePythonFinderImpl implements NativePythonFinder {
             } catch (ex) {
                 lastError = ex;
 
-                // Retry on timeout or connection errors (PET hung or crashed mid-request)
+                // Retry on timeout or a recoverable connection loss (PET hung or crashed mid-request)
                 const isRetryable =
-                    (ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError;
+                    (ex instanceof RpcTimeoutError && ex.method !== 'configure') ||
+                    this.isRecoverableConnectionLoss(ex);
                 if (isRetryable) {
                     if (attempt < MAX_REFRESH_RETRIES) {
-                        const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
+                        const reason = ex instanceof RpcTimeoutError ? 'timed out' : 'crashed';
                         this.outputChannel.warn(
                             `[pet] Refresh ${reason} (attempt ${attempt + 1}/${MAX_REFRESH_RETRIES + 1}), restarting and retrying...`,
                         );
@@ -915,7 +952,7 @@ export class NativePythonFinderImpl implements NativePythonFinder {
                         this.killProcess();
                         this.processExited = true;
                         this.processExitReason =
-                            ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
+                            ex instanceof RpcTimeoutError ? 'rpc_refresh_timeout' : 'rpc_connection_error';
                         continue;
                     }
                     // Final attempt failed
@@ -1047,15 +1084,19 @@ export class NativePythonFinderImpl implements NativePythonFinder {
                 },
                 ex instanceof Error ? ex : undefined,
             );
-            // On refresh timeout or connection error (not configure — configure handles its own timeout),
-            // kill the hung process so next request triggers restart
-            if ((ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError) {
-                const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
+            // On refresh timeout or a recoverable connection loss (crash mid-request; not configure —
+            // configure handles its own timeout), kill the hung/dead process so the retry above (or
+            // the next request) triggers a restart.
+            if (
+                (ex instanceof RpcTimeoutError && ex.method !== 'configure') ||
+                this.isRecoverableConnectionLoss(ex)
+            ) {
+                const reason = ex instanceof RpcTimeoutError ? 'timed out' : 'crashed';
                 this.outputChannel.warn(`[pet] PET process ${reason}, killing for restart`);
                 this.killProcess();
                 this.processExited = true;
                 this.processExitReason =
-                    ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
+                    ex instanceof RpcTimeoutError ? 'rpc_refresh_timeout' : 'rpc_connection_error';
             }
             this.outputChannel.error('[pet] Error refreshing', ex);
             throw ex;
