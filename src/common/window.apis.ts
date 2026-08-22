@@ -144,6 +144,31 @@ export interface QuickPickButtonEvent<T extends QuickPickItem> {
     readonly button: QuickInputButton;
 }
 
+/**
+ * Controls a live {@link showQuickPickWithButtons} instance after it has been shown, allowing a
+ * caller to stream additional items in and toggle the busy indicator while the picker stays open.
+ *
+ * Every mutation is a no-op once the picker has settled (accepted / went back / cancelled / hidden)
+ * or been disposed, so late asynchronous updates can never mutate a closed picker.
+ */
+export interface QuickPickController<T extends QuickPickItem> {
+    /**
+     * Replaces the items shown in the picker. The currently active and selected items are preserved
+     * by reference when they still exist in the new list, so streaming in more items does not move
+     * the user's cursor or drop their selection. No-op once the picker has {@link settled}.
+     */
+    setItems(items: readonly T[]): void;
+    /**
+     * Toggles the picker's busy/progress indicator. No-op once the picker has {@link settled}.
+     */
+    setBusy(busy: boolean): void;
+    /**
+     * `true` once the picker has been accepted, dismissed, or disposed. After this point all
+     * controller mutations are ignored.
+     */
+    readonly settled: boolean;
+}
+
 export function showQuickPick<T extends QuickPickItem>(
     items: readonly T[] | Thenable<readonly T[]>,
     options?: QuickPickOptions,
@@ -167,13 +192,19 @@ export function withProgress<R>(
 
 export async function showQuickPickWithButtons<T extends QuickPickItem>(
     items: readonly T[],
-    options?: QuickPickOptions & { showBackButton?: boolean; buttons?: QuickInputButton[]; selected?: T[] },
+    options?: QuickPickOptions & {
+        showBackButton?: boolean;
+        buttons?: QuickInputButton[];
+        selected?: T[];
+        onDidShow?: (controller: QuickPickController<T>) => void;
+    },
     token?: CancellationToken,
     itemButtonHandler?: (e: QuickPickItemButtonEvent<T>) => void,
 ): Promise<T | T[] | undefined> {
     const quickPick: QuickPick<T> = window.createQuickPick<T>();
     const disposables: Disposable[] = [quickPick];
     const deferred = createDeferred<T | T[] | undefined>();
+    let disposed = false;
 
     quickPick.items = items;
     quickPick.canSelectMany = options?.canPickMany ?? false;
@@ -234,8 +265,45 @@ export async function showQuickPickWithButtons<T extends QuickPickItem>(
     quickPick.show();
 
     try {
+        if (options?.onDidShow) {
+            const controller: QuickPickController<T> = {
+                get settled() {
+                    return deferred.completed || disposed;
+                },
+                setBusy(busy: boolean) {
+                    if (deferred.completed || disposed) {
+                        return;
+                    }
+                    quickPick.busy = busy;
+                },
+                setItems(newItems: readonly T[]) {
+                    if (deferred.completed || disposed) {
+                        return;
+                    }
+                    // Preserve the user's cursor and selection across a rebuild by re-applying the
+                    // active/selected items that still exist (by reference) in the new list, and keep
+                    // the scroll position so streaming more sections in doesn't jump the list.
+                    const newItemSet = new Set<T>(newItems);
+                    const preservedActive = quickPick.activeItems.filter((item) => newItemSet.has(item));
+                    const preservedSelected = quickPick.selectedItems.filter((item) => newItemSet.has(item));
+
+                    quickPick.keepScrollPosition = true;
+                    quickPick.items = newItems;
+
+                    if (preservedActive.length > 0) {
+                        quickPick.activeItems = preservedActive;
+                    }
+                    if (preservedSelected.length > 0) {
+                        quickPick.selectedItems = preservedSelected;
+                    }
+                },
+            };
+            options.onDidShow(controller);
+        }
+
         return await deferred.promise;
     } finally {
+        disposed = true;
         disposables.forEach((d) => d.dispose());
     }
 }

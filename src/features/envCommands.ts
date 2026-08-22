@@ -462,10 +462,14 @@ export async function setEnvironmentCommand(
                 }
             } else {
                 const globalEnvManager = em.getEnvironmentManager(undefined);
-                const recommended = globalEnvManager ? await globalEnvManager.get(undefined) : undefined;
+                // Open the picker immediately with Browse/Create and the streaming manager sections; the
+                // recommended environment is resolved authoritatively after show via resolveRecommended
+                // (the global manager's get()), so a slow/pending get() never delays opening and no
+                // stale, ownership-ambiguous last-known value is guessed synchronously. A delegating
+                // manager returning a base/System environment is handled by the resolver like any other.
                 const selected = await pickEnvironment(em.managers, globalEnvManager ? [globalEnvManager] : [], {
                     projects: [],
-                    recommended,
+                    resolveRecommended: globalEnvManager ? () => globalEnvManager.get(undefined) : undefined,
                     showBackButton: false,
                 });
                 if (selected) {
@@ -482,11 +486,13 @@ export async function setEnvironmentCommand(
         const uris = context as Uri[];
         const projects = wm.getProjects(uris).map((p) => p);
         const projectEnvManagers = em.getProjectEnvManagers(uris);
-        const recommended =
-            projectEnvManagers.length === 1 && uris.length === 1 ? await projectEnvManagers[0].get(uris[0]) : undefined;
+        const canRecommend = projectEnvManagers.length === 1 && uris.length === 1;
+        // Open the picker immediately; the recommended environment is resolved authoritatively after
+        // show via resolveRecommended (the project manager's get()), so a slow/pending get() never
+        // delays opening and no stale, ownership-ambiguous last-known value is guessed synchronously.
         const selected = await pickEnvironment(em.managers, projectEnvManagers, {
             projects,
-            recommended,
+            resolveRecommended: canRecommend ? () => projectEnvManagers[0].get(uris[0]) : undefined,
             showBackButton: uris.length > 1,
         });
 

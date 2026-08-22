@@ -6,8 +6,10 @@ import { traceError } from '../logging';
 import { EventNames } from '../telemetry/constants';
 import { sendTelemetryEvent } from '../telemetry/sender';
 import { isWindows } from '../utils/platformUtils';
+import { normalizePath } from '../utils/pathUtils';
 import { handlePythonPath } from '../utils/pythonPath';
 import {
+    QuickPickController,
     showErrorMessage,
     showOpenDialog,
     showQuickPick,
@@ -41,9 +43,17 @@ function getIconPath(i: IconPath | undefined): QuickPickIcon {
 }
 
 interface EnvironmentPickOptions {
-    recommended?: PythonEnvironment;
     showBackButton?: boolean;
     projects: PythonProject[];
+    /**
+     * Optional async resolver for the recommended environment, run **after** the picker is shown so a
+     * slow default-manager `get()` never delays the picker from opening. It is the sole, authoritative
+     * source for the recommended item: the picker opens immediately with only Browse/Create and the
+     * streaming manager sections, and the recommended slot appears (deduplicated against the sections)
+     * once this resolves. A rejected or `undefined` result simply leaves no recommendation shown, and a
+     * delegating manager (e.g. Venv resolving to a System environment) is fully supported.
+     */
+    resolveRecommended?: () => Promise<PythonEnvironment | undefined>;
 }
 async function browseForPython(
     managers: InternalEnvironmentManager[],
@@ -120,16 +130,81 @@ async function createEnvironment(
     }
 }
 
+/**
+ * A picker item backed by a concrete environment. `manager` is undefined for the recommended slot,
+ * which is not owned by any manager section.
+ */
+interface PickEnvItem extends QuickPickItem {
+    result: PythonEnvironment;
+    manager?: InternalEnvironmentManager;
+}
+
+type EnvironmentPickItem = QuickPickItem | PickEnvItem;
+
+/**
+ * A manager's loaded environments (locally deduplicated), stored as raw environments so the canonical
+ * item objects can be (re)computed deterministically at build time in fixed manager order.
+ */
+interface ManagerSection {
+    readonly separator: QuickPickItem;
+    readonly envs: ReadonlyArray<{ readonly key: string; readonly env: PythonEnvironment }>;
+}
+
+/**
+ * Computes a stable, cross-manager identity for an environment so the same interpreter discovered by
+ * more than one manager is only shown once.
+ *
+ * Prefers the environment/prefix path first: distinct Python-less environments (e.g. bare Conda
+ * prefixes) can share a single launcher executable, so keying on the executable would incorrectly
+ * collapse them into one. Falls back to the resolved executable, then the manager-scoped id. Paths
+ * are normalized for cross-platform comparison.
+ */
+function environmentIdentityKey(e: PythonEnvironment): string {
+    const envPath = e.environmentPath?.fsPath;
+    if (envPath && envPath.trim().length > 0) {
+        return normalizePath(envPath);
+    }
+    const execPath = e.execInfo?.run?.executable;
+    if (execPath && execPath.trim().length > 0) {
+        return normalizePath(execPath);
+    }
+    return `${e.envId.managerId}:${e.envId.id}`;
+}
+
+function describeEnvironment(e: PythonEnvironment): string {
+    const pathDescription = e.displayPath;
+    return e.description && e.description.trim() ? `${e.description} (${pathDescription})` : pathDescription;
+}
+
+/**
+ * Writes an environment's presentation onto a picker item **in place**. Mutating a single canonical
+ * object (rather than allocating a new one) is what lets the QuickPick preserve the user's active and
+ * selected item by reference when an environment's owning manager changes as sections stream in.
+ */
+function applyEnvironmentToItem(
+    item: PickEnvItem,
+    e: PythonEnvironment,
+    manager?: InternalEnvironmentManager,
+): void {
+    item.label = e.displayName ?? e.name;
+    item.description = describeEnvironment(e);
+    item.result = e;
+    item.manager = manager;
+    item.iconPath = getIconPath(e.iconPath);
+}
+
 async function pickEnvironmentImpl(
-    items: (QuickPickItem | (QuickPickItem & { result: PythonEnvironment }))[],
+    items: EnvironmentPickItem[],
     managers: InternalEnvironmentManager[],
     projectEnvManagers: InternalEnvironmentManager[],
     options: EnvironmentPickOptions,
+    onDidShow?: (controller: QuickPickController<EnvironmentPickItem>) => void,
 ): Promise<PythonEnvironment | undefined> {
     const selected = await showQuickPickWithButtons(items, {
         placeHolder: Pickers.Environments.selectEnvironment,
         ignoreFocusOut: true,
         showBackButton: options?.showBackButton,
+        onDidShow,
     });
 
     if (selected && !Array.isArray(selected)) {
@@ -152,7 +227,7 @@ export async function pickEnvironment(
     projectEnvManagers: InternalEnvironmentManager[],
     options: EnvironmentPickOptions,
 ): Promise<PythonEnvironment | undefined> {
-    const items: (QuickPickItem | (QuickPickItem & { result: PythonEnvironment }))[] = [
+    const staticItems: EnvironmentPickItem[] = [
         {
             label: Interpreter.browsePath,
             iconPath: new ThemeIcon('folder'),
@@ -167,51 +242,147 @@ export async function pickEnvironment(
         },
     ];
 
-    if (options?.recommended) {
-        const pathDescription = options.recommended.displayPath;
-        const description =
-            options.recommended.description && options.recommended.description.trim()
-                ? `${options.recommended.description} (${pathDescription})`
-                : pathDescription;
+    // The recommendation is resolved asynchronously by options.resolveRecommended after the picker is
+    // shown (see onDidShow); nothing is seeded synchronously, so a slow, rejected, or delegating
+    // default-manager get() never delays opening nor forces a stale/ownership-ambiguous guess up front.
+    let recommendedEnv: PythonEnvironment | undefined;
+    const recommendedSeparator: QuickPickItem = { label: Common.recommended, kind: QuickPickItemKind.Separator };
 
-        items.push(
-            {
-                label: Common.recommended,
-                kind: QuickPickItemKind.Separator,
-            },
-            {
-                label: options.recommended.displayName,
-                description: description,
-                result: options.recommended,
-                iconPath: getIconPath(options.recommended.iconPath),
-            },
-        );
-    }
+    // One canonical item object per environment identity, reused across rebuilds. When an
+    // environment's owning manager changes (a higher-priority manager resolves later) or it moves
+    // between a manager section and the recommended slot, the same object is moved/updated instead
+    // of replaced, so the QuickPick keeps the user's active and selected item by reference.
+    const canonicalItems = new Map<string, PickEnvItem>();
 
-    for (const manager of managers) {
-        items.push({
-            label: manager.displayName,
-            kind: QuickPickItemKind.Separator,
-        });
-        const envs = await manager.getEnvironments('all');
-        items.push(
-            ...envs.map((e) => {
-                const pathDescription = e.displayPath;
-                const description =
-                    e.description && e.description.trim() ? `${e.description} (${pathDescription})` : pathDescription;
+    const canonicalItem = (key: string, env: PythonEnvironment): PickEnvItem => {
+        let item = canonicalItems.get(key);
+        if (!item) {
+            item = { label: '', result: env };
+            canonicalItems.set(key, item);
+        }
+        return item;
+    };
 
-                return {
-                    label: e.displayName ?? e.name,
-                    description: description,
-                    result: e,
-                    manager: manager,
-                    iconPath: getIconPath(e.iconPath),
-                };
-            }),
-        );
-    }
+    // Sections are stored per manager and rebuilt into the final list in fixed manager order,
+    // independent of the order in which managers finish loading, so section ordering stays
+    // deterministic while environments stream in.
+    const sections = new Map<string, ManagerSection>();
 
-    return pickEnvironmentImpl(items, managers, projectEnvManagers, options);
+    const buildItems = (): EnvironmentPickItem[] => {
+        const result: EnvironmentPickItem[] = [...staticItems];
+        const seen = new Set<string>();
+
+        if (recommendedEnv) {
+            // The recommended environment is shown at the top; skip it in the manager sections.
+            // Reuse the one canonical object for this identity so an environment that also appears
+            // in a manager section keeps the user's active/selected item by reference as it moves
+            // in or out of the recommended slot.
+            const key = environmentIdentityKey(recommendedEnv);
+            seen.add(key);
+            const item = canonicalItem(key, recommendedEnv);
+            applyEnvironmentToItem(item, recommendedEnv);
+            result.push(recommendedSeparator, item);
+        }
+
+        for (const manager of managers) {
+            const section = sections.get(manager.id);
+            if (!section) {
+                continue;
+            }
+            const visible: PickEnvItem[] = [];
+            for (const { key, env } of section.envs) {
+                if (seen.has(key)) {
+                    continue;
+                }
+                seen.add(key);
+                const item = canonicalItem(key, env);
+                applyEnvironmentToItem(item, env, manager);
+                visible.push(item);
+            }
+            if (visible.length > 0) {
+                result.push(section.separator, ...visible);
+            }
+        }
+        return result;
+    };
+
+    const loadManager = async (
+        manager: InternalEnvironmentManager,
+        controller: QuickPickController<EnvironmentPickItem>,
+    ): Promise<void> => {
+        let section: ManagerSection | undefined;
+        try {
+            const envs = await manager.getEnvironments('all');
+            const deduped: { key: string; env: PythonEnvironment }[] = [];
+            const localKeys = new Set<string>();
+            for (const env of envs) {
+                const key = environmentIdentityKey(env);
+                if (localKeys.has(key)) {
+                    continue;
+                }
+                localKeys.add(key);
+                deduped.push({ key, env });
+            }
+            section = {
+                separator: {
+                    label: manager.displayName,
+                    kind: QuickPickItemKind.Separator,
+                },
+                envs: deduped,
+            };
+        } catch (err) {
+            traceError(
+                `[pickEnvironment] Failed to load environments for manager "${manager.id}"; section skipped.`,
+                err,
+            );
+        }
+        // Once the picker has settled (accepted/back/cancelled/disposed) never touch shared section or
+        // canonical-item state: buildItems() rewrites canonical item objects in place, which would
+        // otherwise change the result of an already-accepted item. The synchronous work below is safe
+        // because nothing awaits between this guard and setItems().
+        if (controller.settled) {
+            return;
+        }
+        if (section) {
+            sections.set(manager.id, section);
+        }
+        controller.setItems(buildItems());
+    };
+
+    const loadRecommendation = async (controller: QuickPickController<EnvironmentPickItem>): Promise<void> => {
+        if (!options?.resolveRecommended) {
+            return;
+        }
+        let resolved: PythonEnvironment | undefined;
+        try {
+            // The resolver is the sole, authoritative source for the recommendation, matching the
+            // pre-streaming behavior where the awaited manager.get() was the only source. It runs after
+            // show so a slow get() never blocks opening; a rejected/undefined result leaves no
+            // recommendation. A delegating manager (e.g. Venv resolving to a System env) is fully
+            // supported: whatever env it returns becomes the recommendation, deduped against the
+            // sections by identity.
+            resolved = await options.resolveRecommended();
+        } catch (err) {
+            traceError('[pickEnvironment] Failed to resolve the recommended environment.', err);
+        }
+        // See loadManager: never mutate canonical/section state or rebuild after the picker has settled.
+        if (controller.settled) {
+            return;
+        }
+        recommendedEnv = resolved;
+        controller.setItems(buildItems());
+    };
+
+    const onDidShow = (controller: QuickPickController<EnvironmentPickItem>) => {
+        controller.setBusy(true);
+        const loads: Promise<void>[] = [
+            ...managers.map((manager) => loadManager(manager, controller)),
+            loadRecommendation(controller),
+        ];
+        void Promise.allSettled(loads).finally(() => controller.setBusy(false));
+    };
+
+    return pickEnvironmentImpl(buildItems(), managers, projectEnvManagers, options, onDidShow);
 }
 
 export async function pickEnvironmentFrom(environments: PythonEnvironment[]): Promise<PythonEnvironment | undefined> {

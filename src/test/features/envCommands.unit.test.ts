@@ -6,6 +6,7 @@ import { PythonEnvironment, PythonProject } from '../../api';
 import * as commandApi from '../../common/command.api';
 import { INLINE_SCRIPT_MANAGER_ID } from '../../common/constants';
 import * as managerApi from '../../common/pickers/managers';
+import * as environmentsPicker from '../../common/pickers/environments';
 import * as projectApi from '../../common/pickers/projects';
 import * as windowApis from '../../common/window.apis';
 import {
@@ -13,6 +14,7 @@ import {
     createAnyEnvironmentCommand,
     removePythonProject,
     revealEnvInManagerView,
+    setEnvironmentCommand,
 } from '../../features/envCommands';
 import * as settingHelpers from '../../features/settings/settingHelpers';
 import { EnvManagerView } from '../../features/views/envManagersView';
@@ -383,5 +385,80 @@ suite('Reveal Env In Manager View Command Tests', () => {
         // Assert
         assert.ok(executeCommandStub.calledOnceWith('env-managers.focus'), 'Should focus the env-managers view');
         managerView.verify((m) => m.reveal(environment), typeMoq.Times.once());
+    });
+});
+
+suite('Set Environment Command - recommendation resolution (no synchronous seed)', () => {
+    let pickEnvStub: sinon.SinonStub;
+
+    setup(() => {
+        // The picker itself is exercised in the streaming tests; here we only assert how the
+        // recommendation is handed to it: no synchronous seed, and an authoritative resolver wired to
+        // manager.get() that is invoked only after the picker is shown.
+        pickEnvStub = sinon.stub(environmentsPicker, 'pickEnvironment').resolves(undefined);
+    });
+
+    teardown(() => {
+        sinon.restore();
+    });
+
+    function pickedOptions(): {
+        recommended?: PythonEnvironment;
+        resolveRecommended?: () => Promise<PythonEnvironment | undefined>;
+    } {
+        assert.ok(pickEnvStub.calledOnce, 'pickEnvironment should be called exactly once');
+        return pickEnvStub.lastCall.args[2];
+    }
+
+    test('global: opens the picker without seeding or awaiting a pending default-manager get()', async () => {
+        // A get() that never resolves must not block the picker from opening.
+        const getStub = sinon.stub().returns(new Promise<PythonEnvironment | undefined>(() => {}));
+        const currentManager = { id: 'm-current', get: getStub } as unknown as InternalEnvironmentManager;
+        const em = {
+            get managers() {
+                return [currentManager];
+            },
+            getEnvironmentManager: sinon.stub().returns(currentManager),
+            // Proves the scope-keyed last-known cache is no longer consulted for a synchronous seed.
+            getLastKnownEnvironment: sinon.stub().throws(new Error('last-known cache must not be consulted')),
+            setEnvironments: sinon.stub().resolves(),
+        } as unknown as EnvironmentManagers;
+        const wm = { getProjects: sinon.stub().returns([]) } as unknown as PythonProjectManager;
+
+        await setEnvironmentCommand(undefined, em, wm);
+
+        const options = pickedOptions();
+        assert.strictEqual(options.recommended, undefined, 'no synchronous recommendation is seeded');
+        assert.strictEqual(typeof options.resolveRecommended, 'function', 'the authoritative resolver is wired');
+        assert.ok(getStub.notCalled, 'manager.get() must not be awaited before the picker opens');
+
+        // The resolver defers to manager.get() only when invoked (after show).
+        void options.resolveRecommended!();
+        assert.ok(getStub.calledOnce, 'resolveRecommended defers to manager.get()');
+    });
+
+    test('project: opens the picker without seeding or awaiting a pending default-manager get()', async () => {
+        const getStub = sinon.stub().returns(new Promise<PythonEnvironment | undefined>(() => {}));
+        const projectManager = { id: 'm-current', get: getStub } as unknown as InternalEnvironmentManager;
+        const uri = Uri.file('/workspace/proj');
+        const em = {
+            get managers() {
+                return [projectManager];
+            },
+            getProjectEnvManagers: sinon.stub().returns([projectManager]),
+            getLastKnownEnvironment: sinon.stub().throws(new Error('last-known cache must not be consulted')),
+            setEnvironments: sinon.stub().resolves(),
+        } as unknown as EnvironmentManagers;
+        const wm = { getProjects: sinon.stub().returns([{ uri, name: 'proj' }]) } as unknown as PythonProjectManager;
+
+        await setEnvironmentCommand([uri], em, wm);
+
+        const options = pickedOptions();
+        assert.strictEqual(options.recommended, undefined, 'no synchronous recommendation is seeded');
+        assert.strictEqual(typeof options.resolveRecommended, 'function', 'the authoritative resolver is wired');
+        assert.ok(getStub.notCalled, 'manager.get() must not be awaited before the picker opens');
+
+        void options.resolveRecommended!();
+        assert.ok(getStub.calledOnce, 'resolveRecommended defers to manager.get()');
     });
 });
