@@ -128,31 +128,47 @@ suite('Bounded refresh latency — retryWouldStarveCliFallbackMs', () => {
 suite('Bounded refresh latency — toBudgetError (deadline provenance)', () => {
     test('returns undefined when there is no deadline (non-refresh callers stay unchanged)', () => {
         const err = new RpcTimeoutError('configure', 30_000);
-        assert.strictEqual(toBudgetError(err, undefined, 'configure'), undefined);
+        assert.strictEqual(toBudgetError(err, undefined, 'configure', false), undefined);
     });
 
-    test('returns undefined for an RpcTimeoutError while the deadline still has budget (genuine slow PET)', () => {
+    test('returns undefined for an unclamped base-timeout stage while the budget is healthy (slow PET)', () => {
         const { clock } = makeClock();
-        const dl = new Deadline(100_000, clock); // full budget remaining
+        const dl = new Deadline(100_000, clock); // full budget remaining → stage ran on its base timeout
         const err = new RpcTimeoutError('refresh', 30_000);
-        assert.strictEqual(toBudgetError(err, dl, 'refresh'), undefined);
+        assert.strictEqual(toBudgetError(err, dl, 'refresh', false), undefined);
     });
 
-    test('reclassifies an RpcTimeoutError as a budget error once the deadline is exhausted', () => {
+    test('does NOT reclassify an unclamped base-timeout stage even when the deadline is now exhausted', () => {
+        // Regression: a 30s base timeout that started with 30.5s remaining is NOT deadline-clamped
+        // (min(30000, 30500) = 30000 = base). Its timing out is genuine PET slowness and must keep
+        // normal stage-timeout telemetry / retry / recovery — not be misattributed to the budget cap.
+        const { clock, set } = makeClock();
+        const dl = new Deadline(30_500, clock);
+        set(30_000); // 30s base timeout elapsed → remaining 500 < floor → deadline.isExhausted() is now true
+        assert.strictEqual(dl.isExhausted(), true, 'guard: the deadline is exhausted post-timeout');
+        const err = new RpcTimeoutError('refresh', 30_000);
+        assert.strictEqual(
+            toBudgetError(err, dl, 'refresh', false),
+            undefined,
+            'an unclamped full base-timeout that merely ends with <floor budget is not a budget cap',
+        );
+    });
+
+    test('reclassifies a deadline-clamped RpcTimeoutError as a budget error', () => {
         const { clock, set } = makeClock();
         const dl = new Deadline(100_000, clock);
         set(99_900); // remaining 100 < floor → exhausted
         const err = new RpcTimeoutError('configure', 100);
-        const budget = toBudgetError(err, dl, 'configure');
-        assert.ok(budget instanceof RefreshBudgetExceededError, 'a clamped timeout on an exhausted budget is a budget error');
+        const budget = toBudgetError(err, dl, 'configure', true);
+        assert.ok(budget instanceof RefreshBudgetExceededError, 'a clamped timeout is a budget error');
         assert.strictEqual(budget?.stage, 'configure');
     });
 
-    test('does not reclassify a non-timeout error even when the deadline is exhausted', () => {
+    test('does not reclassify a non-timeout error even when the stage was deadline-clamped', () => {
         const { clock, set } = makeClock();
         const dl = new Deadline(100_000, clock);
         set(99_900);
-        assert.strictEqual(toBudgetError(new Error('boom'), dl, 'refresh'), undefined);
+        assert.strictEqual(toBudgetError(new Error('boom'), dl, 'refresh', true), undefined);
     });
 });
 
@@ -301,8 +317,10 @@ suite('Bounded refresh latency — RefreshBudgetExceededError', () => {
         assert.strictEqual(err.stage, 'restart');
         assert.ok(err instanceof Error);
         assert.ok(err instanceof RefreshBudgetExceededError);
-        assert.match(err.message, /restart/);
-        assert.match(err.message, /budget exceeded/i);
+        assert.strictEqual(
+            err.message,
+            "Refresh operation budget exceeded at stage 'restart' (remaining 250ms)",
+        );
     });
 });
 

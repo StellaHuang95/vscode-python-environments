@@ -604,22 +604,31 @@ async function sendRequestWithTimeout<T>(
  * Converts a stage failure into a {@link RefreshBudgetExceededError} when the failure was caused by
  * our own deadline clamp rather than genuine PET slowness — preserving *deadline provenance*.
  *
- * A stage started under a bounded refresh has its timeout clamped to the remaining budget
- * (see {@link clampTimeoutToRemaining}). If such a clamped stage times out, we necessarily waited
- * the whole remaining budget, so the deadline is now exhausted. Detecting that here lets callers
- * reclassify the failure as a budget-cap error *before* mutating ordinary stage retry counters or
- * emitting stage-timeout telemetry, so a deadline cap is never misattributed to a slow PET.
+ * A stage is reclassified only when BOTH hold:
+ *  - `wasClamped` is true: the stage's effective timeout was the remaining operation budget (the
+ *    deadline was the binding constraint), not the stage's own base timeout. Callers compute this at
+ *    clamp time as `deadline !== undefined && effectiveTimeout < baseTimeout` (see
+ *    {@link clampTimeoutToRemaining}).
+ *  - the failure is an {@link RpcTimeoutError}: a stage clamped to the remaining budget that then
+ *    times out necessarily consumed the whole budget, so the deadline — not PET — ended it.
  *
- * Returns `undefined` (leave the error as an ordinary stage timeout) when there is no deadline, the
- * deadline still has budget left (a genuine base-timeout on a healthy budget), or the error is not
- * an {@link RpcTimeoutError}.
+ * Detecting this lets callers reclassify the failure as a budget-cap error *before* mutating ordinary
+ * stage retry counters or emitting stage-timeout telemetry, so a deadline cap is never misattributed
+ * to a slow PET. We deliberately do NOT infer this from a post-hoc `deadline.isExhausted()` check: a
+ * stage that ran on its *unclamped* base timeout and merely happened to finish with less than the
+ * floor of budget left (e.g. a 30s base timeout that started with 30.5s remaining) is a genuine PET
+ * timeout and must keep normal timeout/retry/recovery handling.
+ *
+ * Returns `undefined` (leave the error as an ordinary stage timeout) when the stage was not
+ * deadline-clamped, there is no deadline, or the error is not an {@link RpcTimeoutError}.
  */
 export function toBudgetError(
     ex: unknown,
     deadline: Deadline | undefined,
     stage: string,
+    wasClamped: boolean,
 ): RefreshBudgetExceededError | undefined {
-    if (deadline !== undefined && deadline.isExhausted() && ex instanceof RpcTimeoutError) {
+    if (deadline !== undefined && wasClamped && ex instanceof RpcTimeoutError) {
         return new RefreshBudgetExceededError(stage, deadline.remainingMs());
     }
     return undefined;
@@ -1327,6 +1336,9 @@ class NativePythonFinderImpl implements NativePythonFinder {
         let refreshPerf: RefreshPerformance | undefined;
         let workspaceDirCount: number | undefined;
         let searchPathCount: number | undefined;
+        // Hoisted so the catch can tell whether the refresh RPC ran on the deadline's remaining
+        // budget (clamped) vs its own base timeout — only a clamped timeout is a budget cap.
+        let refreshTimeoutMs = REFRESH_TIMEOUT_MS;
         try {
             const configuration = await this.buildConfigurationOptions();
             workspaceDirCount = configuration.workspaceDirectories.length;
@@ -1389,11 +1401,12 @@ class NativePythonFinderImpl implements NativePythonFinder {
                     }
                 }),
             );
+            refreshTimeoutMs = clampTimeoutToRemaining(REFRESH_TIMEOUT_MS, deadline, 'refresh');
             await sendRequestWithTimeout<{ duration: number }>(
                 this.connection,
                 'refresh',
                 refreshOptions,
-                clampTimeoutToRemaining(REFRESH_TIMEOUT_MS, deadline, 'refresh'),
+                refreshTimeoutMs,
             );
             await Promise.all(unresolved);
 
@@ -1428,8 +1441,13 @@ class NativePythonFinderImpl implements NativePythonFinder {
             // PET_REFRESH stage-timeout telemetry, mutate restart/timeout counters, or kill the
             // process for it: exhausting OUR operation budget does not mean PET is unhealthy, and
             // sendRequestWithTimeout already cancelled the in-flight refresh RPC via its token.
+            // Only a *clamped* refresh timeout (the deadline, not REFRESH_TIMEOUT_MS, was binding) is
+            // reclassified; a full base-timeout is genuine PET slowness and keeps normal handling.
+            const refreshWasClamped = deadline !== undefined && refreshTimeoutMs < REFRESH_TIMEOUT_MS;
             const budgetError =
-                ex instanceof RefreshBudgetExceededError ? ex : toBudgetError(ex, deadline, 'refresh');
+                ex instanceof RefreshBudgetExceededError
+                    ? ex
+                    : toBudgetError(ex, deadline, 'refresh', refreshWasClamped);
             if (budgetError) {
                 this.outputChannel.warn(`[pet] Refresh attempt aborted by operation budget: ${budgetError.message}`);
                 throw budgetError;
@@ -1499,7 +1517,8 @@ class NativePythonFinderImpl implements NativePythonFinder {
         this.outputChannel.info('[pet] configure: Sending configuration update:', JSON.stringify(configuration));
         // Exponential backoff: 30s, 60s on retry. Capped at MAX_CONFIGURE_TIMEOUT_MS, then further
         // clamped to the remaining operation budget when a deadline is supplied (refresh path only).
-        const timeoutMs = clampTimeoutToRemaining(this.configureRetry.getTimeoutMs(), deadline, 'configure');
+        const baseConfigureTimeoutMs = this.configureRetry.getTimeoutMs();
+        const timeoutMs = clampTimeoutToRemaining(baseConfigureTimeoutMs, deadline, 'configure');
         if (this.configureRetry.timeoutCount > 0) {
             this.outputChannel.info(
                 `[pet] configure: Using extended timeout of ${timeoutMs}ms (retry ${this.configureRetry.timeoutCount})`,
@@ -1524,7 +1543,11 @@ class NativePythonFinderImpl implements NativePythonFinder {
             // configureRetry.onTimeout(), emit PET_CONFIGURE stage-timeout telemetry, or kill the
             // process — exhausting our own budget does not imply an unhealthy PET, and
             // sendRequestWithTimeout already cancelled the in-flight configure via its token.
-            const budgetError = toBudgetError(ex, deadline, 'configure');
+            // Only reclassify when OUR budget clamp caused this timeout (the effective timeout was the
+            // remaining budget, not the configure base/extended timeout); a full base-timeout is a
+            // genuine PET timeout and keeps normal retry/telemetry handling.
+            const configureWasClamped = deadline !== undefined && timeoutMs < baseConfigureTimeoutMs;
+            const budgetError = toBudgetError(ex, deadline, 'configure', configureWasClamped);
             if (budgetError) {
                 this.lastConfiguration = undefined;
                 this.outputChannel.warn(`[pet] Configure aborted by operation budget: ${budgetError.message}`);
