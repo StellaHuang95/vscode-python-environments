@@ -20,7 +20,7 @@ import {
     SetEnvironmentScope,
 } from '../../api';
 import { CondaStrings } from '../../common/localize';
-import { traceError, traceInfo } from '../../common/logging';
+import { traceError, traceInfo, traceVerbose } from '../../common/logging';
 import { StopWatch } from '../../common/stopWatch';
 import { EventNames } from '../../common/telemetry/constants';
 import { classifyError } from '../../common/telemetry/errorClassifier';
@@ -123,8 +123,14 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                     title: CondaStrings.condaDiscovering,
                 },
                 async () => {
-                    this.collection =
-                        (await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this)) ?? [];
+                    const refreshed = await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this);
+                    // `undefined` means discovery failed — keep any known-good collection and
+                    // emit nothing. A successful (possibly empty) array is applied normally.
+                    if (refreshed === undefined) {
+                        traceVerbose('Conda discovery failed during initialization; leaving collection unchanged.');
+                        return;
+                    }
+                    this.collection = refreshed;
                     await this.loadEnvMap();
 
                     this._onDidChangeEnvironments.fire(
@@ -314,8 +320,16 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 },
                 async () => {
                     this.log.info('Refreshing Conda Environments');
+                    const refreshed = await refreshCondaEnvs(true, this.nativeFinder, this.api, this.log, this);
+                    // `undefined` signals a discovery failure (e.g. native finder error). Preserve
+                    // the last known-good collection and emit no changes so a transient failure does
+                    // not remove environments. A successful empty array still removes stale envs below.
+                    if (refreshed === undefined) {
+                        this.log.warn('Conda refresh failed; preserving previously discovered environments.');
+                        return;
+                    }
                     const discard = this.collection.map((c) => c);
-                    this.collection = (await refreshCondaEnvs(true, this.nativeFinder, this.api, this.log, this)) ?? [];
+                    this.collection = refreshed;
 
                     await this.loadEnvMap();
 
@@ -342,8 +356,14 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
             resolve: (p) => resolveCondaPath(p, this.nativeFinder, this.api, this.log, this),
             startBackgroundInit: () =>
                 withProgress({ location: ProgressLocation.Window, title: CondaStrings.condaDiscovering }, async () => {
-                    this.collection =
-                        (await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this)) ?? [];
+                    const refreshed = await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this);
+                    // `undefined` means discovery failed — keep any known-good collection and
+                    // emit nothing. A successful (possibly empty) array is applied normally.
+                    if (refreshed === undefined) {
+                        traceVerbose('Conda background discovery failed; leaving collection unchanged.');
+                        return;
+                    }
+                    this.collection = refreshed;
                     await this.loadEnvMap();
                     this._onDidChangeEnvironments.fire(
                         this.collection.map((e) => ({
