@@ -287,6 +287,22 @@ export class RpcTimeoutError extends Error {
     }
 }
 
+/**
+ * Error thrown when an operation is attempted on a finder that has already been disposed.
+ *
+ * A disposed finder must never spawn a PET server/CLI process, restart, retry, or fall back to the
+ * JSON CLI. Every lifecycle chokepoint (public in-flight requests, `ensureProcessRunning`, restart
+ * before/after its backoff, `start`, and the CLI fallbacks) throws this so an in-flight or
+ * post-dispose caller settles exactly once with a precise, recognizable error instead of leaking a
+ * replacement process or timer.
+ */
+export class NativePythonFinderDisposedError extends Error {
+    constructor() {
+        super('Python Environment Tools (PET) finder has been disposed.');
+        this.name = this.constructor.name;
+    }
+}
+
 /** Retries only JSON-RPC timeout failures; all other errors propagate immediately. */
 export async function retryRpcTimeout<T>(
     request: () => Promise<T>,
@@ -366,6 +382,13 @@ export class NativePythonFinderImpl implements NativePythonFinder {
     private restartAttempts: number = 0;
     private isRestarting: boolean = false;
     private disposed: boolean = false;
+    /**
+     * Cancels an in-progress `restart()` backoff wait. Set while `restart()` is parked on its
+     * exponential-backoff timer and cleared once the wait completes. `dispose()` calls this so a
+     * disposal during the backoff window unblocks the wait immediately (clearing the timer so none
+     * leaks) — `restart()` then re-checks `disposed` and aborts instead of spawning a replacement.
+     */
+    private cancelRestartBackoff: (() => void) | undefined = undefined;
     private processExitReason: string | undefined = undefined;
     private readonly configureRetry = new ConfigureRetryState();
     /**
@@ -393,6 +416,7 @@ export class NativePythonFinderImpl implements NativePythonFinder {
     public async resolve(executable: string): Promise<NativeEnvInfo> {
         const sw = new StopWatch();
         try {
+            this.throwIfDisposed();
             await this.ensureProcessRunning();
             try {
                 await this.configure();
@@ -429,6 +453,11 @@ export class NativePythonFinderImpl implements NativePythonFinder {
                 throw ex;
             }
         } catch (ex) {
+            // A disposal that interrupted this in-flight resolve is intentional teardown, not a
+            // recoverable failure: settle once with the precise error and never fall back to CLI.
+            if (ex instanceof NativePythonFinderDisposedError) {
+                throw ex;
+            }
             const errorType = classifyError(ex);
             sendTelemetryEvent(
                 EventNames.PET_RESOLVE,
@@ -464,11 +493,27 @@ export class NativePythonFinderImpl implements NativePythonFinder {
     }
 
     /**
+     * Fail-fast guard for the dispose race. Throws {@link NativePythonFinderDisposedError} when the
+     * finder has been disposed so no lifecycle path spawns a process, restarts, retries, or runs a
+     * CLI fallback after teardown. Placed at every such chokepoint (public in-flight entry points,
+     * `ensureProcessRunning`, `restart` before/after its backoff, `start`, and the CLI fallbacks).
+     */
+    private throwIfDisposed(): void {
+        if (this.disposed) {
+            throw new NativePythonFinderDisposedError();
+        }
+    }
+
+    /**
      * Ensures the PET process is running. If it has exited or failed, attempts to restart
      * with exponential backoff up to MAX_RESTART_ATTEMPTS times.
      * @throws Error if the process cannot be started after all retry attempts
      */
     private async ensureProcessRunning(): Promise<void> {
+        // A disposed finder must never spawn/restart — fail fast so in-flight resolve()/refresh()
+        // callers settle promptly with a precise disposed error.
+        this.throwIfDisposed();
+
         // Process is running fine
         if (!this.startFailed && !this.processExited) {
             return;
@@ -495,8 +540,15 @@ export class NativePythonFinderImpl implements NativePythonFinder {
     /**
      * Kills the current PET process (if running) and starts a fresh one.
      * Implements exponential backoff between restart attempts.
+     *
+     * Single-flight precondition: callers reach this only through {@link ensureProcessRunning},
+     * whose `isRestarting` guard ensures at most one `restart()` is ever in progress (and thus at
+     * most one parked on the backoff below). `cancelRestartBackoff` therefore tracks a single
+     * pending timer; a second concurrent restart would overwrite it and leak the first timer.
      */
     private async restart(): Promise<void> {
+        // Fail fast if disposed before we do any teardown/spawn work.
+        this.throwIfDisposed();
         this.isRestarting = true;
         this.restartAttempts++;
         const attempt = this.restartAttempts;
@@ -517,8 +569,24 @@ export class NativePythonFinderImpl implements NativePythonFinder {
             this.startDisposables.forEach((d) => d.dispose());
             this.startDisposables = [];
 
-            // Wait with exponential backoff before restarting
-            await new Promise((resolve) => setTimeout(resolve, backoffMs));
+            // Wait with exponential backoff before restarting. The wait is cancelable so a dispose()
+            // during this window unblocks immediately (and clears the timer so none leaks); the
+            // post-backoff throwIfDisposed() below then aborts the restart before any spawn.
+            await new Promise<void>((resolve) => {
+                const timer = setTimeout(() => {
+                    this.cancelRestartBackoff = undefined;
+                    resolve();
+                }, backoffMs);
+                this.cancelRestartBackoff = () => {
+                    clearTimeout(timer);
+                    this.cancelRestartBackoff = undefined;
+                    resolve();
+                };
+            });
+
+            // If the finder was disposed while we were waiting out the backoff, abort now — never
+            // spawn a replacement PET process that nothing would ever dispose.
+            this.throwIfDisposed();
 
             // Reset state flags
             this.processExited = false;
@@ -544,6 +612,12 @@ export class NativePythonFinderImpl implements NativePythonFinder {
             // Reset restart attempts on successful start (process didn't immediately fail)
             // We'll reset this only after a successful request completes
         } catch (ex) {
+            // An abort due to disposal is intentional teardown, not a restart failure: don't emit
+            // error telemetry/logs, just surface the precise error to the (in-flight) caller.
+            if (ex instanceof NativePythonFinderDisposedError) {
+                this.outputChannel.info('[pet] Restart aborted: finder disposed');
+                throw ex;
+            }
             sendTelemetryEvent(
                 EventNames.PET_PROCESS_RESTART,
                 { duration: sw.elapsedTime, attempt },
@@ -561,6 +635,8 @@ export class NativePythonFinderImpl implements NativePythonFinder {
             );
             throw ex;
         } finally {
+            // Backoff is over (fired, canceled, or start() threw) — drop any stale cancel hook.
+            this.cancelRestartBackoff = undefined;
             this.isRestarting = false;
         }
     }
@@ -593,6 +669,7 @@ export class NativePythonFinderImpl implements NativePythonFinder {
     }
 
     public async refresh(hardRefresh: boolean, options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
+        this.throwIfDisposed();
         if (hardRefresh) {
             return this.handleHardRefresh(options);
         }
@@ -675,6 +752,9 @@ export class NativePythonFinderImpl implements NativePythonFinder {
         // by disposing startDisposables/connection below are recognized as intentional shutdown and
         // never mistaken for a recoverable crash (see isRecoverableConnectionLoss).
         this.disposed = true;
+        // Unblock any in-flight restart() parked on its backoff timer so it re-checks `disposed` and
+        // aborts immediately instead of spawning a replacement PET process after teardown.
+        this.cancelRestartBackoff?.();
         this.pool.stop();
         this.startDisposables.forEach((d) => d.dispose());
         this.connection.dispose();
@@ -702,6 +782,9 @@ export class NativePythonFinderImpl implements NativePythonFinder {
     }
 
     private start(): rpc.MessageConnection {
+        // Never spawn a PET server for a disposed finder (immediately before spawn), so a stale
+        // restart or any future caller can't leak a process past teardown.
+        this.throwIfDisposed();
         this.outputChannel.info(`[pet] Starting Python Locator ${this.toolPath} server`);
 
         // jsonrpc package cannot handle messages coming through too quickly.
@@ -1206,9 +1289,11 @@ export class NativePythonFinderImpl implements NativePythonFinder {
      * Used to decide whether to fall back to CLI mode.
      * Does NOT return true while a restart is in progress — the server is not exhausted
      * if it is still mid-restart (concurrent callers must not bypass to CLI prematurely).
+     * Also never true once disposed: a disposed finder must not spawn a CLI fallback process.
      */
     private isServerExhausted(): boolean {
         return (
+            !this.disposed &&
             !this.isRestarting &&
             this.restartAttempts >= MAX_RESTART_ATTEMPTS &&
             (this.startFailed || this.processExited)
@@ -1297,6 +1382,8 @@ export class NativePythonFinderImpl implements NativePythonFinder {
      * @returns NativeInfo[] containing managers and environments, same as server mode.
      */
     private async refreshViaJsonCli(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
+        // Hard stop before spawning any CLI process: a disposed finder never runs the fallback.
+        this.throwIfDisposed();
         const config = await this.buildConfigurationOptions();
         // venvFolders must be included explicitly as search paths when options is Uri[],
         // mirroring getRefreshOptions() server-mode behaviour (searchPaths may override environmentDirectories).
@@ -1394,6 +1481,8 @@ export class NativePythonFinderImpl implements NativePythonFinder {
      * @throws Error if PET cannot identify the environment or if the output cannot be parsed.
      */
     private async resolveViaJsonCli(executable: string): Promise<NativeEnvInfo> {
+        // Hard stop before spawning any CLI process: a disposed finder never runs the fallback.
+        this.throwIfDisposed();
         const args = ['resolve', executable, '--json'];
         if (this.cacheDirectory) {
             args.push('--cache-directory', this.cacheDirectory.fsPath);

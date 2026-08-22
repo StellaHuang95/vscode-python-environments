@@ -8,7 +8,7 @@ import * as sinon from 'sinon';
 import * as rpc from 'vscode-jsonrpc/node';
 import { PythonProjectApi } from '../../../api';
 import * as childProcessApis from '../../../common/childProcess.apis';
-import { NativePythonFinderImpl } from '../../../managers/common/nativePythonFinder';
+import { NativePythonFinderDisposedError, NativePythonFinderImpl } from '../../../managers/common/nativePythonFinder';
 
 /**
  * Minimal fake of a spawned PET server child process. Uses real {@link PassThrough} streams so
@@ -114,6 +114,21 @@ function isPendingResponseRejected(message: string): (err: unknown) => boolean {
             (err as rpc.ResponseError<unknown>).code,
             rpc.ErrorCodes.PendingResponseRejected,
             `${message}: expected the connection-dispose rejection`,
+        );
+        return true;
+    };
+}
+
+/**
+ * Validator for {@link assert.rejects}/{@link assert.throws} asserting the error is the precise
+ * {@link NativePythonFinderDisposedError} raised by the dispose guards — proving a disposed finder
+ * settled the operation with the disposed error rather than spawning/restarting/CLI-falling-back.
+ */
+function isDisposedError(message: string): (err: unknown) => boolean {
+    return (err: unknown): boolean => {
+        assert.ok(
+            err instanceof NativePythonFinderDisposedError,
+            `${message}: expected a NativePythonFinderDisposedError, got ${String(err)}`,
         );
         return true;
     };
@@ -501,5 +516,76 @@ suite('NativePythonFinder PET-exit RPC teardown', () => {
 
         newChild.simulateExit(1, null);
         await assert.rejects(pendingNew, 'replacement request should reject when its own child exits');
+    });
+
+    // --- Dispose race: a disposed finder must never spawn, restart, retry, or run a CLI fallback.
+    // These prove the `disposed` guards close the pre-existing window where dispose() during a
+    // restart() backoff still resumed and spawned a replacement PET process. ---
+
+    test('dispose during restart backoff aborts the restart without spawning a replacement', async () => {
+        const f = createFinder();
+        // Mark the initial child exited so restart()'s killProcess()/graceful-kill disposable don't
+        // schedule real 500ms kill timers; the only fake timer in play is the backoff itself.
+        children[0].markExited();
+
+        // Fake only setTimeout/clearTimeout so the backoff timer is deterministic while microtasks
+        // (the cancelable backoff promise + throwIfDisposed) run in real time.
+        const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        try {
+            const restartPromise = (f as unknown as { restart(): Promise<void> }).restart();
+            // Attach the rejection expectation synchronously so it is never momentarily unhandled.
+            const rejection = assert.rejects(
+                restartPromise,
+                isDisposedError('restart parked on backoff must abort with the disposed error'),
+            );
+
+            await flush(); // let restart() reach and park on the backoff await
+            assert.strictEqual(children.length, 1, 'sanity: no replacement spawned while parked on backoff');
+            assert.strictEqual(clock.countTimers(), 1, 'sanity: exactly the backoff timer is pending');
+
+            // Dispose mid-backoff. This must cancel the backoff timer (no leak) and unblock the wait
+            // so restart() re-checks `disposed` and aborts — WITHOUT advancing the clock at all.
+            f.dispose();
+            await rejection;
+
+            assert.strictEqual(children.length, 1, 'dispose during backoff must NOT spawn a replacement child');
+            assert.strictEqual(clock.countTimers(), 0, 'the backoff timer must be cleared (no leaked timer)');
+            assert.strictEqual(
+                (f as unknown as { isRestarting: boolean }).isRestarting,
+                false,
+                'isRestarting must be reset after the aborted restart',
+            );
+        } finally {
+            clock.restore();
+        }
+    });
+
+    test('start() on a disposed finder throws and never spawns a process', () => {
+        const f = createFinder();
+        children[0].markExited();
+        f.dispose();
+        assert.strictEqual(children.length, 1, 'sanity: only the initial child was spawned');
+
+        // Immediately-before-spawn guard: a disposed finder must never create a PET server child.
+        assert.throws(
+            () => (f as unknown as { start(): rpc.MessageConnection }).start(),
+            isDisposedError('start() after dispose must throw'),
+        );
+        assert.strictEqual(children.length, 1, 'disposed start() must not spawn a replacement child');
+    });
+
+    test('resolve() and refresh() after disposal reject with the disposed error and never spawn', async () => {
+        const f = createFinder();
+        children[0].markExited();
+        f.dispose();
+        const spawnedAtDispose = children.length;
+
+        // Public in-flight entry points must fail fast with the precise disposed error — no restart,
+        // no CLI fallback, no new process — and settle exactly once.
+        await assert.rejects(f.resolve('x'), isDisposedError('resolve() after dispose'));
+        await assert.rejects(f.refresh(true), isDisposedError('hard refresh() after dispose'));
+        await assert.rejects(f.refresh(false), isDisposedError('soft refresh() after dispose'));
+
+        assert.strictEqual(children.length, spawnedAtDispose, 'no operation after dispose may spawn a process');
     });
 });
