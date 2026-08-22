@@ -307,6 +307,31 @@ suite('pickEnvironment - streaming environment sections', () => {
         await pick;
     });
 
+    test('deduplicates an environment path that differs only by path separator (Windows vs POSIX)', async () => {
+        const m1 = controllableManager('m1', 'One');
+        const m2 = controllableManager('m2', 'Two');
+        const pick = pickEnvironment([m1.manager, m2.manager], [], { projects: [] });
+
+        // The same prefix expressed with Windows backslashes vs forward slashes must collapse to one
+        // entry: normalizePath() converts '\' to '/' on every platform, so the identity holds
+        // cross-platform. This exercises the backslash-normalization branch the POSIX-only fixtures
+        // never reach; it deliberately asserts only separator folding, not Windows-only case folding.
+        const backslash = makeEnvWithPrefix('winA', 'C:\\Users\\me\\envs\\proj', '/opt/conda/bin/conda', 'Env A');
+        const forwardSlash = makeEnvWithPrefix('winB', 'C:/Users/me/envs/proj', '/opt/conda/bin/conda', 'Env B');
+        m1.resolve([backslash]);
+        m2.resolve([forwardSlash]);
+        await flush();
+
+        assert.deepStrictEqual(
+            labels(),
+            [...STATIC_LABELS, 'One', 'Env A'],
+            'the same prefix with different path separators must be deduplicated to the first manager',
+        );
+
+        fake.cancel();
+        await pick;
+    });
+
     test('a late higher-priority manager reuses the same item object and keeps it selected', async () => {
         // Alpha is higher priority (listed first) but resolves LATER; Beta is lower priority but
         // resolves first and publishes an environment the user then activates/selects.
