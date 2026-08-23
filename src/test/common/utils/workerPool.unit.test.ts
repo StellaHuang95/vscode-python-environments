@@ -341,7 +341,6 @@ suite('WorkerPool — absolute-deadline expiration', () => {
             pBlocker.catch(() => undefined);
             await clock.tickAsync(0);
 
-            // Enqueue when the shared clock already reads 3000; the caller's absolute deadline is 5000.
             setNow(3_000);
             const pExpire = pool.addToQueue('expireme', QueuePosition.back, 5_000);
             const outcome = pExpire.then(
