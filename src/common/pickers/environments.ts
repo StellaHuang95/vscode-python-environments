@@ -8,6 +8,7 @@ import { sendTelemetryEvent } from '../telemetry/sender';
 import { isWindows } from '../utils/platformUtils';
 import { handlePythonPath } from '../utils/pythonPath';
 import {
+    QuickPickController,
     showErrorMessage,
     showOpenDialog,
     showQuickPick,
@@ -121,15 +122,17 @@ async function createEnvironment(
 }
 
 async function pickEnvironmentImpl(
-    items: (QuickPickItem | (QuickPickItem & { result: PythonEnvironment }))[],
+    items: EnvironmentPickItem[],
     managers: InternalEnvironmentManager[],
     projectEnvManagers: InternalEnvironmentManager[],
     options: EnvironmentPickOptions,
+    onDidShow?: (controller: QuickPickController<EnvironmentPickItem>) => void,
 ): Promise<PythonEnvironment | undefined> {
     const selected = await showQuickPickWithButtons(items, {
         placeHolder: Pickers.Environments.selectEnvironment,
         ignoreFocusOut: true,
         showBackButton: options?.showBackButton,
+        onDidShow,
     });
 
     if (selected && !Array.isArray(selected)) {
@@ -152,7 +155,7 @@ export async function pickEnvironment(
     projectEnvManagers: InternalEnvironmentManager[],
     options: EnvironmentPickOptions,
 ): Promise<PythonEnvironment | undefined> {
-    const items: (QuickPickItem | (QuickPickItem & { result: PythonEnvironment }))[] = [
+    const items: EnvironmentPickItem[] = [
         {
             label: Interpreter.browsePath,
             iconPath: new ThemeIcon('folder'),
@@ -188,30 +191,71 @@ export async function pickEnvironment(
         );
     }
 
-    for (const manager of managers) {
-        items.push({
-            label: manager.displayName,
-            kind: QuickPickItemKind.Separator,
+    const onDidShow = (controller: QuickPickController<EnvironmentPickItem>) => {
+        controller.setBusy(true);
+        if (managers.length === 0) {
+            controller.setBusy(false);
+            return;
+        }
+
+        const sections: (EnvironmentPickItem[] | undefined)[] = managers.map(() => undefined);
+        let remaining = managers.length;
+
+        const publish = () => {
+            const withEnvironments: EnvironmentPickItem[] = [...items];
+            for (const section of sections) {
+                if (section) {
+                    withEnvironments.push(...section);
+                }
+            }
+            controller.setItems(withEnvironments);
+        };
+
+        managers.forEach((manager, index) => {
+            void (async () => {
+                try {
+                    const environments = await manager.getEnvironments('all');
+                    const section: EnvironmentPickItem[] = [
+                        {
+                            label: manager.displayName,
+                            kind: QuickPickItemKind.Separator,
+                        },
+                    ];
+                    section.push(
+                        ...environments.map((e) => {
+                            const pathDescription = e.displayPath;
+                            const description =
+                                e.description && e.description.trim()
+                                    ? `${e.description} (${pathDescription})`
+                                    : pathDescription;
+
+                            return {
+                                label: e.displayName ?? e.name,
+                                description: description,
+                                result: e,
+                                manager: manager,
+                                iconPath: getIconPath(e.iconPath),
+                            };
+                        }),
+                    );
+                    sections[index] = section;
+                    publish();
+                } catch (reason) {
+                    traceError(
+                        `[pickEnvironment] Failed to load environments for manager "${manager.id}"; section skipped.`,
+                        reason,
+                    );
+                } finally {
+                    remaining -= 1;
+                    if (remaining === 0) {
+                        controller.setBusy(false);
+                    }
+                }
+            })();
         });
-        const envs = await manager.getEnvironments('all');
-        items.push(
-            ...envs.map((e) => {
-                const pathDescription = e.displayPath;
-                const description =
-                    e.description && e.description.trim() ? `${e.description} (${pathDescription})` : pathDescription;
+    };
 
-                return {
-                    label: e.displayName ?? e.name,
-                    description: description,
-                    result: e,
-                    manager: manager,
-                    iconPath: getIconPath(e.iconPath),
-                };
-            }),
-        );
-    }
-
-    return pickEnvironmentImpl(items, managers, projectEnvManagers, options);
+    return pickEnvironmentImpl(items, managers, projectEnvManagers, options, onDidShow);
 }
 
 export async function pickEnvironmentFrom(environments: PythonEnvironment[]): Promise<PythonEnvironment | undefined> {
@@ -233,3 +277,5 @@ export async function pickEnvironmentFrom(environments: PythonEnvironment[]): Pr
     });
     return (selected as { e: PythonEnvironment })?.e;
 }
+
+type EnvironmentPickItem = QuickPickItem | (QuickPickItem & { result: PythonEnvironment });

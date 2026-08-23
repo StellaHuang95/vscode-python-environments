@@ -33,6 +33,7 @@ import {
     ResolveEnvironmentContext,
     SetEnvironmentScope,
 } from '../api';
+import { AggregateEnvironmentError } from '../common/errors/AggregateEnvironmentError';
 import { traceError, traceInfo } from '../common/logging';
 import { pickEnvironmentManager } from '../common/pickers/managers';
 import { timeout } from '../common/utils/asyncUtils';
@@ -59,6 +60,50 @@ import { TerminalManager } from './terminal/terminalManager';
 // workspace/configuration handler) from hanging on the full environment enumeration at startup.
 const GET_ENVIRONMENT_TIMEOUT_MS = 1000;
 const GET_ENVIRONMENT_TIMED_OUT = Symbol('getEnvironmentTimedOut');
+
+// Runs `operation` on every manager concurrently, returns the successful results in manager order,
+// logs each failure, and throws AggregateEnvironmentError only when all fail (empty list -> []).
+async function collectFromManagers<T>(
+    managers: readonly InternalEnvironmentManager[],
+    context: string,
+    operation: (manager: InternalEnvironmentManager) => Promise<T>,
+): Promise<T[]> {
+    if (managers.length === 0) {
+        return [];
+    }
+
+    // Log each failure inside its own async boundary as the manager settles, so a synchronous throw
+    // or one slow/never-settling manager cannot hide the others or defer reporting of a failure.
+    const settled = await Promise.allSettled(
+        managers.map(async (manager) => {
+            try {
+                return await operation(manager);
+            } catch (err) {
+                traceError(`[${context}] Environment manager "${manager.id}" failed and was skipped.`, err);
+                throw err;
+            }
+        }),
+    );
+
+    const results: T[] = [];
+    const errors: unknown[] = [];
+    settled.forEach((outcome) => {
+        if (outcome.status === 'fulfilled') {
+            results.push(outcome.value);
+        } else {
+            errors.push(outcome.reason);
+        }
+    });
+
+    if (errors.length === managers.length) {
+        throw new AggregateEnvironmentError(
+            `[${context}] All ${managers.length} environment manager(s) failed.`,
+            errors,
+        );
+    }
+
+    return results;
+}
 
 export class PythonEnvironmentApiImpl implements PythonEnvironmentApi {
     private readonly _onDidChangeEnvironments = new EventEmitter<DidChangeEnvironmentsEventArgs>();
@@ -209,7 +254,9 @@ export class PythonEnvironmentApiImpl implements PythonEnvironmentApi {
 
         if (currentScope === undefined) {
             await waitForAllEnvManagers();
-            await Promise.all(this.envManagers.managers.map((manager) => manager.refresh(currentScope)));
+            await collectFromManagers(this.envManagers.managers, 'refreshEnvironments(all)', (manager) =>
+                manager.refresh(currentScope),
+            );
             return Promise.resolve();
         }
 
@@ -224,8 +271,11 @@ export class PythonEnvironmentApiImpl implements PythonEnvironmentApi {
         const currentScope = checkUri(scope) as GetEnvironmentsScope;
         if (currentScope === 'all' || currentScope === 'global') {
             await waitForAllEnvManagers();
-            const promises = this.envManagers.managers.map((manager) => manager.getEnvironments(currentScope));
-            const items = await Promise.all(promises);
+            const items = await collectFromManagers(
+                this.envManagers.managers,
+                `getEnvironments(${currentScope})`,
+                (manager) => manager.getEnvironments(currentScope),
+            );
             return items.flat();
         }
 
