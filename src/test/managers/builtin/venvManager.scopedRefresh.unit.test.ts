@@ -318,7 +318,7 @@ suite('VenvManager - scoped refresh preservation', () => {
         assert.deepStrictEqual(events, []);
     });
 
-    test('announces an out-of-scope environment appended while loading the project map', async () => {
+    test('does not append an out-of-scope environment while loading the project map', async () => {
         const manager = createManager();
         seed(manager, []);
 
@@ -330,14 +330,28 @@ suite('VenvManager - scoped refresh preservation', () => {
         const events = captureEvents(manager);
         await manager.refresh(Uri.file(folderA));
 
-        assert.deepStrictEqual(ids((manager as any).collection), ['A-new', 'B-PERSISTED']);
-        const changes = flatChanges(events);
+        assert.deepStrictEqual(ids((manager as any).collection), ['A-new']);
         assert.deepStrictEqual(
-            changes.map((c) => ({ id: c.environment.envId.id, kind: c.kind })),
-            [
-                { id: 'A-new', kind: EnvironmentChangeKind.add },
-                { id: 'B-PERSISTED', kind: EnvironmentChangeKind.add },
-            ],
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [[{ id: 'A-new', kind: EnvironmentChangeKind.add }]],
+        );
+    });
+
+    test('does not append a persisted global environment while loading the project map', async () => {
+        const manager = createManager();
+        seed(manager, []);
+
+        findVirtualEnvironmentsStub.resolves([makeEnv('A-new', venvARoot)]);
+        (venvUtils.getVenvForGlobal as sinon.SinonStub).resolves(venvPython(globalVenvRoot));
+        (venvUtils.resolveVenvPythonEnvironmentPath as sinon.SinonStub).resolves(makeEnv('G-PERSISTED', globalVenvRoot));
+
+        const events = captureEvents(manager);
+        await manager.refresh(Uri.file(folderA));
+
+        assert.deepStrictEqual(ids((manager as any).collection), ['A-new']);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [[{ id: 'A-new', kind: EnvironmentChangeKind.add }]],
         );
     });
 
@@ -526,6 +540,43 @@ suite('VenvManager - scoped refresh preservation', () => {
         assert.deepStrictEqual(
             events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
             [[{ id: 'A', kind: EnvironmentChangeKind.remove }]],
+        );
+    });
+
+    test('does not emit a duplicate add when a discovered env is removed and recreated with the same id during project map loading', async () => {
+        const manager = createManager();
+        seed(manager, []);
+
+        const envA = makeEnv('A', venvARoot);
+        findVirtualEnvironmentsStub.resolves([envA]);
+        sinon.stub(venvUtils, 'removeVenv').resolves(true);
+
+        const inLoadEnvMap = createDeferred<void>();
+        const release = createDeferred<void>();
+        let call = 0;
+        ((manager as any).baseManager.getEnvironments as sinon.SinonStub).callsFake(async () => {
+            call += 1;
+            if (call === 1) {
+                inLoadEnvMap.resolve();
+                await release.promise;
+            }
+            return [];
+        });
+
+        const recreated = makeEnv('A', venvARoot);
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(Uri.file(folderA));
+        await inLoadEnvMap.promise;
+        await manager.remove(envA);
+        (manager as any).addEnvironment(recreated, true);
+        release.resolve();
+        await pRefresh;
+
+        assert.strictEqual((manager as any).collection.length, 1);
+        assert.strictEqual((manager as any).collection[0], recreated);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [[{ id: 'A', kind: EnvironmentChangeKind.remove }], [{ id: 'A', kind: EnvironmentChangeKind.add }]],
         );
     });
 

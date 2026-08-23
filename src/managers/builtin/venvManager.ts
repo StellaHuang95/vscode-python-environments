@@ -378,17 +378,17 @@ export class VenvManager implements EnvironmentManager {
         } catch {
             return undefined;
         }
-        const inScope = (env: PythonEnvironment): boolean => isPathInside(scopeRoot, env.environmentPath.fsPath);
+        const inScope = (fsPath: string): boolean => isPathInside(scopeRoot, fsPath);
 
         const retained: PythonEnvironment[] = [];
         const removed: PythonEnvironment[] = [];
         for (const env of this.collection) {
-            (inScope(env) ? removed : retained).push(env);
+            (inScope(env.environmentPath.fsPath) ? removed : retained).push(env);
         }
         const seenPaths = new Set(retained.map((env) => normalizePath(env.environmentPath.fsPath)));
         const added: PythonEnvironment[] = [];
         for (const env of discovered) {
-            if (!inScope(env)) {
+            if (!inScope(env.environmentPath.fsPath)) {
                 continue;
             }
             const key = normalizePath(env.environmentPath.fsPath);
@@ -400,13 +400,13 @@ export class VenvManager implements EnvironmentManager {
         }
 
         this.collection = [...retained, ...added];
-        const appended = await this.loadEnvMap();
+        const appended = await this.loadEnvMap(inScope);
         const currentIds = new Set(this.collection.map((env) => env.envId.id));
 
         const seenAddIds = new Set<string>();
         const addChanges: DidChangeEnvironmentsEventArgs = [];
         for (const env of [...added, ...appended]) {
-            if (!currentIds.has(env.envId.id) || seenAddIds.has(env.envId.id)) {
+            if (!this.collection.includes(env) || seenAddIds.has(env.envId.id)) {
                 continue;
             }
             seenAddIds.add(env.envId.id);
@@ -615,7 +615,10 @@ export class VenvManager implements EnvironmentManager {
     /**
      * Loads and sets the global Python environment from the provided list, resolving if necessary. O(g) where g = globals.length
      */
-    private async loadGlobalEnv(globals: PythonEnvironment[]): Promise<PythonEnvironment | undefined> {
+    private async loadGlobalEnv(
+        globals: PythonEnvironment[],
+        inScope?: (fsPath: string) => boolean,
+    ): Promise<PythonEnvironment | undefined> {
         this.globalEnv = undefined;
 
         // Try to find a global environment
@@ -636,7 +639,7 @@ export class VenvManager implements EnvironmentManager {
                 );
 
                 // If the environment is resolved, add it to the collection
-                if (this.globalEnv) {
+                if (this.globalEnv && (!inScope || inScope(this.globalEnv.environmentPath.fsPath))) {
                     added = this.addEnvironment(this.globalEnv, false);
                 }
             }
@@ -652,10 +655,10 @@ export class VenvManager implements EnvironmentManager {
     /**
      * Loads and maps Python environments to their corresponding project paths in the workspace. about  O(p × e) where p = projects.len and e = environments.len
      */
-    private async loadEnvMap(): Promise<PythonEnvironment[]> {
+    private async loadEnvMap(inScope?: (fsPath: string) => boolean): Promise<PythonEnvironment[]> {
         const appended: PythonEnvironment[] = [];
         const globals = await this.baseManager.getEnvironments('global');
-        const globalAdded = await this.loadGlobalEnv(globals);
+        const globalAdded = await this.loadGlobalEnv(globals, inScope);
         if (globalAdded) {
             appended.push(globalAdded);
         }
@@ -675,6 +678,9 @@ export class VenvManager implements EnvironmentManager {
                 let foundEnv = this.findEnvironmentByPath(env, sorted) ?? this.findEnvironmentByPath(env, globals);
                 const previousEnv = this.fsPathToEnv.get(normalizedPath);
                 if (!foundEnv) {
+                    if (inScope && !inScope(env)) {
+                        continue;
+                    }
                     // attempt to resolve
                     const resolved = await resolveVenvPythonEnvironmentPath(
                         env,
