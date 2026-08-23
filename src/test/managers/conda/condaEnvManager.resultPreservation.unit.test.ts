@@ -554,6 +554,70 @@ suite('CondaEnvManager - result preservation on discovery failure', () => {
         assert.strictEqual(collection[0].version, '3.10.0', 'the collection reflects the updated metadata');
     });
 
+    test('successful refresh emits exact remove then add when a same-path environment group changes', async () => {
+        const sharedPath = Uri.file('/opt/miniconda3/envs/shared').fsPath;
+        refreshCondaEnvsStub.resolves([
+            createMockPythonEnvironment({ name: 'shared', envPath: sharedPath, version: '3.9.0', id: 'shared-old', group: 'Named' }),
+        ]);
+        const mgr = createManager();
+        await mgr.initialize();
+
+        const events = collectEvents(mgr);
+        refreshCondaEnvsStub.resolves([
+            createMockPythonEnvironment({ name: 'shared', envPath: sharedPath, version: '3.9.0', id: 'shared-new', group: 'Prefix' }),
+        ]);
+        await mgr.refresh(undefined);
+
+        assert.deepStrictEqual(
+            events.map((e) => `${e.kind}:${e.environment.name}`),
+            ['remove:shared', 'add:shared'],
+            'a changed group on the same path emits exact remove then add',
+        );
+        const collection = (mgr as any).collection;
+        assert.strictEqual(collection.length, 1, 'the changed entry replaces the old one');
+        assert.strictEqual(collection[0].group, 'Prefix', 'the collection reflects the updated group');
+    });
+
+    test('successful refresh emits exact remove then add when a same-path environment activation changes', async () => {
+        const sharedPath = Uri.file('/opt/miniconda3/envs/shared').fsPath;
+        refreshCondaEnvsStub.resolves([
+            createMockPythonEnvironment({
+                name: 'shared',
+                envPath: sharedPath,
+                version: '3.9.0',
+                id: 'shared-old',
+                activation: [{ executable: 'conda', args: ['activate', 'shared'] }],
+            }),
+        ]);
+        const mgr = createManager();
+        await mgr.initialize();
+
+        const events = collectEvents(mgr);
+        refreshCondaEnvsStub.resolves([
+            createMockPythonEnvironment({
+                name: 'shared',
+                envPath: sharedPath,
+                version: '3.9.0',
+                id: 'shared-new',
+                activation: [{ executable: 'conda', args: ['activate', 'shared', '--stack'] }],
+            }),
+        ]);
+        await mgr.refresh(undefined);
+
+        assert.deepStrictEqual(
+            events.map((e) => `${e.kind}:${e.environment.name}`),
+            ['remove:shared', 'add:shared'],
+            'a changed activation command on the same path emits exact remove then add',
+        );
+        const collection = (mgr as any).collection;
+        assert.strictEqual(collection.length, 1, 'the changed entry replaces the old one');
+        assert.deepStrictEqual(
+            collection[0].execInfo.activation,
+            [{ executable: 'conda', args: ['activate', 'shared', '--stack'] }],
+            'the collection reflects the updated activation',
+        );
+    });
+
     function createManager(): CondaEnvManager {
         const api = {
             getPythonProjects: sinon.stub().returns([]),

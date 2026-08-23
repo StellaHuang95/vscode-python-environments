@@ -7,12 +7,15 @@ import {
     DidChangeEnvironmentEventArgs,
     DidChangeEnvironmentsEventArgs,
     EnvironmentChangeKind,
+    EnvironmentGroupInfo,
     EnvironmentManager,
     GetEnvironmentScope,
     GetEnvironmentsScope,
     IconPath,
+    PythonCommandRunConfiguration,
     PythonEnvironment,
     PythonEnvironmentApi,
+    PythonEnvironmentExecutionInfo,
     PythonProject,
     QuickCreateConfig,
     RefreshEnvironmentsScope,
@@ -346,13 +349,13 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                         ...discard
                             .filter((env) => {
                                 const current = resolvedByPath.get(normalizePath(env.environmentPath.fsPath));
-                                return !current || !this.isEquivalentEnvironment(env, current);
+                                return !current || !isEquivalentEnvironment(env, current);
                             })
                             .map((env) => ({ kind: EnvironmentChangeKind.remove, environment: env })),
                         ...resolvedEnvs
                             .filter((env) => {
                                 const previous = discardedByPath.get(normalizePath(env.environmentPath.fsPath));
-                                return !previous || !this.isEquivalentEnvironment(previous, env);
+                                return !previous || !isEquivalentEnvironment(previous, env);
                             })
                             .map((env) => ({ kind: EnvironmentChangeKind.add, environment: env })),
                     ];
@@ -535,18 +538,6 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
         }
     }
 
-    private isEquivalentEnvironment(a: PythonEnvironment, b: PythonEnvironment): boolean {
-        return (
-            a.name === b.name &&
-            a.displayName === b.displayName &&
-            a.version === b.version &&
-            a.description === b.description &&
-            a.sysPrefix === b.sysPrefix &&
-            a.error === b.error &&
-            a.execInfo.run.executable === b.execInfo.run.executable
-        );
-    }
-
     private async loadEnvMap(): Promise<PythonEnvironment[]> {
         const appended: PythonEnvironment[] = [];
         this.globalEnv = undefined;
@@ -698,4 +689,170 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
             return e.name === name;
         });
     }
+}
+
+function isEquivalentEnvironment(a: PythonEnvironment, b: PythonEnvironment): boolean {
+    return (
+        a.envId.managerId === b.envId.managerId &&
+        a.name === b.name &&
+        a.displayName === b.displayName &&
+        a.shortDisplayName === b.shortDisplayName &&
+        a.displayPath === b.displayPath &&
+        a.version === b.version &&
+        a.description === b.description &&
+        a.sysPrefix === b.sysPrefix &&
+        a.error === b.error &&
+        isSameMarkdownLike(a.tooltip, b.tooltip) &&
+        isSameIconPath(a.iconPath, b.iconPath) &&
+        isSameGroup(a.group, b.group) &&
+        isSameExecInfo(a.execInfo, b.execInfo)
+    );
+}
+
+function isSameExecInfo(a: PythonEnvironmentExecutionInfo, b: PythonEnvironmentExecutionInfo): boolean {
+    return (
+        isSameRunConfig(a.run, b.run) &&
+        isSameRunConfig(a.activatedRun, b.activatedRun) &&
+        isSameRunConfigArray(a.activation, b.activation) &&
+        isSameRunConfigArray(a.deactivation, b.deactivation) &&
+        isSameShellMap(a.shellActivation, b.shellActivation) &&
+        isSameShellMap(a.shellDeactivation, b.shellDeactivation)
+    );
+}
+
+function isSameShellMap(
+    a: Map<string, PythonCommandRunConfiguration[]> | undefined,
+    b: Map<string, PythonCommandRunConfiguration[]> | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined || a.size !== b.size) {
+        return false;
+    }
+    for (const [key, value] of a) {
+        const other = b.get(key);
+        if (other === undefined || !isSameRunConfigArray(value, other)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function isSameRunConfigArray(
+    a: PythonCommandRunConfiguration[] | undefined,
+    b: PythonCommandRunConfiguration[] | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined || a.length !== b.length) {
+        return false;
+    }
+    return a.every((value, index) => isSameRunConfig(value, b[index]));
+}
+
+function isSameRunConfig(
+    a: PythonCommandRunConfiguration | undefined,
+    b: PythonCommandRunConfiguration | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+    return a.executable === b.executable && isSameStringArray(a.args, b.args);
+}
+
+function isSameStringArray(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined || a.length !== b.length) {
+        return false;
+    }
+    return a.every((value, index) => value === b[index]);
+}
+
+function isSameGroup(
+    a: string | EnvironmentGroupInfo | undefined,
+    b: string | EnvironmentGroupInfo | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+    if (typeof a === 'string' || typeof b === 'string') {
+        return a === b;
+    }
+    return (
+        a.name === b.name &&
+        a.description === b.description &&
+        isSameMarkdownLike(a.tooltip, b.tooltip) &&
+        isSameIconPath(a.iconPath, b.iconPath)
+    );
+}
+
+function isSameIconPath(a: IconPath | undefined, b: IconPath | undefined): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+    if ('id' in a || 'id' in b) {
+        return 'id' in a && 'id' in b && a.id === b.id;
+    }
+    if ('light' in a || 'light' in b) {
+        return 'light' in a && 'light' in b && isSameUri(a.light, b.light) && isSameUri(a.dark, b.dark);
+    }
+    return isSameUri(a, b);
+}
+
+function isSameMarkdownLike(
+    a: string | MarkdownString | undefined,
+    b: string | MarkdownString | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+    if (typeof a === 'string' || typeof b === 'string') {
+        return a === b;
+    }
+    return (
+        a.value === b.value &&
+        a.supportThemeIcons === b.supportThemeIcons &&
+        a.supportHtml === b.supportHtml &&
+        isSameTrusted(a.isTrusted, b.isTrusted) &&
+        isSameUri(a.baseUri, b.baseUri)
+    );
+}
+
+function isSameTrusted(
+    a: boolean | { readonly enabledCommands: readonly string[] } | undefined,
+    b: boolean | { readonly enabledCommands: readonly string[] } | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined || typeof a === 'boolean' || typeof b === 'boolean') {
+        return a === b;
+    }
+    return isSameStringArray(a.enabledCommands, b.enabledCommands);
+}
+
+function isSameUri(a: Uri | undefined, b: Uri | undefined): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+    return a.toString() === b.toString();
 }
