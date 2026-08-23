@@ -835,13 +835,18 @@ export async function resolveCondaPath(
     }
 }
 
+/**
+ * Discovers conda environments via the native finder. Returns `undefined` when discovery fails
+ * (the native finder threw/rejected) so callers can keep a known-good collection, or an array
+ * (including `[]`) on success — where `[]` authoritatively means "no conda environments".
+ */
 export async function refreshCondaEnvs(
     hardRefresh: boolean,
     nativeFinder: NativePythonFinder,
     api: PythonEnvironmentApi,
     log: LogOutputChannel,
     manager: EnvironmentManager,
-): Promise<PythonEnvironment[]> {
+): Promise<PythonEnvironment[] | undefined> {
     log.info(`Refreshing conda environments (hardRefresh=${hardRefresh})`);
 
     let data: (NativeEnvInfo | NativeEnvManagerInfo)[];
@@ -850,7 +855,7 @@ export async function refreshCondaEnvs(
     } catch (error) {
         traceError('Failed to refresh native finder for conda environments', error);
         log.error(`Failed to refresh native finder: ${error instanceof Error ? error.message : String(error)}`);
-        return [];
+        return undefined;
     }
 
     // Ensure data is a valid array before proceeding
