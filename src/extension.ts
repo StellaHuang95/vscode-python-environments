@@ -107,6 +107,7 @@ import { registerSystemPythonFeatures } from './managers/builtin/main';
 import { SysPythonManager } from './managers/builtin/sysPythonManager';
 import {
     createNativePythonFinder,
+    clearCacheDirectory,
     getNativePythonToolsPathAndSource,
     getNativePythonToolsVersion,
     NativePythonFinder,
@@ -245,6 +246,8 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
     // Initialize terminal environment variable injection
     const terminalEnvVarInjector = new TerminalEnvVarInjector(context.environmentVariableCollection, envVarManager);
     context.subscriptions.push(terminalEnvVarInjector);
+
+    let sharedNativeFinder: NativePythonFinder | undefined;
 
     context.subscriptions.push(
         shellStartupVarsMgr,
@@ -390,7 +393,15 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
         commands.registerCommand('python-envs.clearCache', async () => {
             await clearPersistentState();
             await envManagers.clearCache(undefined);
-            await clearShellProfileCache(shellStartupProviders);
+            try {
+                if (sharedNativeFinder) {
+                    await sharedNativeFinder.clearCache();
+                } else {
+                    await clearCacheDirectory(context);
+                }
+            } finally {
+                await clearShellProfileCache(shellStartupProviders);
+            }
         }),
         ...(isInlineScriptsFeatureEnabled()
             ? [
@@ -657,6 +668,7 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
                 throw petError;
             }
             context.subscriptions.push(nativeFinder);
+            sharedNativeFinder = nativeFinder;
             const sysMgr = new SysPythonManager(nativeFinder, api, outputChannel);
             sysPythonManager.resolve(sysMgr);
             // Each manager registers independently — one failure must not block the others.
