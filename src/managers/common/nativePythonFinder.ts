@@ -394,6 +394,49 @@ export async function retryRpcTimeout<T>(
     }
 }
 
+/** Chooses how a failed refresh attempt proceeds; returns `'surface'` when a retryable failure hits an exhausted budget so the caller rethrows the original (already-reported) error instead of minting a new terminal one. */
+export function decideRefreshRetryAction(
+    ex: unknown,
+    attempt: number,
+    deadlineExhausted: boolean,
+    serverExhausted: boolean,
+): 'retry' | 'fallback' | 'surface' {
+    const isRetryable =
+        (ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError;
+    if (isRetryable && attempt < MAX_REFRESH_RETRIES) {
+        return deadlineExhausted ? 'surface' : 'retry';
+    }
+    return serverExhausted ? 'fallback' : 'surface';
+}
+
+/** Single owner of terminal refresh-timeout telemetry: emits one {@link EventNames.PET_REFRESH} event only for queue-expiry / running-budget failures that produced no per-attempt telemetry. */
+export function emitTerminalRefreshTimeout(
+    ex: unknown,
+    durationMs: number,
+    petProperties: { petVersion: string; petBuildId: string; petCommitSha: string },
+): void {
+    if (!(ex instanceof QueueTaskExpiredError || ex instanceof RefreshBudgetExceededError)) {
+        return;
+    }
+    const errorType = classifyError(ex);
+    sendTelemetryEvent(
+        EventNames.PET_REFRESH,
+        getRefreshTelemetryMeasures({
+            duration: durationMs,
+            nativeInfo: [],
+            condaKind: NativePythonEnvironmentKind.conda,
+            unresolvedCount: 0,
+            attempt: 0,
+        }),
+        {
+            result: isTimeoutErrorType(errorType) ? 'timeout' : 'error',
+            errorType,
+            ...petProperties,
+        },
+        ex instanceof Error ? ex : undefined,
+    );
+}
+
 /**
  * Wraps a JSON-RPC sendRequest call with a timeout.
  * @param connection The JSON-RPC connection
@@ -726,25 +769,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 return result;
             })
             .catch((ex: unknown) => {
-                if (ex instanceof QueueTaskExpiredError || ex instanceof RefreshBudgetExceededError) {
-                    const errorType = classifyError(ex);
-                    sendTelemetryEvent(
-                        EventNames.PET_REFRESH,
-                        getRefreshTelemetryMeasures({
-                            duration: sw.elapsedTime,
-                            nativeInfo: [],
-                            condaKind: NativePythonEnvironmentKind.conda,
-                            unresolvedCount: 0,
-                            attempt: 0,
-                        }),
-                        {
-                            result: isTimeoutErrorType(errorType) ? 'timeout' : 'error',
-                            errorType,
-                            ...this.getPetInfoProperties(),
-                        },
-                        ex instanceof Error ? ex : undefined,
-                    );
-                }
+                emitTerminalRefreshTimeout(ex, sw.elapsedTime, this.getPetInfoProperties());
                 throw ex;
             })
             .finally(() => {
@@ -998,33 +1023,37 @@ class NativePythonFinderImpl implements NativePythonFinder {
                     throw ex;
                 }
 
-                // Retry on timeout or connection errors (PET hung or crashed mid-request)
-                const isRetryable =
-                    (ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError;
-                if (isRetryable) {
-                    if (attempt < MAX_REFRESH_RETRIES) {
-                        if (deadline?.isExhausted()) {
-                            throw new RefreshBudgetExceededError('refresh_retry', deadline.remainingMs());
-                        }
-                        const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
-                        this.outputChannel.warn(
-                            `[pet] Refresh ${reason} (attempt ${attempt + 1}/${MAX_REFRESH_RETRIES + 1}), restarting and retrying...`,
-                        );
-                        // Kill and restart for retry
-                        this.killProcess();
-                        this.processExited = true;
-                        this.processExitReason =
-                            ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
-                        continue;
-                    }
-                    // Final attempt failed
+                const action = decideRefreshRetryAction(
+                    ex,
+                    attempt,
+                    deadline?.isExhausted() ?? false,
+                    this.isServerExhausted(),
+                );
+
+                if (action === 'retry') {
+                    const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
+                    this.outputChannel.warn(
+                        `[pet] Refresh ${reason} (attempt ${attempt + 1}/${MAX_REFRESH_RETRIES + 1}), restarting and retrying...`,
+                    );
+                    this.killProcess();
+                    this.processExited = true;
+                    this.processExitReason =
+                        ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
+                    continue;
+                }
+
+                if (
+                    attempt === MAX_REFRESH_RETRIES &&
+                    ((ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError)
+                ) {
                     this.outputChannel.error(`[pet] Refresh failed after ${MAX_REFRESH_RETRIES + 1} attempts`);
                 }
-                // Non-timeout errors or final timeout — check if server is fully exhausted
-                if (this.isServerExhausted()) {
+
+                if (action === 'fallback') {
                     this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh');
                     return this.refreshViaJsonCli(options, deadline);
                 }
+
                 throw ex;
             }
         }

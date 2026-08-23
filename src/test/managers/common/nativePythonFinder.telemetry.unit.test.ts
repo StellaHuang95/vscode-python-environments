@@ -1,7 +1,11 @@
 import assert from 'node:assert';
+import * as sinon from 'sinon';
+import * as rpc from 'vscode-jsonrpc/node';
 import {
+    emitTerminalRefreshTimeout,
     NativeInfo,
     NativePythonEnvironmentKind,
+    RefreshBudgetExceededError,
     RpcTimeoutError,
     retryRpcTimeout,
 } from '../../../managers/common/nativePythonFinder';
@@ -9,6 +13,9 @@ import {
     getRefreshTelemetryMeasures,
     shouldRetainPetInfo,
 } from '../../../managers/common/petTelemetry';
+import { EventNames } from '../../../common/telemetry/constants';
+import * as sender from '../../../common/telemetry/sender';
+import { QueueTaskExpiredError } from '../../../common/utils/workerPool';
 
 suite('NativePythonFinder telemetry', () => {
     test('builds numeric refresh measures with available context', () => {
@@ -157,5 +164,56 @@ suite('NativePythonFinder telemetry', () => {
             RpcTimeoutError,
         );
         assert.strictEqual(attempts, 3);
+    });
+});
+
+suite('NativePythonFinder terminal refresh-timeout telemetry (emitTerminalRefreshTimeout)', () => {
+    let sendTelemetryEventStub: sinon.SinonStub;
+    const petProps = { petVersion: 'v1', petBuildId: 'b1', petCommitSha: 's1' };
+
+    setup(() => {
+        sendTelemetryEventStub = sinon.stub(sender, 'sendTelemetryEvent');
+    });
+
+    teardown(() => {
+        sinon.restore();
+    });
+
+    test('emits exactly one PET_REFRESH timeout for a running-stage budget exhaustion', () => {
+        emitTerminalRefreshTimeout(new RefreshBudgetExceededError('restart', 0), 1234, petProps);
+
+        assert.strictEqual(sendTelemetryEventStub.callCount, 1, 'exactly one terminal event');
+        const [event, , properties, error] = sendTelemetryEventStub.firstCall.args;
+        assert.strictEqual(event, EventNames.PET_REFRESH);
+        assert.strictEqual(properties.result, 'timeout');
+        assert.strictEqual(properties.errorType, 'rpc_timeout');
+        assert.strictEqual(properties.petVersion, 'v1', 'PET info properties are forwarded');
+        assert.ok(error instanceof RefreshBudgetExceededError, 'the error object is forwarded');
+    });
+
+    test('emits exactly one PET_REFRESH timeout for a queue expiry', () => {
+        emitTerminalRefreshTimeout(new QueueTaskExpiredError(184_000), 10, petProps);
+
+        assert.strictEqual(sendTelemetryEventStub.callCount, 1);
+        const [event, , properties] = sendTelemetryEventStub.firstCall.args;
+        assert.strictEqual(event, EventNames.PET_REFRESH);
+        assert.strictEqual(properties.result, 'timeout');
+    });
+
+    test('stays silent for a per-attempt RPC timeout surfaced by the retry path (no double emission)', () => {
+        emitTerminalRefreshTimeout(new RpcTimeoutError('refresh', 30_000), 10, petProps);
+
+        assert.strictEqual(
+            sendTelemetryEventStub.callCount,
+            0,
+            'a surfaced attempt error was already reported by doRefreshAttempt; the terminal owner must not re-emit',
+        );
+    });
+
+    test('stays silent for connection errors and generic errors', () => {
+        emitTerminalRefreshTimeout(new rpc.ConnectionError(rpc.ConnectionErrors.Closed, 'closed'), 10, petProps);
+        emitTerminalRefreshTimeout(new Error('boom'), 10, petProps);
+
+        assert.strictEqual(sendTelemetryEventStub.callCount, 0);
     });
 });

@@ -2,16 +2,19 @@
 // Licensed under the MIT License.
 
 import assert from 'node:assert';
+import * as rpc from 'vscode-jsonrpc/node';
 import {
     backoffThenCheckBudget,
     clampTimeoutToRemaining,
     computeRefreshOperationBudgetMs,
+    decideRefreshRetryAction,
     Deadline,
     MIN_STAGE_BUDGET_MS,
     MonotonicClock,
     REFRESH_OPERATION_BUDGET_MS,
     RefreshBudgetExceededError,
     resolveTimeoutForRefresh,
+    RpcTimeoutError,
 } from '../../../managers/common/nativePythonFinder';
 
 function makeClock(start = 0): { clock: MonotonicClock; advance(ms: number): void; set(ms: number): void } {
@@ -220,5 +223,45 @@ suite('Bounded refresh latency — RefreshBudgetExceededError', () => {
         assert.ok(err instanceof Error);
         assert.ok(err instanceof RefreshBudgetExceededError);
         assert.strictEqual(err.message, "Refresh operation budget exceeded at stage 'restart' (remaining 250ms)");
+    });
+});
+
+suite('Bounded refresh latency — decideRefreshRetryAction (terminal telemetry owner)', () => {
+    const refreshTimeout = () => new RpcTimeoutError('refresh', 30_000);
+    const configureTimeout = () => new RpcTimeoutError('configure', 60_000);
+    const connectionError = () => new rpc.ConnectionError(rpc.ConnectionErrors.Closed, 'closed');
+
+    test('retries a retryable failure while budget remains and a retry is left', () => {
+        assert.strictEqual(decideRefreshRetryAction(refreshTimeout(), 0, false, false), 'retry');
+        assert.strictEqual(decideRefreshRetryAction(connectionError(), 0, false, false), 'retry');
+    });
+
+    test('surfaces the original error when the budget is exhausted mid-retry (no new terminal budget error)', () => {
+        assert.strictEqual(
+            decideRefreshRetryAction(refreshTimeout(), 0, true, false),
+            'surface',
+            'an exhausted budget must surface the already-reported attempt error so terminal telemetry is emitted once',
+        );
+        assert.strictEqual(decideRefreshRetryAction(connectionError(), 0, true, false), 'surface');
+    });
+
+    test('an exhausted budget mid-retry short-circuits before the server-exhausted CLI fallback', () => {
+        assert.strictEqual(decideRefreshRetryAction(refreshTimeout(), 0, true, true), 'surface');
+    });
+
+    test('after the final attempt, surfaces when the server is not exhausted and falls back when it is', () => {
+        assert.strictEqual(decideRefreshRetryAction(refreshTimeout(), 1, false, false), 'surface');
+        assert.strictEqual(decideRefreshRetryAction(refreshTimeout(), 1, false, true), 'fallback');
+    });
+
+    test('treats a configure timeout as non-retryable within the refresh loop', () => {
+        assert.strictEqual(decideRefreshRetryAction(configureTimeout(), 0, false, false), 'surface');
+        assert.strictEqual(decideRefreshRetryAction(configureTimeout(), 0, false, true), 'fallback');
+    });
+
+    test('surfaces non-retryable errors, or falls back when the server is exhausted', () => {
+        const generic = new Error('boom');
+        assert.strictEqual(decideRefreshRetryAction(generic, 0, false, false), 'surface');
+        assert.strictEqual(decideRefreshRetryAction(generic, 0, false, true), 'fallback');
     });
 });
