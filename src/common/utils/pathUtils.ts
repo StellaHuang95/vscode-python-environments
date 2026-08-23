@@ -65,6 +65,20 @@ export function normalizePath(fsPath: string): string {
     return path1;
 }
 
+/**
+ * Returns `true` when `candidateFsPath` is the same path as, or nested inside, `scopeFsPath`
+ * (inclusive of the scope itself). Both operands are resolved to absolute paths and compared with
+ * `path.relative`, so sibling directories sharing a name prefix (e.g. `.../app` vs `.../app-2`) are
+ * correctly treated as outside the scope.
+ */
+export function isPathInside(scopeFsPath: string, candidateFsPath: string): boolean {
+    const relative = path.relative(path.resolve(scopeFsPath), path.resolve(candidateFsPath));
+    return (
+        relative === '' ||
+        (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+    );
+}
+
 export function getResourceUri(resourcePath: string, root?: string): Uri | undefined {
     try {
         if (!resourcePath) {
