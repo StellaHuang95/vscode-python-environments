@@ -1,6 +1,7 @@
 import { CancellationError } from 'vscode';
 import * as rpc from 'vscode-jsonrpc/node';
-import { RpcTimeoutError } from '../../managers/common/nativePythonFinder';
+import { RefreshBudgetExceededError, RpcTimeoutError } from '../../managers/common/nativePythonFinder';
+import { QueueTaskExpiredError } from '../utils/workerPool';
 import { BaseError } from '../errors/types';
 
 export type DiscoveryErrorType =
@@ -47,6 +48,11 @@ export function classifyError(ex: unknown): DiscoveryErrorType {
             default:
                 return 'rpc_timeout';
         }
+    }
+
+    // Queue-expiry and refresh-budget errors are time-budget exhaustions → generic RPC timeout category.
+    if (ex instanceof QueueTaskExpiredError || ex instanceof RefreshBudgetExceededError) {
+        return 'rpc_timeout';
     }
 
     // JSON-RPC connection errors (e.g., PET process died mid-request, connection closed/disposed)
