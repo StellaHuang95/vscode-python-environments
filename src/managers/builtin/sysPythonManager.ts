@@ -71,7 +71,8 @@ export class SysPythonManager implements EnvironmentManager {
             return this._initialized.promise;
         }
 
-        this._initialized = createDeferred();
+        const initialized = createDeferred<void>();
+        this._initialized = initialized;
 
         try {
             await this.internalRefresh(false, SysManagerStrings.sysManagerDiscovering);
@@ -96,8 +97,13 @@ export class SysPythonManager implements EnvironmentManager {
                     }
                 }
             }
+        } catch (ex) {
+            if (this._initialized === initialized) {
+                this._initialized = undefined;
+            }
+            throw ex;
         } finally {
-            this._initialized.resolve();
+            initialized.resolve();
         }
     }
 
