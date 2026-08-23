@@ -144,6 +144,12 @@ export interface QuickPickButtonEvent<T extends QuickPickItem> {
     readonly button: QuickInputButton;
 }
 
+/** Populates items and toggles the busy indicator on a shown quick pick; no-ops once it settles. */
+export interface QuickPickController<T extends QuickPickItem> {
+    setItems(items: readonly T[]): void;
+    setBusy(busy: boolean): void;
+}
+
 export function showQuickPick<T extends QuickPickItem>(
     items: readonly T[] | Thenable<readonly T[]>,
     options?: QuickPickOptions,
@@ -167,13 +173,19 @@ export function withProgress<R>(
 
 export async function showQuickPickWithButtons<T extends QuickPickItem>(
     items: readonly T[],
-    options?: QuickPickOptions & { showBackButton?: boolean; buttons?: QuickInputButton[]; selected?: T[] },
+    options?: QuickPickOptions & {
+        showBackButton?: boolean;
+        buttons?: QuickInputButton[];
+        selected?: T[];
+        onDidShow?: (controller: QuickPickController<T>) => void;
+    },
     token?: CancellationToken,
     itemButtonHandler?: (e: QuickPickItemButtonEvent<T>) => void,
 ): Promise<T | T[] | undefined> {
     const quickPick: QuickPick<T> = window.createQuickPick<T>();
     const disposables: Disposable[] = [quickPick];
     const deferred = createDeferred<T | T[] | undefined>();
+    let disposed = false;
 
     quickPick.items = items;
     quickPick.canSelectMany = options?.canPickMany ?? false;
@@ -234,8 +246,35 @@ export async function showQuickPickWithButtons<T extends QuickPickItem>(
     quickPick.show();
 
     try {
+        if (options?.onDidShow) {
+            const controller: QuickPickController<T> = {
+                setBusy(busy: boolean) {
+                    if (deferred.completed || disposed) {
+                        return;
+                    }
+                    quickPick.busy = busy;
+                },
+                setItems(newItems: readonly T[]) {
+                    if (deferred.completed || disposed) {
+                        return;
+                    }
+                    const activeItems = quickPick.activeItems.filter((item) => newItems.includes(item));
+                    const selectedItems = quickPick.selectedItems.filter((item) => newItems.includes(item));
+                    quickPick.items = newItems;
+                    if (activeItems.length > 0) {
+                        quickPick.activeItems = activeItems;
+                    }
+                    if (selectedItems.length > 0) {
+                        quickPick.selectedItems = selectedItems;
+                    }
+                },
+            };
+            options.onDidShow(controller);
+        }
+
         return await deferred.promise;
     } finally {
+        disposed = true;
         disposables.forEach((d) => d.dispose());
     }
 }

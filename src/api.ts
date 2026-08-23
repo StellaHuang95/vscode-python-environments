@@ -1049,6 +1049,9 @@ export interface PythonEnvironmentsApi {
      * Initiates a refresh of Python environments within the specified scope.
      * @param scope - The scope within which to search for environments.
      * @returns A promise that resolves when the search is complete.
+     * @throws When the scope spans all managers and every manager fails, the promise rejects with an
+     * aggregate error whose `errors` array holds each manager's failure (mirroring the standard
+     * `AggregateError` shape). If at least one manager succeeds, the refresh resolves.
      */
     refreshEnvironments(scope: RefreshEnvironmentsScope): Promise<void>;
 
@@ -1056,6 +1059,10 @@ export interface PythonEnvironmentsApi {
      * Retrieves a list of Python environments within the specified scope.
      * @param scope - The scope within which to retrieve environments.
      * @returns A promise that resolves to an array of Python environments.
+     * @throws When the scope spans all managers and every manager fails, the promise rejects with an
+     * aggregate error whose `errors` array holds each manager's failure (mirroring the standard
+     * `AggregateError` shape). If at least one manager succeeds, only the successful managers'
+     * environments are returned.
      */
     getEnvironments(scope: GetEnvironmentsScope): Promise<PythonEnvironment[]>;
 
