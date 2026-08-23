@@ -11,8 +11,10 @@ import {
     Deadline,
     MIN_STAGE_BUDGET_MS,
     MonotonicClock,
+    NativeEnvInfo,
     REFRESH_OPERATION_BUDGET_MS,
     RefreshBudgetExceededError,
+    resolveOrRetainEnv,
     resolveTimeoutForRefresh,
     RpcTimeoutError,
 } from '../../../managers/common/nativePythonFinder';
@@ -263,5 +265,29 @@ suite('Bounded refresh latency — decideRefreshRetryAction (terminal telemetry 
         const generic = new Error('boom');
         assert.strictEqual(decideRefreshRetryAction(generic, 0, false, false), 'surface');
         assert.strictEqual(decideRefreshRetryAction(generic, 0, false, true), 'fallback');
+    });
+});
+
+suite('Bounded refresh latency — resolveOrRetainEnv', () => {
+    test('returns the resolved environment on success and does not report an error', async () => {
+        const resolved: NativeEnvInfo = { executable: '/py', version: '3.12', prefix: '/env' };
+        const raw: NativeEnvInfo = { executable: '/py' };
+        let reported = false;
+        const result = await resolveOrRetainEnv(Promise.resolve(resolved), raw, () => {
+            reported = true;
+        });
+        assert.strictEqual(result, resolved);
+        assert.strictEqual(reported, false);
+    });
+
+    test('retains the raw discovered record when a clamped resolve times out, reporting the error', async () => {
+        const raw: NativeEnvInfo = { executable: '/py' };
+        const timeout = new RpcTimeoutError('resolve', 1_000);
+        let reportedError: unknown;
+        const result = await resolveOrRetainEnv(Promise.reject(timeout), raw, (ex) => {
+            reportedError = ex;
+        });
+        assert.strictEqual(result, raw, 'a timed-out resolve must retain the raw record instead of dropping the env');
+        assert.strictEqual(reportedError, timeout);
     });
 });

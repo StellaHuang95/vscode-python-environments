@@ -176,6 +176,20 @@ export function resolveTimeoutForRefresh(deadline: Deadline | undefined): number
     }
 }
 
+/** Awaits a refresh-time resolve and retains the raw incomplete record if it rejects, so a timed-out or failed resolve never silently drops a discovered environment. */
+export async function resolveOrRetainEnv(
+    resolve: Promise<NativeEnvInfo>,
+    rawData: NativeEnvInfo,
+    onError: (ex: unknown) => void,
+): Promise<NativeEnvInfo> {
+    try {
+        return await resolve;
+    } catch (ex) {
+        onError(ex);
+        return rawData;
+    }
+}
+
 export type NativePythonToolsSource = 'envs_extension' | 'python_extension';
 
 export async function getNativePythonToolsPath(): Promise<string> {
@@ -1096,22 +1110,23 @@ class NativePythonFinderImpl implements NativePythonFinder {
                             nativeInfo.push(data);
                             return;
                         }
+                        const resolveRequest = sendRequestWithTimeout<NativeEnvInfo>(
+                            this.connection,
+                            'resolve',
+                            { executable: data.executable },
+                            resolveTimeout,
+                        ).then((environment: NativeEnvInfo) => {
+                            this.outputChannel.info(
+                                `Resolved environment during PET refresh: ${environment.executable}`,
+                            );
+                            return environment;
+                        });
                         unresolved.push(
-                            sendRequestWithTimeout<NativeEnvInfo>(
-                                this.connection,
-                                'resolve',
-                                { executable: data.executable },
-                                resolveTimeout,
-                            )
-                                .then((environment: NativeEnvInfo) => {
-                                    this.outputChannel.info(
-                                        `Resolved environment during PET refresh: ${environment.executable}`,
-                                    );
-                                    nativeInfo.push(environment);
-                                })
-                                .catch((ex) =>
-                                    this.outputChannel.error(`Error in Resolving ${JSON.stringify(data)}`, ex),
-                                ),
+                            resolveOrRetainEnv(resolveRequest, data, (ex) =>
+                                this.outputChannel.error(`Error in Resolving ${JSON.stringify(data)}`, ex),
+                            ).then((env) => {
+                                nativeInfo.push(env);
+                            }),
                         );
                     } else {
                         nativeInfo.push(data);
