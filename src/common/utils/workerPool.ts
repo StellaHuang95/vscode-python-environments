@@ -51,11 +51,12 @@ export interface WorkerPool<T, R> extends Worker {
      * @method addToQueue
      * @param {T} item: Item to process
      * @param {QueuePosition} position: Add items to the front or back of the queue.
-     * @param {number} expiresInMs: Optional. When set, a still-queued item is rejected with
-     *        {@link QueueTaskExpiredError} after this many ms and never runs; omit to queue unbounded.
+     * @param {number} expiresAt: Optional absolute deadline on the pool's clock. A still-queued item
+     *        is rejected with {@link QueueTaskExpiredError} once the clock reaches it and never runs;
+     *        omit to queue unbounded.
      * @returns A promise that when resolved gets the result from running the worker function.
      */
-    addToQueue(item: T, position?: QueuePosition, expiresInMs?: number): Promise<R>;
+    addToQueue(item: T, position?: QueuePosition, expiresAt?: number): Promise<R>;
 }
 
 class WorkerImpl<T, R> implements Worker {
@@ -96,7 +97,7 @@ class WorkQueue<T, R> {
 
     public constructor(private readonly now: QueueClock = Date.now) {}
 
-    public add(item: T, position?: QueuePosition, expiresInMs?: number): Promise<R> {
+    public add(item: T, position?: QueuePosition, expiresAt?: number): Promise<R> {
         // Wrap the user provided item in a wrapper object. This will allow us to track multiple
         // submissions of the same item. For example, addToQueue(2), addToQueue(2). If we did not
         // wrap this, then from the map both submissions will look the same. Since this is a generic
@@ -116,10 +117,11 @@ class WorkQueue<T, R> {
         const deferred = createDeferred<R>();
         this.results.set(workItem, deferred);
 
-        if (expiresInMs !== undefined) {
-            workItem.expiresInMs = expiresInMs;
-            workItem.expiresAt = this.now() + expiresInMs;
-            workItem.expiryTimer = setTimeout(() => this.expire(workItem), Math.max(0, expiresInMs));
+        if (expiresAt !== undefined) {
+            const remainingMs = Math.max(0, expiresAt - this.now());
+            workItem.expiresAt = expiresAt;
+            workItem.expiresInMs = remainingMs;
+            workItem.expiryTimer = setTimeout(() => this.expire(workItem), remainingMs);
         }
 
         return deferred.promise;
@@ -224,14 +226,14 @@ class WorkerPoolImpl<T, R> implements WorkerPool<T, R> {
         this.queue = new WorkQueue<T, R>(now);
     }
 
-    public addToQueue(item: T, position?: QueuePosition, expiresInMs?: number): Promise<R> {
+    public addToQueue(item: T, position?: QueuePosition, expiresAt?: number): Promise<R> {
         if (this.stopProcessing) {
             throw Error('Queue is stopped');
         }
 
         // This promise when resolved should return the processed result of the item
         // being added to the queue.
-        const deferred = this.queue.add(item, position, expiresInMs);
+        const deferred = this.queue.add(item, position, expiresAt);
 
         const worker = this.waitingWorkersUnblockQueue.shift();
         if (worker) {

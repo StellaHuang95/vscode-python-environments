@@ -11,6 +11,7 @@ import {
     MonotonicClock,
     REFRESH_OPERATION_BUDGET_MS,
     RefreshBudgetExceededError,
+    resolveTimeoutForRefresh,
 } from '../../../managers/common/nativePythonFinder';
 
 function makeClock(start = 0): { clock: MonotonicClock; advance(ms: number): void; set(ms: number): void } {
@@ -118,6 +119,42 @@ suite('Bounded refresh latency — Deadline', () => {
         set(9_500); // remaining 500
         assert.strictEqual(dl.isExhausted(100), false, '500 remaining is above a 100ms floor');
         assert.strictEqual(dl.isExhausted(1_000), true, '500 remaining is below a 1000ms floor');
+    });
+
+    test('expiresAt is the fixed absolute instant shared with the queue, independent of the clock', () => {
+        const { clock, set } = makeClock(1_000);
+        const dl = new Deadline(REFRESH_OPERATION_BUDGET_MS, clock);
+        assert.strictEqual(dl.expiresAt, 1_000 + REFRESH_OPERATION_BUDGET_MS);
+
+        set(1_000 + REFRESH_OPERATION_BUDGET_MS);
+        assert.strictEqual(dl.remainingMs(), 0);
+        assert.strictEqual(dl.expiresAt, 1_000 + REFRESH_OPERATION_BUDGET_MS, 'expiresAt does not move with the clock');
+    });
+});
+
+suite('Bounded refresh latency — resolveTimeoutForRefresh', () => {
+    const RESOLVE_TIMEOUT_MS = 30_000;
+
+    test('returns the base resolve timeout when no deadline is supplied (non-refresh resolve unchanged)', () => {
+        assert.strictEqual(resolveTimeoutForRefresh(undefined), RESOLVE_TIMEOUT_MS);
+    });
+
+    test('clamps the resolve timeout to the remaining budget', () => {
+        const { clock, set } = makeClock();
+        const dl = new Deadline(100_000, clock);
+        set(80_000); // remaining 20s
+        assert.strictEqual(resolveTimeoutForRefresh(dl), 20_000);
+    });
+
+    test('preserves the record (undefined) when a late notification arrives below the floor', () => {
+        const { clock, set } = makeClock();
+        const dl = new Deadline(100_000, clock);
+        set(99_500); // remaining 500 < MIN_STAGE_BUDGET_MS → budget spent
+        assert.strictEqual(
+            resolveTimeoutForRefresh(dl),
+            undefined,
+            'an exhausted budget must signal preserve-raw, not drop the discovered env',
+        );
     });
 });
 

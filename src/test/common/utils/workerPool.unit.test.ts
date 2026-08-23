@@ -196,14 +196,14 @@ suite('WorkerPool — pending-task expiration', () => {
         }
     });
 
-    test('omitting expiresInMs preserves the original unbounded queueing behavior', async () => {
+    test('omitting the deadline preserves the original unbounded queueing behavior', async () => {
         const { pool, started, blockerGate } = makeBlockingPool();
         try {
             const pBlocker = pool.addToQueue('blocker');
             pBlocker.catch(() => undefined);
             await clock.tickAsync(0);
 
-            // No expiresInMs → the queued item must never expire.
+            // No expiresAt → the queued item must never expire.
             const pQueued = pool.addToQueue('patient', QueuePosition.back);
             let settled = false;
             pQueued.then(
@@ -212,7 +212,7 @@ suite('WorkerPool — pending-task expiration', () => {
             );
 
             await clock.tickAsync(60 * 60 * 1000);
-            assert.strictEqual(settled, false, 'a task without expiresInMs must not expire while queued');
+            assert.strictEqual(settled, false, 'a task without a deadline must not expire while queued');
             assert.ok(!started.includes('patient'), 'still queued behind the blocker');
 
             blockerGate.resolve('blocker');
@@ -334,6 +334,34 @@ suite('WorkerPool — absolute-deadline expiration', () => {
         }
     });
 
+    test('expiresAt is the caller-supplied absolute instant, not a budget recaptured at enqueue', async () => {
+        const { pool, started, blockerGate, setNow } = makeInjectedClockPool();
+        try {
+            const pBlocker = pool.addToQueue('blocker');
+            pBlocker.catch(() => undefined);
+            await clock.tickAsync(0);
+
+            // Enqueue when the shared clock already reads 3000; the caller's absolute deadline is 5000.
+            setNow(3_000);
+            const pExpire = pool.addToQueue('expireme', QueuePosition.back, 5_000);
+            const outcome = pExpire.then(
+                () => ({ ok: true as const }),
+                (e: unknown) => ({ ok: false as const, err: e }),
+            );
+
+            setNow(5_000);
+            blockerGate.resolve('blocker');
+            await clock.tickAsync(0);
+
+            const result = await outcome;
+            assert.strictEqual(result.ok, false, 'the absolute deadline (5000) must expire at now=5000');
+            assert.ok(!result.ok && result.err instanceof QueueTaskExpiredError);
+            assert.ok(!started.includes('expireme'), 'a past-deadline item must never execute');
+        } finally {
+            pool.stop();
+        }
+    });
+
     test('next() skips a stalled-expired item and continues to the next valid queued item', async () => {
         const { pool, started, blockerGate, setNow } = makeInjectedClockPool();
         try {
@@ -363,7 +391,7 @@ suite('WorkerPool — absolute-deadline expiration', () => {
         }
     });
 
-    test('enqueuing an already-expired item (non-positive expiresInMs) rejects it without stranding the parked worker', async () => {
+    test('enqueuing an already-expired item (deadline at or before now) rejects it without stranding the parked worker', async () => {
         const started: string[] = [];
         const pool = createRunningWorkerPool<string, string>(
             async (i: string) => {

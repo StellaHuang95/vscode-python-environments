@@ -16,7 +16,7 @@ import { classifyError, isTimeoutErrorType } from '../../common/telemetry/errorC
 import { sendTelemetryEvent } from '../../common/telemetry/sender';
 import { untildify, untildifyArray } from '../../common/utils/pathUtils';
 import { isWindows } from '../../common/utils/platformUtils';
-import { createRunningWorkerPool, QueuePosition, WorkerPool } from '../../common/utils/workerPool';
+import { createRunningWorkerPool, QueuePosition, QueueTaskExpiredError, WorkerPool } from '../../common/utils/workerPool';
 import { getConfiguration, getWorkspaceFolders } from '../../common/workspace.apis';
 import {
     getRefreshTelemetryMeasures,
@@ -132,6 +132,10 @@ export class Deadline {
     isExhausted(floorMs: number = MIN_STAGE_BUDGET_MS): boolean {
         return this.remainingMs() < floorMs;
     }
+
+    get expiresAt(): number {
+        return this.deadlineAt;
+    }
 }
 
 /** Rejects a bounded refresh (or one of its stages) once the operation budget is spent. */
@@ -159,6 +163,17 @@ export function clampTimeoutToRemaining(
         throw new RefreshBudgetExceededError(stage, remaining);
     }
     return Math.min(baseTimeoutMs, remaining);
+}
+
+export function resolveTimeoutForRefresh(deadline: Deadline | undefined): number | undefined {
+    try {
+        return clampTimeoutToRemaining(RESOLVE_TIMEOUT_MS, deadline, 'refresh_resolve');
+    } catch (ex) {
+        if (ex instanceof RefreshBudgetExceededError) {
+            return undefined;
+        }
+        throw ex;
+    }
 }
 
 export type NativePythonToolsSource = 'envs_extension' | 'python_extension';
@@ -465,6 +480,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
             async (work) => await this.doRefresh(work.options, work.deadline),
             1,
             'NativeRefresh-task',
+            defaultMonotonicClock,
         );
     }
 
@@ -694,12 +710,13 @@ class NativePythonFinderImpl implements NativePythonFinder {
 
         // One deadline captured at enqueue: the pool expires the queued item and the same deadline clamps every running stage.
         const deadline = new Deadline(REFRESH_OPERATION_BUDGET_MS);
+        const sw = new StopWatch();
 
         // .finally clears the in-flight slot on both success AND failure paths so
         // a rejected refresh does not poison the cache — the next call after a
         // failure starts a fresh attempt, matching today's behavior.
         const refreshPromise = this.pool
-            .addToQueue({ options, deadline }, QueuePosition.back, REFRESH_OPERATION_BUDGET_MS)
+            .addToQueue({ options, deadline }, QueuePosition.back, deadline.expiresAt)
             .then((result) => {
                 if (!result || !Array.isArray(result)) {
                     this.outputChannel.warn(`[pet] Worker pool returned invalid result type: ${typeof result}`);
@@ -707,6 +724,28 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 }
                 this.cache.set(key, result);
                 return result;
+            })
+            .catch((ex: unknown) => {
+                if (ex instanceof QueueTaskExpiredError || ex instanceof RefreshBudgetExceededError) {
+                    const errorType = classifyError(ex);
+                    sendTelemetryEvent(
+                        EventNames.PET_REFRESH,
+                        getRefreshTelemetryMeasures({
+                            duration: sw.elapsedTime,
+                            nativeInfo: [],
+                            condaKind: NativePythonEnvironmentKind.conda,
+                            unresolvedCount: 0,
+                            attempt: 0,
+                        }),
+                        {
+                            result: isTimeoutErrorType(errorType) ? 'timeout' : 'error',
+                            errorType,
+                            ...this.getPetInfoProperties(),
+                        },
+                        ex instanceof Error ? ex : undefined,
+                    );
+                }
+                throw ex;
             })
             .finally(() => {
                 this.inFlightRefreshes.delete(key);
@@ -1023,10 +1062,9 @@ class NativePythonFinderImpl implements NativePythonFinder {
                     this.outputChannel.info(`Discovered env: ${data.executable || data.prefix}`);
                     if (data.executable && (!data.version || !data.prefix)) {
                         unresolvedCount++;
-                        let resolveTimeout: number;
-                        try {
-                            resolveTimeout = clampTimeoutToRemaining(RESOLVE_TIMEOUT_MS, deadline, 'refresh_resolve');
-                        } catch {
+                        const resolveTimeout = resolveTimeoutForRefresh(deadline);
+                        if (resolveTimeout === undefined) {
+                            nativeInfo.push(data);
                             return;
                         }
                         unresolved.push(
