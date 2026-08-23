@@ -343,7 +343,7 @@ async function sendRequestWithTimeout<T>(
     }
 }
 
-type KillablePetProcess = Pick<ChildProcess, 'kill' | 'exitCode'>;
+type KillablePetProcess = Pick<ChildProcess, 'kill' | 'exitCode' | 'signalCode'>;
 
 /**
  * Terminates a PET child process, capturing it before signalling so the delayed SIGKILL only ever
@@ -357,12 +357,12 @@ export function killPetProcessWithGrace(
 ): void {
     const proc = getProc();
     clearProc();
-    if (proc && proc.exitCode === null) {
+    if (proc && proc.exitCode === null && proc.signalCode === null) {
         try {
             outputChannel.info('[pet] Killing hung/crashed PET process');
             proc.kill('SIGTERM');
             setTimeout(() => {
-                if (proc.exitCode === null) {
+                if (proc.exitCode === null && proc.signalCode === null) {
                     proc.kill('SIGKILL');
                 }
             }, graceMs);

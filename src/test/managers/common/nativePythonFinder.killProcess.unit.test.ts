@@ -18,8 +18,11 @@ suite('killPetProcessWithGrace (PET force-kill ownership)', () => {
         sinon.restore();
     });
 
-    function makeProc(exitCode: number | null = null): { exitCode: number | null; kill: sinon.SinonStub } {
-        return { exitCode, kill: sinon.stub().returns(true) };
+    function makeProc(
+        exitCode: number | null = null,
+        signalCode: NodeJS.Signals | null = null,
+    ): { exitCode: number | null; signalCode: NodeJS.Signals | null; kill: sinon.SinonStub } {
+        return { exitCode, signalCode, kill: sinon.stub().returns(true) };
     }
 
     test('sends SIGTERM to the running child and relinquishes ownership synchronously', () => {
@@ -76,6 +79,27 @@ suite('killPetProcessWithGrace (PET force-kill ownership)', () => {
         clock.tick(GRACE_MS);
 
         assert.ok(original.kill.calledOnceWithExactly('SIGTERM'), 'only SIGTERM, no SIGKILL for an exited child');
+    });
+
+    test('does not force-kill a child terminated by SIGTERM during the grace period', () => {
+        const original = makeProc(null);
+        let holder: typeof original | undefined = original;
+
+        killPetProcessWithGrace(
+            () => holder,
+            () => {
+                holder = undefined;
+            },
+            outputChannel,
+        );
+
+        original.signalCode = 'SIGTERM';
+        clock.tick(GRACE_MS);
+
+        assert.ok(
+            original.kill.calledOnceWithExactly('SIGTERM'),
+            'only SIGTERM, no SIGKILL for a signal-terminated child',
+        );
     });
 
     test('does not signal a child that had already exited, but still clears ownership', () => {
