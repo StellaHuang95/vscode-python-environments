@@ -222,7 +222,7 @@ suite('VenvManager - scoped refresh preservation', () => {
         assert.deepStrictEqual(ids((manager as any).collection), ['A-new', 'B']);
     });
 
-    test('resolves a deleted file scope through its owning project when inspection fails', async () => {
+    test('skips scoped mutation for a deleted file scope owned by a project', async () => {
         const manager = createManager();
         seed(manager, [makeEnv('A-old', venvARoot), makeEnv('B', venvBRoot)]);
 
@@ -236,29 +236,34 @@ suite('VenvManager - scoped refresh preservation', () => {
         });
         findVirtualEnvironmentsStub.resolves([makeEnv('A-new', venvARoot)]);
 
+        const events = captureEvents(manager);
         await manager.refresh(deletedScope);
 
-        assert.deepStrictEqual(ids((manager as any).collection), ['A-new', 'B']);
+        assert.deepStrictEqual(ids((manager as any).collection), ['A-old', 'B']);
+        assert.deepStrictEqual(events, []);
     });
 
-    test('normalizes a file-based owning project uri to its directory when the scope is uninspectable', async () => {
+    test('skips scoped mutation for a missing nested directory scope owned by a project', async () => {
         const manager = createManager();
-        seed(manager, [makeEnv('A-old', venvARoot), makeEnv('B', venvBRoot)]);
+        const pkgVenv = path.join(folderA, 'pkg', '.venv');
+        const otherVenv = path.join(folderA, 'other', '.venv');
+        seed(manager, [makeEnv('PKG', pkgVenv), makeEnv('OTHER', otherVenv)]);
 
-        const deletedScope = Uri.file(path.join(folderA, 'deleted.py'));
-        const projectFile = path.join(folderA, 'app.py');
-        ((manager as any).api.getPythonProject as sinon.SinonStub).returns({ uri: Uri.file(projectFile) });
+        const missingNested = Uri.file(path.join(folderA, 'pkg'));
+        ((manager as any).api.getPythonProject as sinon.SinonStub).returns({ uri: Uri.file(folderA) });
         findParentIfFileStub.callsFake(async (p: string) => {
-            if (p === deletedScope.fsPath) {
+            if (p === missingNested.fsPath) {
                 throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
             }
-            return path.dirname(p);
+            return p;
         });
-        findVirtualEnvironmentsStub.resolves([makeEnv('A-new', venvARoot)]);
+        findVirtualEnvironmentsStub.resolves([makeEnv('PKG-new', pkgVenv)]);
 
-        await manager.refresh(deletedScope);
+        const events = captureEvents(manager);
+        await manager.refresh(missingNested);
 
-        assert.deepStrictEqual(ids((manager as any).collection), ['A-new', 'B']);
+        assert.deepStrictEqual(ids((manager as any).collection), ['OTHER', 'PKG']);
+        assert.deepStrictEqual(events, []);
     });
 
     test('skips scoped mutation without widening when an uninspectable directory scope equals its owning project uri', async () => {
@@ -455,6 +460,72 @@ suite('VenvManager - scoped refresh preservation', () => {
         assert.deepStrictEqual(
             events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
             [[{ id: 'RECOVERED', kind: EnvironmentChangeKind.add }]],
+        );
+    });
+
+    test('does not attribute a concurrent create to a scoped refresh while loading the project map', async () => {
+        const manager = createManager();
+        seed(manager, []);
+
+        findVirtualEnvironmentsStub.resolves([makeEnv('A', venvARoot)]);
+
+        const inLoadEnvMap = createDeferred<void>();
+        const release = createDeferred<void>();
+        let call = 0;
+        ((manager as any).baseManager.getEnvironments as sinon.SinonStub).callsFake(async () => {
+            call += 1;
+            if (call === 1) {
+                inLoadEnvMap.resolve();
+                await release.promise;
+            }
+            return [];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(Uri.file(folderA));
+        await inLoadEnvMap.promise;
+        (manager as any).addEnvironment(makeEnv('CREATED', path.join(ROOT, 'created', '.venv')), true);
+        release.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), ['A', 'CREATED']);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [[{ id: 'CREATED', kind: EnvironmentChangeKind.add }], [{ id: 'A', kind: EnvironmentChangeKind.add }]],
+        );
+    });
+
+    test('does not publish a stale add when a scoped refresh discovery is removed during project map loading', async () => {
+        const manager = createManager();
+        seed(manager, []);
+
+        const envA = makeEnv('A', venvARoot);
+        findVirtualEnvironmentsStub.resolves([envA]);
+        sinon.stub(venvUtils, 'removeVenv').resolves(true);
+
+        const inLoadEnvMap = createDeferred<void>();
+        const release = createDeferred<void>();
+        let call = 0;
+        ((manager as any).baseManager.getEnvironments as sinon.SinonStub).callsFake(async () => {
+            call += 1;
+            if (call === 1) {
+                inLoadEnvMap.resolve();
+                await release.promise;
+            }
+            return [];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(Uri.file(folderA));
+        await inLoadEnvMap.promise;
+        await manager.remove(envA);
+        release.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), []);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [[{ id: 'A', kind: EnvironmentChangeKind.remove }]],
         );
     });
 

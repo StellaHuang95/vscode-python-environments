@@ -372,21 +372,12 @@ export class VenvManager implements EnvironmentManager {
         scope: Uri,
         discovered: readonly PythonEnvironment[],
     ): Promise<DidChangeEnvironmentsEventArgs | undefined> {
-        let scopeDir: string | undefined;
+        let scopeRoot: string;
         try {
-            scopeDir = await findParentIfFile(scope.fsPath);
-        } catch (err) {
-            if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-                const project = this.api.getPythonProject(scope);
-                if (project && project.uri.fsPath !== scope.fsPath) {
-                    scopeDir = await findParentIfFile(project.uri.fsPath).catch(() => undefined);
-                }
-            }
-        }
-        if (scopeDir === undefined) {
+            scopeRoot = await findParentIfFile(scope.fsPath);
+        } catch {
             return undefined;
         }
-        const scopeRoot = scopeDir;
         const inScope = (env: PythonEnvironment): boolean => isPathInside(scopeRoot, env.environmentPath.fsPath);
 
         const retained: PythonEnvironment[] = [];
@@ -409,13 +400,23 @@ export class VenvManager implements EnvironmentManager {
         }
 
         this.collection = [...retained, ...added];
-        const knownIds = new Set(this.collection.map((env) => env.envId.id));
-        await this.loadEnvMap();
-        const appended = this.collection.filter((env) => !knownIds.has(env.envId.id));
+        const appended = await this.loadEnvMap();
+        const currentIds = new Set(this.collection.map((env) => env.envId.id));
+
+        const seenAddIds = new Set<string>();
+        const addChanges: DidChangeEnvironmentsEventArgs = [];
+        for (const env of [...added, ...appended]) {
+            if (!currentIds.has(env.envId.id) || seenAddIds.has(env.envId.id)) {
+                continue;
+            }
+            seenAddIds.add(env.envId.id);
+            addChanges.push({ environment: env, kind: EnvironmentChangeKind.add });
+        }
         const changes: DidChangeEnvironmentsEventArgs = [
-            ...removed.map((env) => ({ kind: EnvironmentChangeKind.remove, environment: env })),
-            ...added.map((env) => ({ environment: env, kind: EnvironmentChangeKind.add })),
-            ...appended.map((env) => ({ environment: env, kind: EnvironmentChangeKind.add })),
+            ...removed
+                .filter((env) => !currentIds.has(env.envId.id))
+                .map((env) => ({ kind: EnvironmentChangeKind.remove, environment: env })),
+            ...addChanges,
         ];
         return changes.length > 0 ? changes : undefined;
     }
@@ -581,9 +582,9 @@ export class VenvManager implements EnvironmentManager {
         await clearVenvCache();
     }
 
-    private addEnvironment(environment: PythonEnvironment, raiseEvent?: boolean): void {
+    private addEnvironment(environment: PythonEnvironment, raiseEvent?: boolean): PythonEnvironment | undefined {
         if (this.collection.find((e) => e.envId.id === environment.envId.id)) {
-            return;
+            return undefined;
         }
 
         const oldEnv = this.findEnvironmentByPath(environment.environmentPath.fsPath);
@@ -602,6 +603,7 @@ export class VenvManager implements EnvironmentManager {
                 this._onDidChangeEnvironments.fire([{ environment, kind: EnvironmentChangeKind.add }]);
             }
         }
+        return environment;
     }
 
     private async resetGlobalEnv() {
@@ -613,12 +615,13 @@ export class VenvManager implements EnvironmentManager {
     /**
      * Loads and sets the global Python environment from the provided list, resolving if necessary. O(g) where g = globals.length
      */
-    private async loadGlobalEnv(globals: PythonEnvironment[]) {
+    private async loadGlobalEnv(globals: PythonEnvironment[]): Promise<PythonEnvironment | undefined> {
         this.globalEnv = undefined;
 
         // Try to find a global environment
         const fsPath = await getVenvForGlobal();
 
+        let added: PythonEnvironment | undefined;
         if (fsPath) {
             this.globalEnv = this.findEnvironmentByPath(fsPath) ?? this.findEnvironmentByPath(fsPath, globals);
 
@@ -634,7 +637,7 @@ export class VenvManager implements EnvironmentManager {
 
                 // If the environment is resolved, add it to the collection
                 if (this.globalEnv) {
-                    this.addEnvironment(this.globalEnv, false);
+                    added = this.addEnvironment(this.globalEnv, false);
                 }
             }
         }
@@ -643,14 +646,19 @@ export class VenvManager implements EnvironmentManager {
         if (!this.globalEnv) {
             this.globalEnv = getLatest(globals);
         }
+        return added;
     }
 
     /**
      * Loads and maps Python environments to their corresponding project paths in the workspace. about  O(p × e) where p = projects.len and e = environments.len
      */
-    private async loadEnvMap() {
+    private async loadEnvMap(): Promise<PythonEnvironment[]> {
+        const appended: PythonEnvironment[] = [];
         const globals = await this.baseManager.getEnvironments('global');
-        await this.loadGlobalEnv(globals);
+        const globalAdded = await this.loadGlobalEnv(globals);
+        if (globalAdded) {
+            appended.push(globalAdded);
+        }
 
         this.fsPathToEnv.clear();
 
@@ -677,11 +685,14 @@ export class VenvManager implements EnvironmentManager {
                     );
                     if (resolved) {
                         // If resolved; add it to the venvManager collection
-                        this.addEnvironment(resolved, false);
+                        const addedEnv = this.addEnvironment(resolved, false);
+                        if (addedEnv) {
+                            appended.push(addedEnv);
+                        }
                         foundEnv = resolved;
                     } else {
                         this.log.error(`Failed to resolve python environment: ${env}`);
-                        return;
+                        return appended;
                     }
                 }
                 // Given found env, add it to the map and fire the event if needed.
@@ -704,6 +715,7 @@ export class VenvManager implements EnvironmentManager {
         }
 
         events.forEach((e) => e());
+        return appended;
     }
 
     /**
