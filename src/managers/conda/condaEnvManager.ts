@@ -95,12 +95,14 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
             return this._initialized.promise;
         }
 
-        this._initialized = createDeferred();
+        const deferred = createDeferred<void>();
+        this._initialized = deferred;
         const stopWatch = new StopWatch();
         let result: 'success' | 'tool_not_found' | 'error' = 'success';
         let envCount = 0;
         let toolSource = 'none';
         let errorType: string | undefined;
+        let discoveryFailed = false;
 
         try {
             // Check if tool is findable before PET refresh (settings/cache/persistent state/PATH only, no PET).
@@ -123,8 +125,13 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                     title: CondaStrings.condaDiscovering,
                 },
                 async () => {
-                    this.collection =
-                        (await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this)) ?? [];
+                    const refreshed = await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this);
+                    if (refreshed === undefined) {
+                        discoveryFailed = true;
+                        await this.loadEnvMapPreservingCollection();
+                        return;
+                    }
+                    this.collection = refreshed;
                     await this.loadEnvMap();
 
                     this._onDidChangeEnvironments.fire(
@@ -173,7 +180,10 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 toolSource,
                 errorType,
             });
-            this._initialized.resolve();
+            deferred.resolve();
+            if (discoveryFailed && this._initialized === deferred) {
+                this._initialized = undefined;
+            }
         }
     }
 
@@ -314,14 +324,37 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 },
                 async () => {
                     this.log.info('Refreshing Conda Environments');
+                    const refreshed = await refreshCondaEnvs(true, this.nativeFinder, this.api, this.log, this);
+                    if (refreshed === undefined) {
+                        await this.loadEnvMapPreservingCollection();
+                        return;
+                    }
                     const discard = this.collection.map((c) => c);
-                    this.collection = (await refreshCondaEnvs(true, this.nativeFinder, this.api, this.log, this)) ?? [];
+                    const discovered = refreshed.map((c) => c);
+                    this.collection = refreshed;
+                    const appended = await this.loadEnvMap();
 
-                    await this.loadEnvMap();
+                    const resolvedEnvs = [...discovered, ...appended];
+                    const resolvedByPath = new Map(
+                        resolvedEnvs.map((env) => [normalizePath(env.environmentPath.fsPath), env] as const),
+                    );
+                    const discardedByPath = new Map(
+                        discard.map((env) => [normalizePath(env.environmentPath.fsPath), env] as const),
+                    );
 
                     const args = [
-                        ...discard.map((env) => ({ kind: EnvironmentChangeKind.remove, environment: env })),
-                        ...this.collection.map((env) => ({ kind: EnvironmentChangeKind.add, environment: env })),
+                        ...discard
+                            .filter((env) => {
+                                const current = resolvedByPath.get(normalizePath(env.environmentPath.fsPath));
+                                return !current || !this.isEquivalentEnvironment(env, current);
+                            })
+                            .map((env) => ({ kind: EnvironmentChangeKind.remove, environment: env })),
+                        ...resolvedEnvs
+                            .filter((env) => {
+                                const previous = discardedByPath.get(normalizePath(env.environmentPath.fsPath));
+                                return !previous || !this.isEquivalentEnvironment(previous, env);
+                            })
+                            .map((env) => ({ kind: EnvironmentChangeKind.add, environment: env })),
                     ];
 
                     this._onDidChangeEnvironments.fire(args);
@@ -342,15 +375,21 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
             resolve: (p) => resolveCondaPath(p, this.nativeFinder, this.api, this.log, this),
             startBackgroundInit: () =>
                 withProgress({ location: ProgressLocation.Window, title: CondaStrings.condaDiscovering }, async () => {
-                    this.collection =
-                        (await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this)) ?? [];
-                    await this.loadEnvMap();
-                    this._onDidChangeEnvironments.fire(
-                        this.collection.map((e) => ({
-                            environment: e,
-                            kind: EnvironmentChangeKind.add,
-                        })),
-                    );
+                    const refreshed = await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this);
+                    if (refreshed === undefined) {
+                        await this.loadEnvMapPreservingCollection();
+                        throw new Error('Conda background discovery failed');
+                    }
+                    this.collection = refreshed;
+                    const refreshedAdds = refreshed.map((environment) => ({
+                        environment,
+                        kind: EnvironmentChangeKind.add,
+                    }));
+                    const appended = await this.loadEnvMap();
+                    this._onDidChangeEnvironments.fire([
+                        ...refreshedAdds,
+                        ...appended.map((environment) => ({ environment, kind: EnvironmentChangeKind.add })),
+                    ]);
                 }),
         });
         if (fastResult) {
@@ -486,7 +525,30 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
         await clearCondaCache();
     }
 
-    private async loadEnvMap() {
+    private async loadEnvMapPreservingCollection(): Promise<void> {
+        const added = await this.loadEnvMap();
+        const present = added.filter((environment) => this.collection.includes(environment));
+        if (present.length > 0) {
+            this._onDidChangeEnvironments.fire(
+                present.map((environment) => ({ kind: EnvironmentChangeKind.add, environment })),
+            );
+        }
+    }
+
+    private isEquivalentEnvironment(a: PythonEnvironment, b: PythonEnvironment): boolean {
+        return (
+            a.name === b.name &&
+            a.displayName === b.displayName &&
+            a.version === b.version &&
+            a.description === b.description &&
+            a.sysPrefix === b.sysPrefix &&
+            a.error === b.error &&
+            a.execInfo.run.executable === b.execInfo.run.executable
+        );
+    }
+
+    private async loadEnvMap(): Promise<PythonEnvironment[]> {
+        const appended: PythonEnvironment[] = [];
         this.globalEnv = undefined;
         this.fsPathToEnv.clear();
 
@@ -498,11 +560,18 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
 
             // If the environment is not found, resolve the fsPath. Could be portable conda.
             if (!this.globalEnv) {
-                this.globalEnv = await resolveCondaPath(fsPath, this.nativeFinder, this.api, this.log, this);
+                const resolved = await resolveCondaPath(fsPath, this.nativeFinder, this.api, this.log, this);
 
                 // If the environment is resolved, add it to the collection
-                if (this.globalEnv) {
-                    this.collection.push(this.globalEnv);
+                if (resolved) {
+                    const existing = this.findByExactPath(resolved.environmentPath.fsPath);
+                    if (existing) {
+                        this.globalEnv = existing;
+                    } else {
+                        this.globalEnv = resolved;
+                        this.collection.push(resolved);
+                        appended.push(resolved);
+                    }
                 }
             }
         }
@@ -544,8 +613,14 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
 
                     if (resolved) {
                         // If resolved add it to the collection
-                        this.fsPathToEnv.set(normalizedPath, resolved);
-                        this.collection.push(resolved);
+                        const existing = this.findByExactPath(resolved.environmentPath.fsPath);
+                        if (existing) {
+                            this.fsPathToEnv.set(normalizedPath, existing);
+                        } else {
+                            this.fsPathToEnv.set(normalizedPath, resolved);
+                            this.collection.push(resolved);
+                            appended.push(resolved);
+                        }
                     } else {
                         this.log.error(`Failed to resolve conda environment: ${env}`);
                     }
@@ -568,6 +643,7 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 }
             }
         }
+        return appended;
     }
 
     private fromEnvMap(uri: Uri): PythonEnvironment | undefined {
@@ -610,6 +686,11 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 normalizePath(path.dirname(path.dirname(e.environmentPath.fsPath))) === normalized
             );
         });
+    }
+
+    private findByExactPath(fsPath: string): PythonEnvironment | undefined {
+        const normalized = normalizePath(fsPath);
+        return this.collection.find((e) => normalizePath(e.environmentPath.fsPath) === normalized);
     }
 
     private findEnvironmentByName(name: string): PythonEnvironment | undefined {
