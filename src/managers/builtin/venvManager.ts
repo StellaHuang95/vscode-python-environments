@@ -25,7 +25,7 @@ import { PYTHON_EXTENSION_ID } from '../../common/constants';
 import { VenvManagerStrings } from '../../common/localize';
 import { traceError, traceWarn } from '../../common/logging';
 import { createDeferred, Deferred } from '../../common/utils/deferred';
-import { normalizePath } from '../../common/utils/pathUtils';
+import { normalizePath, isPathInside } from '../../common/utils/pathUtils';
 import { showErrorMessage, showInformationMessage, withProgress } from '../../common/window.apis';
 import { findParentIfFile } from '../../features/envCommands';
 import { getProjectFsPathForScope, tryFastPathGet } from '../common/fastPath';
@@ -51,6 +51,7 @@ import {
 
 export class VenvManager implements EnvironmentManager {
     private collection: PythonEnvironment[] = [];
+    private refreshChain: Promise<void> = Promise.resolve();
     private readonly fsPathToEnv: Map<string, PythonEnvironment> = new Map();
     private globalEnv: PythonEnvironment | undefined;
     private skipWatcherRefresh = false;
@@ -324,26 +325,99 @@ export class VenvManager implements EnvironmentManager {
                 title,
             },
             async () => {
-                const discard = this.collection.map((env) => ({
-                    kind: EnvironmentChangeKind.remove,
-                    environment: env,
-                }));
+                const run = this.refreshChain.then(
+                    async (): Promise<DidChangeEnvironmentsEventArgs | undefined> => {
+                        const discovered =
+                            (await findVirtualEnvironments(
+                                hardRefresh,
+                                this.nativeFinder,
+                                this.api,
+                                this.log,
+                                this,
+                                scope ? [scope] : undefined,
+                            )) ?? [];
+                        if (scope) {
+                            return this.mergeScopedEnvironments(scope, discovered);
+                        }
+                        const discard = this.collection.map((env) => ({
+                            kind: EnvironmentChangeKind.remove,
+                            environment: env,
+                        }));
+                        this.collection = discovered;
+                        await this.loadEnvMap();
+                        const added = this.collection.map((env) => ({
+                            environment: env,
+                            kind: EnvironmentChangeKind.add,
+                        }));
+                        return [...discard, ...added];
+                    },
+                );
+                this.refreshChain = run.then(
+                    () => undefined,
+                    () => undefined,
+                );
+                const changes = await run;
 
-                this.collection =
-                    (await findVirtualEnvironments(
-                        hardRefresh,
-                        this.nativeFinder,
-                        this.api,
-                        this.log,
-                        this,
-                        scope ? [scope] : undefined,
-                    )) ?? [];
-                await this.loadEnvMap();
-
-                const added = this.collection.map((env) => ({ environment: env, kind: EnvironmentChangeKind.add }));
-                this._onDidChangeEnvironments.fire([...discard, ...added]);
+                if (changes !== undefined) {
+                    this._onDidChangeEnvironments.fire(changes);
+                }
             },
         );
+    }
+
+    // A scoped discovery is authoritative only within `scope`: environments in other workspace
+    // folders (and globals outside it) are retained untouched, so they neither disappear nor emit
+    // events; only in-scope environments are replaced by the freshly discovered ones.
+    private async mergeScopedEnvironments(
+        scope: Uri,
+        discovered: readonly PythonEnvironment[],
+    ): Promise<DidChangeEnvironmentsEventArgs | undefined> {
+        let scopeDir: string | undefined;
+        try {
+            scopeDir = await findParentIfFile(scope.fsPath);
+        } catch (err) {
+            if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+                const project = this.api.getPythonProject(scope);
+                if (project && project.uri.fsPath !== scope.fsPath) {
+                    scopeDir = await findParentIfFile(project.uri.fsPath).catch(() => undefined);
+                }
+            }
+        }
+        if (scopeDir === undefined) {
+            return undefined;
+        }
+        const scopeRoot = scopeDir;
+        const inScope = (env: PythonEnvironment): boolean => isPathInside(scopeRoot, env.environmentPath.fsPath);
+
+        const retained: PythonEnvironment[] = [];
+        const removed: PythonEnvironment[] = [];
+        for (const env of this.collection) {
+            (inScope(env) ? removed : retained).push(env);
+        }
+        const seenPaths = new Set(retained.map((env) => normalizePath(env.environmentPath.fsPath)));
+        const added: PythonEnvironment[] = [];
+        for (const env of discovered) {
+            if (!inScope(env)) {
+                continue;
+            }
+            const key = normalizePath(env.environmentPath.fsPath);
+            if (seenPaths.has(key)) {
+                continue;
+            }
+            seenPaths.add(key);
+            added.push(env);
+        }
+
+        this.collection = [...retained, ...added];
+        const knownIds = new Set(this.collection.map((env) => env.envId.id));
+        await this.loadEnvMap();
+        const appended = this.collection.filter((env) => !knownIds.has(env.envId.id));
+        const changes: DidChangeEnvironmentsEventArgs = [
+            ...removed.map((env) => ({ kind: EnvironmentChangeKind.remove, environment: env })),
+            ...added.map((env) => ({ environment: env, kind: EnvironmentChangeKind.add })),
+            ...appended.map((env) => ({ environment: env, kind: EnvironmentChangeKind.add })),
+        ];
+        return changes.length > 0 ? changes : undefined;
     }
 
     async getEnvironments(scope: GetEnvironmentsScope): Promise<PythonEnvironment[]> {
