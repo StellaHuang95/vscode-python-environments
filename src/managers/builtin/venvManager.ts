@@ -53,6 +53,7 @@ export class VenvManager implements EnvironmentManager {
     private collection: PythonEnvironment[] = [];
     private refreshChain: Promise<void> = Promise.resolve();
     private collectionMutationGeneration = 0;
+    private readonly directRemovalGenerations = new Map<string, number>();
     private readonly fsPathToEnv: Map<string, PythonEnvironment> = new Map();
     private globalEnv: PythonEnvironment | undefined;
     private skipWatcherRefresh = false;
@@ -292,7 +293,13 @@ export class VenvManager implements EnvironmentManager {
         this.collection = this.collection.filter((e) => normalizePath(e.environmentPath.fsPath) !== envPath);
         if (this.collection.length !== before) {
             this.collectionMutationGeneration++;
+            this.directRemovalGenerations.set(envPath, this.collectionMutationGeneration);
         }
+    }
+
+    private wasDirectlyRemovedSince(environment: PythonEnvironment, generation: number): boolean {
+        const removedGeneration = this.directRemovalGenerations.get(normalizePath(environment.environmentPath.fsPath));
+        return removedGeneration !== undefined && removedGeneration > generation;
     }
 
     private updateFsPathToEnv(environment: PythonEnvironment): Uri[] {
@@ -333,6 +340,11 @@ export class VenvManager implements EnvironmentManager {
                 const run = this.refreshChain.then(
                     async (): Promise<DidChangeEnvironmentsEventArgs | undefined> => {
                         const generation = this.collectionMutationGeneration;
+                        for (const [key, removedGeneration] of this.directRemovalGenerations) {
+                            if (removedGeneration <= generation) {
+                                this.directRemovalGenerations.delete(key);
+                            }
+                        }
                         let scopeRoot: string | undefined;
                         if (scope) {
                             try {
@@ -357,21 +369,25 @@ export class VenvManager implements EnvironmentManager {
                             return undefined;
                         }
                         if (scopeRoot !== undefined) {
-                            return this.mergeScopedEnvironments(scopeRoot, discovered);
+                            return this.mergeScopedEnvironments(scopeRoot, discovered, generation);
                         }
-                        const discard = this.collection.map((env) => ({
-                            kind: EnvironmentChangeKind.remove,
-                            environment: env,
-                        }));
+                        const previousCollection = this.collection;
                         this.collection = [...discovered];
                         const appended = await this.loadEnvMap();
+                        const discard = previousCollection
+                            .filter((env) => !this.wasDirectlyRemovedSince(env, generation))
+                            .map((env) => ({
+                                kind: EnvironmentChangeKind.remove,
+                                environment: env,
+                            }));
                         const added = [...discovered, ...appended]
                             .filter((env) => this.collection.includes(env))
                             .map((env) => ({
                                 environment: env,
                                 kind: EnvironmentChangeKind.add,
                             }));
-                        return [...discard, ...added];
+                        const fullChanges = [...discard, ...added];
+                        return fullChanges.length > 0 ? fullChanges : undefined;
                     },
                 );
                 this.refreshChain = run.then(
@@ -393,6 +409,7 @@ export class VenvManager implements EnvironmentManager {
     private async mergeScopedEnvironments(
         scopeRoot: string,
         discovered: readonly PythonEnvironment[],
+        generation: number,
     ): Promise<DidChangeEnvironmentsEventArgs | undefined> {
         const inScope = (fsPath: string): boolean => isPathInside(scopeRoot, fsPath);
 
@@ -440,7 +457,7 @@ export class VenvManager implements EnvironmentManager {
 
         const changes: DidChangeEnvironmentsEventArgs = [];
         for (const env of oldInScope) {
-            if (!this.collection.includes(env)) {
+            if (!this.collection.includes(env) && !this.wasDirectlyRemovedSince(env, generation)) {
                 changes.push({ environment: env, kind: EnvironmentChangeKind.remove });
             }
         }
@@ -636,6 +653,12 @@ export class VenvManager implements EnvironmentManager {
         }
         if (raiseEvent) {
             this.collectionMutationGeneration++;
+            if (oldEnv) {
+                this.directRemovalGenerations.set(
+                    normalizePath(oldEnv.environmentPath.fsPath),
+                    this.collectionMutationGeneration,
+                );
+            }
         }
         return environment;
     }

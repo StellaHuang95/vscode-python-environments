@@ -696,6 +696,159 @@ suite('VenvManager - scoped refresh preservation', () => {
         );
     });
 
+    test('does not duplicate a full-refresh remove when a direct remove completes during project map loading', async () => {
+        const manager = createManager();
+        const envA = makeEnv('A', venvARoot);
+        seed(manager, [envA]);
+        sinon.stub(venvUtils, 'removeVenv').resolves(true);
+
+        findVirtualEnvironmentsStub.resolves([envA]);
+
+        const inLoadEnvMap = createDeferred<void>();
+        const release = createDeferred<void>();
+        let call = 0;
+        ((manager as any).baseManager.getEnvironments as sinon.SinonStub).callsFake(async () => {
+            call += 1;
+            if (call === 1) {
+                inLoadEnvMap.resolve();
+                await release.promise;
+            }
+            return [];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(undefined);
+        await inLoadEnvMap.promise;
+        await manager.remove(envA);
+        release.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), []);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [[{ id: 'A', kind: EnvironmentChangeKind.remove }]],
+        );
+    });
+
+    test('emits a directly removed env once while republishing surviving envs during a full refresh', async () => {
+        const manager = createManager();
+        const envA = makeEnv('A', venvARoot);
+        const envB = makeEnv('B', venvBRoot);
+        seed(manager, [envA, envB]);
+        sinon.stub(venvUtils, 'removeVenv').resolves(true);
+
+        findVirtualEnvironmentsStub.resolves([envA, envB]);
+
+        const inLoadEnvMap = createDeferred<void>();
+        const release = createDeferred<void>();
+        let call = 0;
+        ((manager as any).baseManager.getEnvironments as sinon.SinonStub).callsFake(async () => {
+            call += 1;
+            if (call === 1) {
+                inLoadEnvMap.resolve();
+                await release.promise;
+            }
+            return [];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(undefined);
+        await inLoadEnvMap.promise;
+        await manager.remove(envA);
+        release.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), ['B']);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [
+                [{ id: 'A', kind: EnvironmentChangeKind.remove }],
+                [
+                    { id: 'B', kind: EnvironmentChangeKind.remove },
+                    { id: 'B', kind: EnvironmentChangeKind.add },
+                ],
+            ],
+        );
+    });
+
+    test('does not duplicate a replacement remove when a direct create replaces an env during full-refresh map loading', async () => {
+        const manager = createManager();
+        const envAOld = makeEnv('A-old', venvARoot);
+        const envB = makeEnv('B', venvBRoot);
+        seed(manager, [envAOld, envB]);
+
+        findVirtualEnvironmentsStub.resolves([envAOld, envB]);
+
+        const inLoadEnvMap = createDeferred<void>();
+        const release = createDeferred<void>();
+        let call = 0;
+        ((manager as any).baseManager.getEnvironments as sinon.SinonStub).callsFake(async () => {
+            call += 1;
+            if (call === 1) {
+                inLoadEnvMap.resolve();
+                await release.promise;
+            }
+            return [];
+        });
+
+        const envANew = makeEnv('A-new', venvARoot);
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(undefined);
+        await inLoadEnvMap.promise;
+        (manager as any).addEnvironment(envANew, true);
+        release.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), ['A-new', 'B']);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [
+                [
+                    { id: 'A-old', kind: EnvironmentChangeKind.remove },
+                    { id: 'A-new', kind: EnvironmentChangeKind.add },
+                ],
+                [
+                    { id: 'B', kind: EnvironmentChangeKind.remove },
+                    { id: 'B', kind: EnvironmentChangeKind.add },
+                ],
+            ],
+        );
+    });
+
+    test('does not duplicate a scoped remove when a direct remove completes during project map loading', async () => {
+        const manager = createManager();
+        const envA = makeEnv('A', venvARoot);
+        seed(manager, [envA]);
+        sinon.stub(venvUtils, 'removeVenv').resolves(true);
+
+        findVirtualEnvironmentsStub.resolves([envA]);
+
+        const inLoadEnvMap = createDeferred<void>();
+        const release = createDeferred<void>();
+        let call = 0;
+        ((manager as any).baseManager.getEnvironments as sinon.SinonStub).callsFake(async () => {
+            call += 1;
+            if (call === 1) {
+                inLoadEnvMap.resolve();
+                await release.promise;
+            }
+            return [];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(Uri.file(folderA));
+        await inLoadEnvMap.promise;
+        await manager.remove(envA);
+        release.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), []);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [[{ id: 'A', kind: EnvironmentChangeKind.remove }]],
+        );
+    });
+
     test('discards a stale scoped discovery when a direct remove mutates the collection during discovery', async () => {
         const manager = createManager();
         const envA = makeEnv('A', venvARoot);
