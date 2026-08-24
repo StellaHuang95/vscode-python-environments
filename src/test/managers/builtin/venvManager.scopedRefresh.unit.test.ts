@@ -587,6 +587,44 @@ suite('VenvManager - scoped refresh preservation', () => {
         );
     });
 
+    test('does not attribute a concurrent create to a full refresh while loading the project map', async () => {
+        const manager = createManager();
+        seed(manager, [makeEnv('OLD', venvBRoot)]);
+
+        findVirtualEnvironmentsStub.resolves([makeEnv('A', venvARoot)]);
+
+        const inLoadEnvMap = createDeferred<void>();
+        const release = createDeferred<void>();
+        let call = 0;
+        ((manager as any).baseManager.getEnvironments as sinon.SinonStub).callsFake(async () => {
+            call += 1;
+            if (call === 1) {
+                inLoadEnvMap.resolve();
+                await release.promise;
+            }
+            return [];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(undefined);
+        await inLoadEnvMap.promise;
+        (manager as any).addEnvironment(makeEnv('CREATED', path.join(ROOT, 'created', '.venv')), true);
+        release.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), ['A', 'CREATED']);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [
+                [{ id: 'CREATED', kind: EnvironmentChangeKind.add }],
+                [
+                    { id: 'OLD', kind: EnvironmentChangeKind.remove },
+                    { id: 'A', kind: EnvironmentChangeKind.add },
+                ],
+            ],
+        );
+    });
+
     test('does not publish a stale add when a scoped refresh discovery is removed during project map loading', async () => {
         const manager = createManager();
         seed(manager, []);

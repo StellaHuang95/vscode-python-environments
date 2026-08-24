@@ -363,12 +363,14 @@ export class VenvManager implements EnvironmentManager {
                             kind: EnvironmentChangeKind.remove,
                             environment: env,
                         }));
-                        this.collection = discovered;
-                        await this.loadEnvMap();
-                        const added = this.collection.map((env) => ({
-                            environment: env,
-                            kind: EnvironmentChangeKind.add,
-                        }));
+                        this.collection = [...discovered];
+                        const appended = await this.loadEnvMap();
+                        const added = [...discovered, ...appended]
+                            .filter((env) => this.collection.includes(env))
+                            .map((env) => ({
+                                environment: env,
+                                kind: EnvironmentChangeKind.add,
+                            }));
                         return [...discard, ...added];
                     },
                 );
