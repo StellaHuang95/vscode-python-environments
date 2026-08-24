@@ -327,6 +327,14 @@ export class VenvManager implements EnvironmentManager {
             async () => {
                 const run = this.refreshChain.then(
                     async (): Promise<DidChangeEnvironmentsEventArgs | undefined> => {
+                        let scopeRoot: string | undefined;
+                        if (scope) {
+                            try {
+                                scopeRoot = await findParentIfFile(scope.fsPath);
+                            } catch {
+                                return undefined;
+                            }
+                        }
                         const discovered =
                             (await findVirtualEnvironments(
                                 hardRefresh,
@@ -334,10 +342,10 @@ export class VenvManager implements EnvironmentManager {
                                 this.api,
                                 this.log,
                                 this,
-                                scope ? [scope] : undefined,
+                                scopeRoot !== undefined ? [Uri.file(scopeRoot)] : undefined,
                             )) ?? [];
-                        if (scope) {
-                            return this.mergeScopedEnvironments(scope, discovered);
+                        if (scopeRoot !== undefined) {
+                            return this.mergeScopedEnvironments(scopeRoot, discovered);
                         }
                         const discard = this.collection.map((env) => ({
                             kind: EnvironmentChangeKind.remove,
@@ -369,55 +377,64 @@ export class VenvManager implements EnvironmentManager {
     // folders (and globals outside it) are retained untouched, so they neither disappear nor emit
     // events; only in-scope environments are replaced by the freshly discovered ones.
     private async mergeScopedEnvironments(
-        scope: Uri,
+        scopeRoot: string,
         discovered: readonly PythonEnvironment[],
     ): Promise<DidChangeEnvironmentsEventArgs | undefined> {
-        let scopeRoot: string;
-        try {
-            scopeRoot = await findParentIfFile(scope.fsPath);
-        } catch {
-            return undefined;
-        }
         const inScope = (fsPath: string): boolean => isPathInside(scopeRoot, fsPath);
 
         const retained: PythonEnvironment[] = [];
-        const removed: PythonEnvironment[] = [];
+        const oldInScope: PythonEnvironment[] = [];
+        const oldByPath = new Map<string, PythonEnvironment>();
         for (const env of this.collection) {
-            (inScope(env.environmentPath.fsPath) ? removed : retained).push(env);
+            if (inScope(env.environmentPath.fsPath)) {
+                oldInScope.push(env);
+                const key = normalizePath(env.environmentPath.fsPath);
+                if (!oldByPath.has(key)) {
+                    oldByPath.set(key, env);
+                }
+            } else {
+                retained.push(env);
+            }
         }
-        const seenPaths = new Set(retained.map((env) => normalizePath(env.environmentPath.fsPath)));
-        const added: PythonEnvironment[] = [];
+
+        const retainedPaths = new Set(retained.map((env) => normalizePath(env.environmentPath.fsPath)));
+        const discoveredByPath = new Map<string, PythonEnvironment>();
         for (const env of discovered) {
             if (!inScope(env.environmentPath.fsPath)) {
                 continue;
             }
             const key = normalizePath(env.environmentPath.fsPath);
-            if (seenPaths.has(key)) {
+            if (retainedPaths.has(key) || discoveredByPath.has(key)) {
                 continue;
             }
-            seenPaths.add(key);
-            added.push(env);
+            discoveredByPath.set(key, env);
         }
 
-        this.collection = [...retained, ...added];
+        const finalInScope: PythonEnvironment[] = [];
+        const added: PythonEnvironment[] = [];
+        for (const [key, env] of discoveredByPath) {
+            if (oldByPath.get(key) === env) {
+                finalInScope.push(env);
+            } else {
+                added.push(env);
+                finalInScope.push(env);
+            }
+        }
+
+        this.collection = [...retained, ...finalInScope];
         const appended = await this.loadEnvMap(inScope);
-        const currentIds = new Set(this.collection.map((env) => env.envId.id));
 
-        const seenAddIds = new Set<string>();
-        const addChanges: DidChangeEnvironmentsEventArgs = [];
-        for (const env of [...added, ...appended]) {
-            if (!this.collection.includes(env) || seenAddIds.has(env.envId.id)) {
-                continue;
+        const changes: DidChangeEnvironmentsEventArgs = [];
+        for (const env of oldInScope) {
+            if (!this.collection.includes(env)) {
+                changes.push({ environment: env, kind: EnvironmentChangeKind.remove });
             }
-            seenAddIds.add(env.envId.id);
-            addChanges.push({ environment: env, kind: EnvironmentChangeKind.add });
         }
-        const changes: DidChangeEnvironmentsEventArgs = [
-            ...removed
-                .filter((env) => !currentIds.has(env.envId.id))
-                .map((env) => ({ kind: EnvironmentChangeKind.remove, environment: env })),
-            ...addChanges,
-        ];
+        for (const env of [...added, ...appended]) {
+            if (this.collection.includes(env)) {
+                changes.push({ environment: env, kind: EnvironmentChangeKind.add });
+            }
+        }
         return changes.length > 0 ? changes : undefined;
     }
 

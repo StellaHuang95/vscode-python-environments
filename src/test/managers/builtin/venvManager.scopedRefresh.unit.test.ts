@@ -82,6 +82,75 @@ suite('VenvManager - scoped refresh preservation', () => {
         );
     });
 
+    test('replaces a same-path environment sharing its id when the discovered object differs', async () => {
+        const manager = createManager();
+        const envAOld = makeEnv('A', venvARoot, '3.11.0');
+        seed(manager, [envAOld]);
+
+        const envANew = makeEnv('A', venvARoot, '3.12.5');
+        findVirtualEnvironmentsStub.resolves([envANew]);
+
+        const events = captureEvents(manager);
+        await manager.refresh(Uri.file(folderA));
+
+        const collection: PythonEnvironment[] = (manager as any).collection;
+        assert.strictEqual(collection.length, 1);
+        assert.strictEqual(collection[0], envANew);
+        assert.ok(!collection.includes(envAOld));
+
+        const changes = flatChanges(events);
+        assert.deepStrictEqual(
+            changes.map((c) => ({ id: c.environment.envId.id, kind: c.kind })),
+            [
+                { id: 'A', kind: EnvironmentChangeKind.remove },
+                { id: 'A', kind: EnvironmentChangeKind.add },
+            ],
+        );
+        assert.strictEqual(changes[0].environment, envAOld);
+        assert.strictEqual(changes[1].environment, envANew);
+    });
+
+    test('emits no event when the exact same environment object is rediscovered in scope', async () => {
+        const manager = createManager();
+        const envA = makeEnv('A', venvARoot);
+        seed(manager, [envA]);
+
+        findVirtualEnvironmentsStub.resolves([envA]);
+
+        const events = captureEvents(manager);
+        await manager.refresh(Uri.file(folderA));
+
+        const collection: PythonEnvironment[] = (manager as any).collection;
+        assert.strictEqual(collection.length, 1);
+        assert.strictEqual(collection[0], envA);
+        assert.deepStrictEqual(events, []);
+    });
+
+    test('emits a remove for every stale in-scope duplicate that shares a normalized path', async () => {
+        const manager = createManager();
+        const dup1 = makeEnv('A-dup-1', venvARoot);
+        const dup2 = makeEnv('A-dup-2', venvARoot);
+        seed(manager, [dup1, dup2, makeEnv('B', venvBRoot)]);
+
+        findVirtualEnvironmentsStub.resolves([makeEnv('A-new', venvARoot)]);
+
+        const events = captureEvents(manager);
+        await manager.refresh(Uri.file(folderA));
+
+        const collection: PythonEnvironment[] = (manager as any).collection;
+        assert.deepStrictEqual(ids(collection), ['A-new', 'B']);
+        assert.ok(!collection.includes(dup1) && !collection.includes(dup2));
+
+        const changes = flatChanges(events).map((c) => ({ id: c.environment.envId.id, kind: c.kind }));
+        const removed = changes
+            .filter((c) => c.kind === EnvironmentChangeKind.remove)
+            .map((c) => c.id)
+            .sort();
+        const added = changes.filter((c) => c.kind === EnvironmentChangeKind.add).map((c) => c.id);
+        assert.deepStrictEqual(removed, ['A-dup-1', 'A-dup-2']);
+        assert.deepStrictEqual(added, ['A-new']);
+    });
+
     test('removes only stale environments inside the target scope', async () => {
         const manager = createManager();
         seed(manager, [makeEnv('A', venvARoot), makeEnv('B', venvBRoot), makeEnv('G', globalVenvRoot)]);
@@ -262,6 +331,7 @@ suite('VenvManager - scoped refresh preservation', () => {
         const events = captureEvents(manager);
         await manager.refresh(missingNested);
 
+        assert.ok(findVirtualEnvironmentsStub.notCalled);
         assert.deepStrictEqual(ids((manager as any).collection), ['OTHER', 'PKG']);
         assert.deepStrictEqual(events, []);
     });
@@ -291,6 +361,7 @@ suite('VenvManager - scoped refresh preservation', () => {
         const events = captureEvents(manager);
         await manager.refresh(Uri.file(path.join(folderA, 'deleted.py')));
 
+        assert.ok(findVirtualEnvironmentsStub.notCalled);
         assert.deepStrictEqual(ids((manager as any).collection), ['A-old', 'B']);
         assert.deepStrictEqual(events, []);
     });
@@ -615,7 +686,24 @@ suite('VenvManager - scoped refresh preservation', () => {
         assert.strictEqual(uris[0].fsPath, scope.fsPath);
     });
 
-    function createManager(): VenvManager {
+    test('resolves a file scope to its directory before invoking the native finder', async () => {
+        findVirtualEnvironmentsStub.restore();
+        const finderRefresh = sinon.stub().resolves([]);
+        const manager = createManager({ refresh: finderRefresh } as unknown as NativePythonFinder);
+        seed(manager, []);
+
+        const fileUri = Uri.file(path.join(folderA, 'main.py'));
+        findParentIfFileStub.callsFake(async () => folderA);
+
+        await manager.refresh(fileUri);
+
+        assert.ok(finderRefresh.calledOnce);
+        const uris = finderRefresh.firstCall.args[1] as Uri[] | undefined;
+        assert.ok(Array.isArray(uris) && uris.length === 1);
+        assert.strictEqual(uris[0].fsPath, Uri.file(folderA).fsPath);
+    });
+
+    function createManager(finder: NativePythonFinder = {} as NativePythonFinder): VenvManager {
         const api = {
             getEnvironments: sinon.stub().resolves([]),
             getPythonProject: sinon.stub().returns(undefined),
@@ -625,7 +713,7 @@ suite('VenvManager - scoped refresh preservation', () => {
         const baseManager = {
             getEnvironments: sinon.stub().resolves([]),
         } as any as EnvironmentManager;
-        const manager = new VenvManager({} as NativePythonFinder, api, baseManager, {
+        const manager = new VenvManager(finder, api, baseManager, {
             info: sinon.stub(),
             error: sinon.stub(),
             warn: sinon.stub(),
