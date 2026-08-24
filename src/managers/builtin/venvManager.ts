@@ -52,6 +52,7 @@ import {
 export class VenvManager implements EnvironmentManager {
     private collection: PythonEnvironment[] = [];
     private refreshChain: Promise<void> = Promise.resolve();
+    private collectionMutationGeneration = 0;
     private readonly fsPathToEnv: Map<string, PythonEnvironment> = new Map();
     private globalEnv: PythonEnvironment | undefined;
     private skipWatcherRefresh = false;
@@ -287,7 +288,11 @@ export class VenvManager implements EnvironmentManager {
 
     private updateCollection(environment: PythonEnvironment): void {
         const envPath = normalizePath(environment.environmentPath.fsPath);
+        const before = this.collection.length;
         this.collection = this.collection.filter((e) => normalizePath(e.environmentPath.fsPath) !== envPath);
+        if (this.collection.length !== before) {
+            this.collectionMutationGeneration++;
+        }
     }
 
     private updateFsPathToEnv(environment: PythonEnvironment): Uri[] {
@@ -327,12 +332,16 @@ export class VenvManager implements EnvironmentManager {
             async () => {
                 const run = this.refreshChain.then(
                     async (): Promise<DidChangeEnvironmentsEventArgs | undefined> => {
+                        const generation = this.collectionMutationGeneration;
                         let scopeRoot: string | undefined;
                         if (scope) {
                             try {
                                 scopeRoot = await findParentIfFile(scope.fsPath);
-                            } catch {
-                                return undefined;
+                            } catch (err) {
+                                if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+                                    return undefined;
+                                }
+                                throw err;
                             }
                         }
                         const discovered =
@@ -344,6 +353,9 @@ export class VenvManager implements EnvironmentManager {
                                 this,
                                 scopeRoot !== undefined ? [Uri.file(scopeRoot)] : undefined,
                             )) ?? [];
+                        if (this.collectionMutationGeneration !== generation) {
+                            return undefined;
+                        }
                         if (scopeRoot !== undefined) {
                             return this.mergeScopedEnvironments(scopeRoot, discovered);
                         }
@@ -620,13 +632,19 @@ export class VenvManager implements EnvironmentManager {
                 this._onDidChangeEnvironments.fire([{ environment, kind: EnvironmentChangeKind.add }]);
             }
         }
+        if (raiseEvent) {
+            this.collectionMutationGeneration++;
+        }
         return environment;
     }
 
     private async resetGlobalEnv() {
         this.globalEnv = undefined;
         const globals = await this.baseManager.getEnvironments('global');
-        await this.loadGlobalEnv(globals);
+        const added = await this.loadGlobalEnv(globals);
+        if (added) {
+            this.collectionMutationGeneration++;
+        }
     }
 
     /**

@@ -366,7 +366,7 @@ suite('VenvManager - scoped refresh preservation', () => {
         assert.deepStrictEqual(events, []);
     });
 
-    test('skips reconciliation without widening when a nested scope inspection fails with EACCES', async () => {
+    test('rejects and surfaces the error without discovery when a scope inspection fails with EACCES', async () => {
         const manager = createManager();
         const pkgVenv = path.join(folderA, 'pkg', '.venv');
         const otherVenv = path.join(folderA, 'other', '.venv');
@@ -374,8 +374,10 @@ suite('VenvManager - scoped refresh preservation', () => {
 
         const nestedScope = Uri.file(path.join(folderA, 'pkg'));
         ((manager as any).api.getPythonProject as sinon.SinonStub).returns({ uri: Uri.file(folderA) });
+        let call = 0;
         findParentIfFileStub.callsFake(async (p: string) => {
-            if (p === nestedScope.fsPath) {
+            call += 1;
+            if (call === 1) {
                 throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
             }
             return p;
@@ -383,10 +385,15 @@ suite('VenvManager - scoped refresh preservation', () => {
         findVirtualEnvironmentsStub.resolves([makeEnv('PKG-new', pkgVenv)]);
 
         const events = captureEvents(manager);
-        await manager.refresh(nestedScope);
+        await assert.rejects(manager.refresh(nestedScope), /EACCES/);
 
+        assert.ok(findVirtualEnvironmentsStub.notCalled);
         assert.deepStrictEqual(ids((manager as any).collection), ['OTHER', 'PKG']);
         assert.deepStrictEqual(events, []);
+
+        await manager.refresh(nestedScope);
+        assert.ok(findVirtualEnvironmentsStub.called);
+        assert.deepStrictEqual(ids((manager as any).collection), ['OTHER', 'PKG-new']);
     });
 
     test('does not append an out-of-scope environment while loading the project map', async () => {
@@ -649,6 +656,157 @@ suite('VenvManager - scoped refresh preservation', () => {
             events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
             [[{ id: 'A', kind: EnvironmentChangeKind.remove }], [{ id: 'A', kind: EnvironmentChangeKind.add }]],
         );
+    });
+
+    test('discards a stale scoped discovery when a direct remove mutates the collection during discovery', async () => {
+        const manager = createManager();
+        const envA = makeEnv('A', venvARoot);
+        seed(manager, [envA]);
+        sinon.stub(venvUtils, 'removeVenv').resolves(true);
+
+        const inDiscovery = createDeferred<void>();
+        const releaseDiscovery = createDeferred<void>();
+        findVirtualEnvironmentsStub.callsFake(async () => {
+            inDiscovery.resolve();
+            await releaseDiscovery.promise;
+            return [envA];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(Uri.file(folderA));
+        await inDiscovery.promise;
+        await manager.remove(envA);
+        releaseDiscovery.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), []);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [[{ id: 'A', kind: EnvironmentChangeKind.remove }]],
+        );
+    });
+
+    test('discards a stale full refresh when a direct remove mutates the collection during discovery', async () => {
+        const manager = createManager();
+        const envA = makeEnv('A', venvARoot);
+        seed(manager, [envA]);
+        sinon.stub(venvUtils, 'removeVenv').resolves(true);
+
+        const inDiscovery = createDeferred<void>();
+        const releaseDiscovery = createDeferred<void>();
+        findVirtualEnvironmentsStub.callsFake(async () => {
+            inDiscovery.resolve();
+            await releaseDiscovery.promise;
+            return [envA];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(undefined);
+        await inDiscovery.promise;
+        await manager.remove(envA);
+        releaseDiscovery.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), []);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [[{ id: 'A', kind: EnvironmentChangeKind.remove }]],
+        );
+    });
+
+    test('discards a stale scoped discovery when a direct create mutates the collection during discovery', async () => {
+        const manager = createManager();
+        seed(manager, []);
+
+        const envA = makeEnv('A', venvARoot);
+        const created = makeEnv('CREATED', path.join(ROOT, 'created', '.venv'));
+        const inDiscovery = createDeferred<void>();
+        const releaseDiscovery = createDeferred<void>();
+        findVirtualEnvironmentsStub.callsFake(async () => {
+            inDiscovery.resolve();
+            await releaseDiscovery.promise;
+            return [envA];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(Uri.file(folderA));
+        await inDiscovery.promise;
+        (manager as any).addEnvironment(created, true);
+        releaseDiscovery.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), ['CREATED']);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [[{ id: 'CREATED', kind: EnvironmentChangeKind.add }]],
+        );
+    });
+
+    test('resumes on a later refresh after discarding a stale discovery result', async () => {
+        const manager = createManager();
+        const envA = makeEnv('A', venvARoot);
+        seed(manager, [envA]);
+        sinon.stub(venvUtils, 'removeVenv').resolves(true);
+
+        const inDiscovery = createDeferred<void>();
+        const releaseDiscovery = createDeferred<void>();
+        let call = 0;
+        findVirtualEnvironmentsStub.callsFake(async () => {
+            call += 1;
+            if (call === 1) {
+                inDiscovery.resolve();
+                await releaseDiscovery.promise;
+                return [envA];
+            }
+            return [makeEnv('A-new', venvARoot)];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(Uri.file(folderA));
+        await inDiscovery.promise;
+        await manager.remove(envA);
+        releaseDiscovery.resolve();
+        await pRefresh;
+
+        await manager.refresh(Uri.file(folderA));
+
+        assert.deepStrictEqual(ids((manager as any).collection), ['A-new']);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [
+                [{ id: 'A', kind: EnvironmentChangeKind.remove }],
+                [{ id: 'A-new', kind: EnvironmentChangeKind.add }],
+            ],
+        );
+    });
+
+    test('discards a stale full refresh when setting the global env mutates the collection during discovery', async () => {
+        const manager = createManager();
+        const envA = makeEnv('A', venvARoot);
+        seed(manager, [envA]);
+
+        const globalEnv = makeEnv('G', globalVenvRoot);
+        sinon.stub(venvUtils, 'setVenvForGlobal').resolves();
+        (venvUtils.getVenvForGlobal as sinon.SinonStub).resolves(venvPython(globalVenvRoot));
+        (venvUtils.resolveVenvPythonEnvironmentPath as sinon.SinonStub).resolves(globalEnv);
+
+        const inDiscovery = createDeferred<void>();
+        const releaseDiscovery = createDeferred<void>();
+        findVirtualEnvironmentsStub.callsFake(async () => {
+            inDiscovery.resolve();
+            await releaseDiscovery.promise;
+            return [makeEnv('A-STALE', venvARoot)];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(undefined);
+        await inDiscovery.promise;
+        await manager.set(undefined, globalEnv);
+        releaseDiscovery.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), ['A', 'G']);
+        assert.deepStrictEqual(events, []);
     });
 
     test('full (unscoped) refresh still replaces the entire collection', async () => {
