@@ -849,6 +849,82 @@ suite('VenvManager - scoped refresh preservation', () => {
         );
     });
 
+    test('emits the refresh remove for a distinct old object when a direct remove targets a same-path replacement during full-refresh map loading', async () => {
+        const manager = createManager();
+        const envOld = makeEnv('A', venvARoot);
+        seed(manager, [envOld]);
+        sinon.stub(venvUtils, 'removeVenv').resolves(true);
+
+        const envDiscovered = makeEnv('A', venvARoot);
+        findVirtualEnvironmentsStub.resolves([envDiscovered]);
+
+        const inLoadEnvMap = createDeferred<void>();
+        const release = createDeferred<void>();
+        let call = 0;
+        ((manager as any).baseManager.getEnvironments as sinon.SinonStub).callsFake(async () => {
+            call += 1;
+            if (call === 1) {
+                inLoadEnvMap.resolve();
+                await release.promise;
+            }
+            return [];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(undefined);
+        await inLoadEnvMap.promise;
+        await manager.remove(envDiscovered);
+        release.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), []);
+        assert.strictEqual(events.length, 2);
+        assert.strictEqual(events[0].length, 1);
+        assert.strictEqual(events[0][0].kind, EnvironmentChangeKind.remove);
+        assert.strictEqual(events[0][0].environment, envDiscovered);
+        assert.strictEqual(events[1].length, 1);
+        assert.strictEqual(events[1][0].kind, EnvironmentChangeKind.remove);
+        assert.strictEqual(events[1][0].environment, envOld);
+    });
+
+    test('emits the refresh remove for a distinct old object when a direct remove targets a same-path scoped replacement during map loading', async () => {
+        const manager = createManager();
+        const envOld = makeEnv('A', venvARoot);
+        seed(manager, [envOld]);
+        sinon.stub(venvUtils, 'removeVenv').resolves(true);
+
+        const envDiscovered = makeEnv('A', venvARoot);
+        findVirtualEnvironmentsStub.resolves([envDiscovered]);
+
+        const inLoadEnvMap = createDeferred<void>();
+        const release = createDeferred<void>();
+        let call = 0;
+        ((manager as any).baseManager.getEnvironments as sinon.SinonStub).callsFake(async () => {
+            call += 1;
+            if (call === 1) {
+                inLoadEnvMap.resolve();
+                await release.promise;
+            }
+            return [];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(Uri.file(folderA));
+        await inLoadEnvMap.promise;
+        await manager.remove(envDiscovered);
+        release.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), []);
+        assert.strictEqual(events.length, 2);
+        assert.strictEqual(events[0].length, 1);
+        assert.strictEqual(events[0][0].kind, EnvironmentChangeKind.remove);
+        assert.strictEqual(events[0][0].environment, envDiscovered);
+        assert.strictEqual(events[1].length, 1);
+        assert.strictEqual(events[1][0].kind, EnvironmentChangeKind.remove);
+        assert.strictEqual(events[1][0].environment, envOld);
+    });
+
     test('discards a stale scoped discovery when a direct remove mutates the collection during discovery', async () => {
         const manager = createManager();
         const envA = makeEnv('A', venvARoot);

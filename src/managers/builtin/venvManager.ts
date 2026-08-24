@@ -53,7 +53,7 @@ export class VenvManager implements EnvironmentManager {
     private collection: PythonEnvironment[] = [];
     private refreshChain: Promise<void> = Promise.resolve();
     private collectionMutationGeneration = 0;
-    private readonly directRemovalGenerations = new Map<string, number>();
+    private readonly directRemovalGenerations = new WeakMap<PythonEnvironment, number>();
     private readonly fsPathToEnv: Map<string, PythonEnvironment> = new Map();
     private globalEnv: PythonEnvironment | undefined;
     private skipWatcherRefresh = false;
@@ -289,16 +289,26 @@ export class VenvManager implements EnvironmentManager {
 
     private updateCollection(environment: PythonEnvironment): void {
         const envPath = normalizePath(environment.environmentPath.fsPath);
-        const before = this.collection.length;
-        this.collection = this.collection.filter((e) => normalizePath(e.environmentPath.fsPath) !== envPath);
-        if (this.collection.length !== before) {
+        const removed: PythonEnvironment[] = [];
+        const kept: PythonEnvironment[] = [];
+        for (const e of this.collection) {
+            if (normalizePath(e.environmentPath.fsPath) === envPath) {
+                removed.push(e);
+            } else {
+                kept.push(e);
+            }
+        }
+        if (removed.length > 0) {
+            this.collection = kept;
             this.collectionMutationGeneration++;
-            this.directRemovalGenerations.set(envPath, this.collectionMutationGeneration);
+            for (const env of removed) {
+                this.directRemovalGenerations.set(env, this.collectionMutationGeneration);
+            }
         }
     }
 
     private wasDirectlyRemovedSince(environment: PythonEnvironment, generation: number): boolean {
-        const removedGeneration = this.directRemovalGenerations.get(normalizePath(environment.environmentPath.fsPath));
+        const removedGeneration = this.directRemovalGenerations.get(environment);
         return removedGeneration !== undefined && removedGeneration > generation;
     }
 
@@ -340,11 +350,6 @@ export class VenvManager implements EnvironmentManager {
                 const run = this.refreshChain.then(
                     async (): Promise<DidChangeEnvironmentsEventArgs | undefined> => {
                         const generation = this.collectionMutationGeneration;
-                        for (const [key, removedGeneration] of this.directRemovalGenerations) {
-                            if (removedGeneration <= generation) {
-                                this.directRemovalGenerations.delete(key);
-                            }
-                        }
                         let scopeRoot: string | undefined;
                         if (scope) {
                             try {
@@ -636,7 +641,9 @@ export class VenvManager implements EnvironmentManager {
         }
 
         const oldEnv = this.findEnvironmentByPath(environment.environmentPath.fsPath);
+        let replaced: PythonEnvironment[] = [];
         if (oldEnv) {
+            replaced = this.collection.filter((e) => e.envId.id === oldEnv.envId.id);
             this.collection = this.collection.filter((e) => e.envId.id !== oldEnv.envId.id);
             this.collection.push(environment);
             if (raiseEvent) {
@@ -653,11 +660,8 @@ export class VenvManager implements EnvironmentManager {
         }
         if (raiseEvent) {
             this.collectionMutationGeneration++;
-            if (oldEnv) {
-                this.directRemovalGenerations.set(
-                    normalizePath(oldEnv.environmentPath.fsPath),
-                    this.collectionMutationGeneration,
-                );
+            for (const env of replaced) {
+                this.directRemovalGenerations.set(env, this.collectionMutationGeneration);
             }
         }
         return environment;
