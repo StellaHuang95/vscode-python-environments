@@ -643,6 +643,7 @@ export class VenvManager implements EnvironmentManager {
         const globals = await this.baseManager.getEnvironments('global');
         const added = await this.loadGlobalEnv(globals);
         if (added) {
+            this._onDidChangeEnvironments.fire([{ environment: added, kind: EnvironmentChangeKind.add }]);
             this.collectionMutationGeneration++;
         }
     }

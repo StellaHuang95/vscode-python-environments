@@ -780,7 +780,7 @@ suite('VenvManager - scoped refresh preservation', () => {
         );
     });
 
-    test('discards a stale full refresh when setting the global env mutates the collection during discovery', async () => {
+    test('emits the global add and discards a stale full refresh when setting the global env mutates the collection during discovery', async () => {
         const manager = createManager();
         const envA = makeEnv('A', venvARoot);
         seed(manager, [envA]);
@@ -806,7 +806,46 @@ suite('VenvManager - scoped refresh preservation', () => {
         await pRefresh;
 
         assert.deepStrictEqual(ids((manager as any).collection), ['A', 'G']);
-        assert.deepStrictEqual(events, []);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [[{ id: 'G', kind: EnvironmentChangeKind.add }]],
+        );
+    });
+
+    test('selecting an already-collected global emits no add and does not discard a concurrent scoped refresh', async () => {
+        const manager = createManager();
+        const envA = makeEnv('A', venvARoot);
+        const globalEnv = makeEnv('G', globalVenvRoot);
+        seed(manager, [envA, globalEnv]);
+
+        sinon.stub(venvUtils, 'setVenvForGlobal').resolves();
+        (venvUtils.getVenvForGlobal as sinon.SinonStub).resolves(venvPython(globalVenvRoot));
+
+        const inDiscovery = createDeferred<void>();
+        const releaseDiscovery = createDeferred<void>();
+        findVirtualEnvironmentsStub.callsFake(async () => {
+            inDiscovery.resolve();
+            await releaseDiscovery.promise;
+            return [makeEnv('A-new', venvARoot)];
+        });
+
+        const events = captureEvents(manager);
+        const pRefresh = manager.refresh(Uri.file(folderA));
+        await inDiscovery.promise;
+        await manager.set(undefined, globalEnv);
+        releaseDiscovery.resolve();
+        await pRefresh;
+
+        assert.deepStrictEqual(ids((manager as any).collection), ['A-new', 'G']);
+        assert.deepStrictEqual(
+            events.map((batch) => batch.map((c) => ({ id: c.environment.envId.id, kind: c.kind }))),
+            [
+                [
+                    { id: 'A', kind: EnvironmentChangeKind.remove },
+                    { id: 'A-new', kind: EnvironmentChangeKind.add },
+                ],
+            ],
+        );
     });
 
     test('full (unscoped) refresh still replaces the entire collection', async () => {
