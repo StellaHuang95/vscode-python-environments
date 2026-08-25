@@ -22,13 +22,13 @@ import {
     shouldRetainPetInfo,
     type RefreshPerformance,
 } from './petTelemetry';
-import { noop } from './utils';
 
 // Timeout constants for JSON-RPC requests (in milliseconds)
 const CONFIGURE_TIMEOUT_MS = 30_000; // 30 seconds for configuration
 const MAX_CONFIGURE_TIMEOUT_MS = 60_000; // Max configure timeout after retries (60s)
 const REFRESH_TIMEOUT_MS = 30_000; // 30 seconds for full refresh (with 1 retry = 60s max)
 const RESOLVE_TIMEOUT_MS = 30_000; // 30 seconds for single resolve
+const CLEAR_TIMEOUT_MS = 30_000; // 30 seconds for the `clear` cache request (bounded so Clear Cache never hangs)
 const INFO_TIMEOUT_MS = 2_000; // `info` is a const lookup on PET; 2s is generous
 const INFO_REQUEST_ATTEMPTS = 3; // Retry early startup timeouts without blocking PET operations
 
@@ -244,6 +244,12 @@ export interface NativePythonFinder extends Disposable {
      * @param executable
      */
     resolve(executable: string): Promise<NativeEnvInfo>;
+    /**
+     * Clears every discovery cache owned by the finder: the in-memory result map, the live PET `clear`
+     * request, and the on-disk cache directory. Rejects when the on-disk clear fails and no live server
+     * handled it.
+     */
+    clearCache(): Promise<void>;
 }
 interface NativeLog {
     level: string;
@@ -342,15 +348,22 @@ async function sendRequestWithTimeout<T>(
     }
 }
 
-class NativePythonFinderImpl implements NativePythonFinder {
+interface InFlightRefresh {
+    promise: Promise<NativeInfo[]>;
+    configuration: ConfigurationOptions;
+    generation: number;
+}
+
+/** Concrete {@link NativePythonFinder} backed by the PET JSON-RPC server. Exported for unit tests. */
+export class NativePythonFinderImpl implements NativePythonFinder {
     private connection: rpc.MessageConnection;
-    private readonly pool: WorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>;
-    private cache: Map<string, NativeInfo[]> = new Map();
+    private readonly pool: WorkerPool<RefreshTask, RefreshResult>;
+    private readonly cache = new DiscoveryResultCache();
     /**
      * Tracks in-flight hard refreshes by cache key so concurrent callers share a
      * single PET scan instead of queueing duplicate work.
      */
-    private inFlightRefreshes: Map<string, Promise<NativeInfo[]>> = new Map();
+    private inFlightRefreshes: Map<string, InFlightRefresh> = new Map();
     private startDisposables: Disposable[] = [];
     private proc: ChildProcess | undefined;
     private processExited: boolean = false;
@@ -374,8 +387,8 @@ class NativePythonFinderImpl implements NativePythonFinder {
         private readonly cacheDirectory?: Uri,
     ) {
         this.connection = this.start();
-        this.pool = createRunningWorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>(
-            async (options) => await this.doRefresh(options),
+        this.pool = createRunningWorkerPool<RefreshTask, RefreshResult>(
+            async (task) => await this.doRefresh(task.options, task.configuration),
             1,
             'NativeRefresh-task',
         );
@@ -580,13 +593,22 @@ class NativePythonFinderImpl implements NativePythonFinder {
         return 'all';
     }
 
-    private async handleHardRefresh(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
+    private async handleHardRefresh(
+        options?: NativePythonEnvironmentKind | Uri[],
+        prebuiltConfiguration?: ConfigurationOptions,
+    ): Promise<NativeInfo[]> {
         const key = this.getKey(options);
+        const configuration = prebuiltConfiguration ?? (await this.buildConfigurationOptions());
+        const generationAtStart = this.cache.generation;
 
         const inFlight = this.inFlightRefreshes.get(key);
-        if (inFlight) {
+        if (
+            inFlight &&
+            inFlight.generation === generationAtStart &&
+            configurationEquals(inFlight.configuration, configuration)
+        ) {
             this.outputChannel.debug(`[Finder] Coalescing hard refresh with in-flight request for key: ${key}`);
-            return inFlight;
+            return inFlight.promise;
         }
 
         this.cache.delete(key);
@@ -596,45 +618,81 @@ class NativePythonFinderImpl implements NativePythonFinder {
             this.outputChannel.debug(`[Finder] Hard refresh for key: ${key}`);
         }
 
-        // .finally clears the in-flight slot on both success AND failure paths so
-        // a rejected refresh does not poison the cache — the next call after a
-        // failure starts a fresh attempt, matching today's behavior.
+        let entry: InFlightRefresh;
         const refreshPromise = this.pool
-            .addToQueue(options)
-            .then((result) => {
-                if (!result || !Array.isArray(result)) {
-                    this.outputChannel.warn(`[pet] Worker pool returned invalid result type: ${typeof result}`);
+            .addToQueue({ options, configuration })
+            .then((refreshResult) => {
+                const results = refreshResult?.results;
+                if (!results || !Array.isArray(results)) {
+                    this.outputChannel.warn(
+                        `[pet] Worker pool returned invalid result type: ${typeof refreshResult}`,
+                    );
                     return [] as NativeInfo[];
                 }
-                this.cache.set(key, result);
-                return result;
+                this.cache.set(key, refreshResult.configuration, results, generationAtStart);
+                return results;
             })
             .finally(() => {
-                this.inFlightRefreshes.delete(key);
+                if (this.inFlightRefreshes.get(key) === entry) {
+                    this.inFlightRefreshes.delete(key);
+                }
             });
 
-        this.inFlightRefreshes.set(key, refreshPromise);
+        entry = { promise: refreshPromise, configuration, generation: generationAtStart };
+        this.inFlightRefreshes.set(key, entry);
         return refreshPromise;
     }
 
     private async handleSoftRefresh(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
         const key = this.getKey(options);
-        const cacheResult = this.cache.get(key);
-        // Validate cache integrity - if cached value is not a valid array, do a hard refresh
-        if (!cacheResult || !Array.isArray(cacheResult)) {
-            if (cacheResult !== undefined) {
-                this.outputChannel.warn(`[pet] Cache contained invalid data type: ${typeof cacheResult}`);
-                this.cache.delete(key);
+        const configuration = await this.buildConfigurationOptions();
+        const cacheResult = this.cache.getValid(key, configuration);
+        if (cacheResult) {
+            if (!options) {
+                this.outputChannel.debug('[Finder] Returning cached environments for all');
+            } else {
+                this.outputChannel.debug(`[Finder] Returning cached environments for key: ${key}`);
             }
-            return this.handleHardRefresh(options);
+            return cacheResult;
         }
 
-        if (!options) {
-            this.outputChannel.debug('[Finder] Returning cached environments for all');
-        } else {
-            this.outputChannel.debug(`[Finder] Returning cached environments for key: ${key}`);
+        return this.handleHardRefresh(options, configuration);
+    }
+
+    public async clearCache(): Promise<void> {
+        this.cache.clear();
+        this.lastConfiguration = undefined;
+
+        let liveClearSucceeded = false;
+        const serverLive = !this.startFailed && !this.processExited && this.proc !== undefined;
+        if (serverLive) {
+            try {
+                await sendRequestWithTimeout(this.connection, 'clear', {}, CLEAR_TIMEOUT_MS);
+                liveClearSucceeded = true;
+                this.outputChannel.info('[pet] Cleared native discovery cache via live server');
+            } catch (ex) {
+                this.outputChannel.warn('[pet] Live `clear` request failed; relying on on-disk clear', ex);
+            }
         }
-        return cacheResult;
+
+        if (this.cacheDirectory) {
+            try {
+                await fs.emptyDir(this.cacheDirectory.fsPath);
+                this.outputChannel.info('[pet] Cleared on-disk PET cache directory');
+            } catch (ex) {
+                if (liveClearSucceeded) {
+                    this.outputChannel.warn(
+                        '[pet] Redundant on-disk cache clear failed after a successful live clear; ignoring',
+                        ex,
+                    );
+                } else {
+                    this.outputChannel.error('[pet] Failed to clear on-disk PET cache directory', ex);
+                    throw ex;
+                }
+            }
+        } else if (!liveClearSucceeded) {
+            this.outputChannel.warn('[pet] No live server and no cache directory configured; nothing to clear.');
+        }
     }
 
     public dispose() {
@@ -843,12 +901,16 @@ class NativePythonFinderImpl implements NativePythonFinder {
         };
     }
 
-    private async doRefresh(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
+    private async doRefresh(
+        options: NativePythonEnvironmentKind | Uri[] | undefined,
+        configuration: ConfigurationOptions,
+    ): Promise<RefreshResult> {
         let lastError: unknown;
 
         for (let attempt = 0; attempt <= MAX_REFRESH_RETRIES; attempt++) {
             try {
-                return await this.doRefreshAttempt(options, attempt);
+                const results = await this.doRefreshAttempt(options, attempt, configuration);
+                return { results, configuration };
             } catch (ex) {
                 lastError = ex;
 
@@ -874,7 +936,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 // Non-timeout errors or final timeout — check if server is fully exhausted
                 if (this.isServerExhausted()) {
                     this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh');
-                    return this.refreshViaJsonCli(options);
+                    return { results: await this.refreshViaJsonCli(options, configuration), configuration };
                 }
                 throw ex;
             }
@@ -883,7 +945,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
         // Should not reach here, but TypeScript needs this
         if (this.isServerExhausted()) {
             this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh (final)');
-            return this.refreshViaJsonCli(options);
+            return { results: await this.refreshViaJsonCli(options, configuration), configuration };
         }
         throw lastError;
     }
@@ -891,6 +953,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
     private async doRefreshAttempt(
         options: NativePythonEnvironmentKind | Uri[] | undefined,
         attempt: number,
+        configuration: ConfigurationOptions,
     ): Promise<NativeInfo[]> {
         await this.ensureProcessRunning();
         const disposables: Disposable[] = [];
@@ -899,12 +962,9 @@ class NativePythonFinderImpl implements NativePythonFinder {
         const sw = new StopWatch();
         let unresolvedCount = 0;
         let refreshPerf: RefreshPerformance | undefined;
-        let workspaceDirCount: number | undefined;
-        let searchPathCount: number | undefined;
+        const workspaceDirCount: number | undefined = configuration.workspaceDirectories.length;
+        const searchPathCount: number | undefined = configuration.environmentDirectories.length;
         try {
-            const configuration = await this.buildConfigurationOptions();
-            workspaceDirCount = configuration.workspaceDirectories.length;
-            searchPathCount = configuration.environmentDirectories.length;
             await this.configure(configuration);
             const refreshOptions = this.getRefreshOptions(options);
             disposables.push(
@@ -1023,11 +1083,12 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * Must be invoked when ever there are changes to any data related to the configuration details.
      */
     private async configure(options?: ConfigurationOptions) {
+        const generationAtStart = this.cache.generation;
         const configuration = options ?? (await this.buildConfigurationOptions());
         const workspaceDirCount = configuration.workspaceDirectories.length;
         const envDirCount = configuration.environmentDirectories.length;
         // No need to send a configuration request if there are no changes.
-        if (this.lastConfiguration && this.configurationEquals(configuration, this.lastConfiguration)) {
+        if (this.lastConfiguration && configurationEquals(configuration, this.lastConfiguration)) {
             this.outputChannel.debug('[pet] configure: No changes detected, skipping configuration update.');
             sendTelemetryEvent(
                 EventNames.PET_CONFIGURE,
@@ -1048,8 +1109,13 @@ class NativePythonFinderImpl implements NativePythonFinder {
         const retryCount = this.configureRetry.timeoutCount;
         try {
             await sendRequestWithTimeout(this.connection, 'configure', configuration, timeoutMs);
-            // Only cache after success so failed/timed-out calls will retry
-            this.lastConfiguration = configuration;
+            if (this.cache.generation === generationAtStart) {
+                this.lastConfiguration = configuration;
+            } else {
+                this.outputChannel.debug(
+                    '[pet] configure: cache was cleared during configure; not caching lastConfiguration',
+                );
+            }
             this.configureRetry.onSuccess();
             sendTelemetryEvent(
                 EventNames.PET_CONFIGURE,
@@ -1203,10 +1269,13 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * Spawns PET as a one-shot subprocess and parses the JSON output.
      *
      * @param options Optional kind filter or URI search paths (same semantics as refresh()).
+     * @param config The effective configuration for this refresh.
      * @returns NativeInfo[] containing managers and environments, same as server mode.
      */
-    private async refreshViaJsonCli(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
-        const config = await this.buildConfigurationOptions();
+    private async refreshViaJsonCli(
+        options: NativePythonEnvironmentKind | Uri[] | undefined,
+        config: ConfigurationOptions,
+    ): Promise<NativeInfo[]> {
         // venvFolders must be included explicitly as search paths when options is Uri[],
         // mirroring getRefreshOptions() server-mode behaviour (searchPaths may override environmentDirectories).
         const venvFolders = getPythonSettingAndUntildify<string[]>('venvFolders') ?? [];
@@ -1348,46 +1417,6 @@ class NativePythonFinderImpl implements NativePythonFinder {
         });
         return parsed;
     }
-
-    /**
-     * Compares two ConfigurationOptions objects for equality.
-     * Uses property-by-property comparison to avoid issues with JSON.stringify
-     * (property order, undefined values serialization).
-     */
-    private configurationEquals(a: ConfigurationOptions, b: ConfigurationOptions): boolean {
-        // Compare simple optional string properties
-        if (a.condaExecutable !== b.condaExecutable) {
-            return false;
-        }
-        if (a.pipenvExecutable !== b.pipenvExecutable) {
-            return false;
-        }
-        if (a.poetryExecutable !== b.poetryExecutable) {
-            return false;
-        }
-        if (a.cacheDirectory !== b.cacheDirectory) {
-            return false;
-        }
-
-        // Compare array properties using sorted comparison to handle order differences
-        const arraysEqual = (arr1: string[], arr2: string[]): boolean => {
-            if (arr1.length !== arr2.length) {
-                return false;
-            }
-            const sorted1 = [...arr1].sort();
-            const sorted2 = [...arr2].sort();
-            return sorted1.every((val, idx) => val === sorted2[idx]);
-        };
-
-        if (!arraysEqual(a.workspaceDirectories, b.workspaceDirectories)) {
-            return false;
-        }
-        if (!arraysEqual(a.environmentDirectories, b.environmentDirectories)) {
-            return false;
-        }
-
-        return true;
-    }
 }
 
 export type ConfigurationOptions = {
@@ -1398,6 +1427,110 @@ export type ConfigurationOptions = {
     poetryExecutable: string | undefined;
     cacheDirectory?: string;
 };
+
+export interface RefreshResult {
+    results: NativeInfo[];
+    configuration: ConfigurationOptions;
+}
+
+interface RefreshTask {
+    options?: NativePythonEnvironmentKind | Uri[];
+    configuration: ConfigurationOptions;
+}
+
+/** Property-by-property equality (arrays order-independent) that gates `configure` and soft hits. */
+export function configurationEquals(a: ConfigurationOptions, b: ConfigurationOptions): boolean {
+    if (a.condaExecutable !== b.condaExecutable) {
+        return false;
+    }
+    if (a.pipenvExecutable !== b.pipenvExecutable) {
+        return false;
+    }
+    if (a.poetryExecutable !== b.poetryExecutable) {
+        return false;
+    }
+    if (a.cacheDirectory !== b.cacheDirectory) {
+        return false;
+    }
+
+    const arraysEqual = (arr1: string[], arr2: string[]): boolean => {
+        if (arr1.length !== arr2.length) {
+            return false;
+        }
+        const sorted1 = [...arr1].sort();
+        const sorted2 = [...arr2].sort();
+        return sorted1.every((val, idx) => val === sorted2[idx]);
+    };
+
+    if (!arraysEqual(a.workspaceDirectories, b.workspaceDirectories)) {
+        return false;
+    }
+    if (!arraysEqual(a.environmentDirectories, b.environmentDirectories)) {
+        return false;
+    }
+
+    return true;
+}
+
+interface DiscoveryCacheEntry {
+    configuration: ConfigurationOptions;
+    results: NativeInfo[];
+    generation: number;
+}
+
+/**
+ * Result cache keyed by refresh scope: a soft hit is valid only when the key's saved configuration
+ * still matches, and a monotonic {@link generation} (advanced by {@link clear}) rejects pre-clear stores.
+ */
+export class DiscoveryResultCache {
+    private readonly entries = new Map<string, DiscoveryCacheEntry>();
+    private currentGeneration = 0;
+
+    get generation(): number {
+        return this.currentGeneration;
+    }
+
+    get size(): number {
+        return this.entries.size;
+    }
+
+    getValid(key: string, configuration: ConfigurationOptions): NativeInfo[] | undefined {
+        const entry = this.entries.get(key);
+        if (!entry) {
+            return undefined;
+        }
+        if (entry.generation !== this.currentGeneration) {
+            this.entries.delete(key);
+            return undefined;
+        }
+        if (!configurationEquals(entry.configuration, configuration)) {
+            return undefined;
+        }
+        return entry.results;
+    }
+
+    set(
+        key: string,
+        configuration: ConfigurationOptions,
+        results: NativeInfo[],
+        generationAtStart: number,
+    ): boolean {
+        if (generationAtStart !== this.currentGeneration) {
+            return false;
+        }
+        this.entries.set(key, { configuration, results, generation: this.currentGeneration });
+        return true;
+    }
+
+    delete(key: string): void {
+        this.entries.delete(key);
+    }
+
+    clear(): void {
+        this.currentGeneration++;
+        this.entries.clear();
+    }
+}
 
 /**
  * Parses the stdout of `pet find --json` into a structured result.
@@ -1684,7 +1817,13 @@ export function getCacheDirectory(context: ExtensionContext): Uri {
 
 export async function clearCacheDirectory(context: ExtensionContext): Promise<void> {
     const cacheDirectory = getCacheDirectory(context);
-    await fs.emptyDir(cacheDirectory.fsPath).catch(noop);
+    try {
+        await fs.emptyDir(cacheDirectory.fsPath);
+        traceVerbose(`[pet] Cleared on-disk discovery cache directory: ${cacheDirectory.fsPath}`);
+    } catch (ex) {
+        traceError(`[pet] Failed to clear on-disk discovery cache directory: ${cacheDirectory.fsPath}`, ex);
+        throw ex;
+    }
 }
 
 export async function createNativePythonFinder(
