@@ -25,7 +25,7 @@ import { PYTHON_EXTENSION_ID } from '../../common/constants';
 import { VenvManagerStrings } from '../../common/localize';
 import { traceError, traceWarn } from '../../common/logging';
 import { createDeferred, Deferred } from '../../common/utils/deferred';
-import { normalizePath } from '../../common/utils/pathUtils';
+import { normalizePath, isPathInside } from '../../common/utils/pathUtils';
 import { showErrorMessage, showInformationMessage, withProgress } from '../../common/window.apis';
 import { findParentIfFile } from '../../features/envCommands';
 import { getProjectFsPathForScope, tryFastPathGet } from '../common/fastPath';
@@ -51,6 +51,9 @@ import {
 
 export class VenvManager implements EnvironmentManager {
     private collection: PythonEnvironment[] = [];
+    private refreshChain: Promise<void> = Promise.resolve();
+    private collectionMutationGeneration = 0;
+    private readonly directRemovalGenerations = new WeakMap<PythonEnvironment, number>();
     private readonly fsPathToEnv: Map<string, PythonEnvironment> = new Map();
     private globalEnv: PythonEnvironment | undefined;
     private skipWatcherRefresh = false;
@@ -286,7 +289,27 @@ export class VenvManager implements EnvironmentManager {
 
     private updateCollection(environment: PythonEnvironment): void {
         const envPath = normalizePath(environment.environmentPath.fsPath);
-        this.collection = this.collection.filter((e) => normalizePath(e.environmentPath.fsPath) !== envPath);
+        const removed: PythonEnvironment[] = [];
+        const kept: PythonEnvironment[] = [];
+        for (const e of this.collection) {
+            if (normalizePath(e.environmentPath.fsPath) === envPath) {
+                removed.push(e);
+            } else {
+                kept.push(e);
+            }
+        }
+        if (removed.length > 0) {
+            this.collection = kept;
+            this.collectionMutationGeneration++;
+            for (const env of removed) {
+                this.directRemovalGenerations.set(env, this.collectionMutationGeneration);
+            }
+        }
+    }
+
+    private wasDirectlyRemovedSince(environment: PythonEnvironment, generation: number): boolean {
+        const removedGeneration = this.directRemovalGenerations.get(environment);
+        return removedGeneration !== undefined && removedGeneration > generation;
     }
 
     private updateFsPathToEnv(environment: PythonEnvironment): Uri[] {
@@ -324,26 +347,131 @@ export class VenvManager implements EnvironmentManager {
                 title,
             },
             async () => {
-                const discard = this.collection.map((env) => ({
-                    kind: EnvironmentChangeKind.remove,
-                    environment: env,
-                }));
+                const run = this.refreshChain.then(
+                    async (): Promise<DidChangeEnvironmentsEventArgs | undefined> => {
+                        const generation = this.collectionMutationGeneration;
+                        let scopeRoot: string | undefined;
+                        if (scope) {
+                            try {
+                                scopeRoot = await findParentIfFile(scope.fsPath);
+                            } catch (err) {
+                                if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+                                    return undefined;
+                                }
+                                throw err;
+                            }
+                        }
+                        const discovered =
+                            (await findVirtualEnvironments(
+                                hardRefresh,
+                                this.nativeFinder,
+                                this.api,
+                                this.log,
+                                this,
+                                scopeRoot !== undefined ? [Uri.file(scopeRoot)] : undefined,
+                            )) ?? [];
+                        if (this.collectionMutationGeneration !== generation) {
+                            return undefined;
+                        }
+                        if (scopeRoot !== undefined) {
+                            return this.mergeScopedEnvironments(scopeRoot, discovered, generation);
+                        }
+                        const previousCollection = this.collection;
+                        this.collection = [...discovered];
+                        const appended = await this.loadEnvMap();
+                        const discard = previousCollection
+                            .filter((env) => !this.wasDirectlyRemovedSince(env, generation))
+                            .map((env) => ({
+                                kind: EnvironmentChangeKind.remove,
+                                environment: env,
+                            }));
+                        const added = [...discovered, ...appended]
+                            .filter((env) => this.collection.includes(env))
+                            .map((env) => ({
+                                environment: env,
+                                kind: EnvironmentChangeKind.add,
+                            }));
+                        const fullChanges = [...discard, ...added];
+                        return fullChanges.length > 0 ? fullChanges : undefined;
+                    },
+                );
+                this.refreshChain = run.then(
+                    () => undefined,
+                    () => undefined,
+                );
+                const changes = await run;
 
-                this.collection =
-                    (await findVirtualEnvironments(
-                        hardRefresh,
-                        this.nativeFinder,
-                        this.api,
-                        this.log,
-                        this,
-                        scope ? [scope] : undefined,
-                    )) ?? [];
-                await this.loadEnvMap();
-
-                const added = this.collection.map((env) => ({ environment: env, kind: EnvironmentChangeKind.add }));
-                this._onDidChangeEnvironments.fire([...discard, ...added]);
+                if (changes !== undefined) {
+                    this._onDidChangeEnvironments.fire(changes);
+                }
             },
         );
+    }
+
+    // A scoped discovery is authoritative only within `scope`: environments in other workspace
+    // folders (and globals outside it) are retained untouched, so they neither disappear nor emit
+    // events; only in-scope environments are replaced by the freshly discovered ones.
+    private async mergeScopedEnvironments(
+        scopeRoot: string,
+        discovered: readonly PythonEnvironment[],
+        generation: number,
+    ): Promise<DidChangeEnvironmentsEventArgs | undefined> {
+        const inScope = (fsPath: string): boolean => isPathInside(scopeRoot, fsPath);
+
+        const retained: PythonEnvironment[] = [];
+        const oldInScope: PythonEnvironment[] = [];
+        const oldByPath = new Map<string, PythonEnvironment>();
+        for (const env of this.collection) {
+            if (inScope(env.environmentPath.fsPath)) {
+                oldInScope.push(env);
+                const key = normalizePath(env.environmentPath.fsPath);
+                if (!oldByPath.has(key)) {
+                    oldByPath.set(key, env);
+                }
+            } else {
+                retained.push(env);
+            }
+        }
+
+        const retainedPaths = new Set(retained.map((env) => normalizePath(env.environmentPath.fsPath)));
+        const discoveredByPath = new Map<string, PythonEnvironment>();
+        for (const env of discovered) {
+            if (!inScope(env.environmentPath.fsPath)) {
+                continue;
+            }
+            const key = normalizePath(env.environmentPath.fsPath);
+            if (retainedPaths.has(key) || discoveredByPath.has(key)) {
+                continue;
+            }
+            discoveredByPath.set(key, env);
+        }
+
+        const finalInScope: PythonEnvironment[] = [];
+        const added: PythonEnvironment[] = [];
+        for (const [key, env] of discoveredByPath) {
+            if (oldByPath.get(key) === env) {
+                finalInScope.push(env);
+            } else {
+                added.push(env);
+                finalInScope.push(env);
+            }
+        }
+
+        this.collection = [...retained, ...finalInScope];
+        const appended = await this.loadEnvMap(inScope);
+
+        const changes: DidChangeEnvironmentsEventArgs = [];
+        for (const env of oldInScope) {
+            if (!this.collection.includes(env) && !this.wasDirectlyRemovedSince(env, generation)) {
+                changes.push({ environment: env, kind: EnvironmentChangeKind.remove });
+            }
+        }
+        for (const env of [...added, ...appended]) {
+            if (this.collection.includes(env)) {
+                changes.push({ environment: env, kind: EnvironmentChangeKind.add });
+            }
+        }
+        return changes.length > 0 ? changes : undefined;
     }
 
     async getEnvironments(scope: GetEnvironmentsScope): Promise<PythonEnvironment[]> {
@@ -507,13 +635,15 @@ export class VenvManager implements EnvironmentManager {
         await clearVenvCache();
     }
 
-    private addEnvironment(environment: PythonEnvironment, raiseEvent?: boolean): void {
+    private addEnvironment(environment: PythonEnvironment, raiseEvent?: boolean): PythonEnvironment | undefined {
         if (this.collection.find((e) => e.envId.id === environment.envId.id)) {
-            return;
+            return undefined;
         }
 
         const oldEnv = this.findEnvironmentByPath(environment.environmentPath.fsPath);
+        let replaced: PythonEnvironment[] = [];
         if (oldEnv) {
+            replaced = this.collection.filter((e) => e.envId.id === oldEnv.envId.id);
             this.collection = this.collection.filter((e) => e.envId.id !== oldEnv.envId.id);
             this.collection.push(environment);
             if (raiseEvent) {
@@ -528,23 +658,38 @@ export class VenvManager implements EnvironmentManager {
                 this._onDidChangeEnvironments.fire([{ environment, kind: EnvironmentChangeKind.add }]);
             }
         }
+        if (raiseEvent) {
+            this.collectionMutationGeneration++;
+            for (const env of replaced) {
+                this.directRemovalGenerations.set(env, this.collectionMutationGeneration);
+            }
+        }
+        return environment;
     }
 
     private async resetGlobalEnv() {
         this.globalEnv = undefined;
         const globals = await this.baseManager.getEnvironments('global');
-        await this.loadGlobalEnv(globals);
+        const added = await this.loadGlobalEnv(globals);
+        if (added) {
+            this._onDidChangeEnvironments.fire([{ environment: added, kind: EnvironmentChangeKind.add }]);
+            this.collectionMutationGeneration++;
+        }
     }
 
     /**
      * Loads and sets the global Python environment from the provided list, resolving if necessary. O(g) where g = globals.length
      */
-    private async loadGlobalEnv(globals: PythonEnvironment[]) {
+    private async loadGlobalEnv(
+        globals: PythonEnvironment[],
+        inScope?: (fsPath: string) => boolean,
+    ): Promise<PythonEnvironment | undefined> {
         this.globalEnv = undefined;
 
         // Try to find a global environment
         const fsPath = await getVenvForGlobal();
 
+        let added: PythonEnvironment | undefined;
         if (fsPath) {
             this.globalEnv = this.findEnvironmentByPath(fsPath) ?? this.findEnvironmentByPath(fsPath, globals);
 
@@ -559,8 +704,8 @@ export class VenvManager implements EnvironmentManager {
                 );
 
                 // If the environment is resolved, add it to the collection
-                if (this.globalEnv) {
-                    this.addEnvironment(this.globalEnv, false);
+                if (this.globalEnv && (!inScope || inScope(this.globalEnv.environmentPath.fsPath))) {
+                    added = this.addEnvironment(this.globalEnv, false);
                 }
             }
         }
@@ -569,14 +714,19 @@ export class VenvManager implements EnvironmentManager {
         if (!this.globalEnv) {
             this.globalEnv = getLatest(globals);
         }
+        return added;
     }
 
     /**
      * Loads and maps Python environments to their corresponding project paths in the workspace. about  O(p × e) where p = projects.len and e = environments.len
      */
-    private async loadEnvMap() {
+    private async loadEnvMap(inScope?: (fsPath: string) => boolean): Promise<PythonEnvironment[]> {
+        const appended: PythonEnvironment[] = [];
         const globals = await this.baseManager.getEnvironments('global');
-        await this.loadGlobalEnv(globals);
+        const globalAdded = await this.loadGlobalEnv(globals, inScope);
+        if (globalAdded) {
+            appended.push(globalAdded);
+        }
 
         this.fsPathToEnv.clear();
 
@@ -593,6 +743,9 @@ export class VenvManager implements EnvironmentManager {
                 let foundEnv = this.findEnvironmentByPath(env, sorted) ?? this.findEnvironmentByPath(env, globals);
                 const previousEnv = this.fsPathToEnv.get(normalizedPath);
                 if (!foundEnv) {
+                    if (inScope && !inScope(env)) {
+                        continue;
+                    }
                     // attempt to resolve
                     const resolved = await resolveVenvPythonEnvironmentPath(
                         env,
@@ -603,11 +756,14 @@ export class VenvManager implements EnvironmentManager {
                     );
                     if (resolved) {
                         // If resolved; add it to the venvManager collection
-                        this.addEnvironment(resolved, false);
+                        const addedEnv = this.addEnvironment(resolved, false);
+                        if (addedEnv) {
+                            appended.push(addedEnv);
+                        }
                         foundEnv = resolved;
                     } else {
                         this.log.error(`Failed to resolve python environment: ${env}`);
-                        return;
+                        return appended;
                     }
                 }
                 // Given found env, add it to the map and fire the event if needed.
@@ -630,6 +786,7 @@ export class VenvManager implements EnvironmentManager {
         }
 
         events.forEach((e) => e());
+        return appended;
     }
 
     /**
