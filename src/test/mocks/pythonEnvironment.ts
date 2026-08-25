@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 
 import { Uri } from 'vscode';
-import { PythonEnvironment } from '../../api';
+import { EnvironmentGroupInfo, PythonCommandRunConfiguration, PythonEnvironment } from '../../api';
 import { PythonEnvironmentImpl } from '../../internal.api';
 
 /**
@@ -25,6 +25,10 @@ export interface MockPythonEnvironmentOptions {
     description?: string;
     /** Optional display name. Defaults to `<name> (<version>)`. */
     displayName?: string;
+    /** Optional group used to exercise reconciliation of consumer-visible metadata. */
+    group?: string | EnvironmentGroupInfo;
+    /** Optional explicit `execInfo.activation` commands. */
+    activation?: PythonCommandRunConfiguration[];
     /** If true, includes an `activation` entry in `execInfo`. */
     hasActivation?: boolean;
 }
@@ -46,6 +50,8 @@ export function createMockPythonEnvironment(options: MockPythonEnvironmentOption
         id = `${name}-test`,
         description,
         displayName = `${name} (${version})`,
+        group,
+        activation,
         hasActivation = false,
     } = options;
 
@@ -57,13 +63,16 @@ export function createMockPythonEnvironment(options: MockPythonEnvironmentOption
             displayPath: envPath,
             version,
             description,
+            group,
             environmentPath: Uri.file(envPath),
             sysPrefix,
             execInfo: {
                 run: { executable: 'python' },
-                ...(hasActivation && {
-                    activation: [{ executable: envPath.replace('python', 'activate') }],
-                }),
+                ...(activation
+                    ? { activation }
+                    : hasActivation
+                      ? { activation: [{ executable: envPath.replace('python', 'activate') }] }
+                      : {}),
             },
         },
     );

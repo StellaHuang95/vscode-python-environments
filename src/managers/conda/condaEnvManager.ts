@@ -7,12 +7,15 @@ import {
     DidChangeEnvironmentEventArgs,
     DidChangeEnvironmentsEventArgs,
     EnvironmentChangeKind,
+    EnvironmentGroupInfo,
     EnvironmentManager,
     GetEnvironmentScope,
     GetEnvironmentsScope,
     IconPath,
+    PythonCommandRunConfiguration,
     PythonEnvironment,
     PythonEnvironmentApi,
+    PythonEnvironmentExecutionInfo,
     PythonProject,
     QuickCreateConfig,
     RefreshEnvironmentsScope,
@@ -95,12 +98,14 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
             return this._initialized.promise;
         }
 
-        this._initialized = createDeferred();
+        const deferred = createDeferred<void>();
+        this._initialized = deferred;
         const stopWatch = new StopWatch();
         let result: 'success' | 'tool_not_found' | 'error' = 'success';
         let envCount = 0;
         let toolSource = 'none';
         let errorType: string | undefined;
+        let discoveryFailed = false;
 
         try {
             // Check if tool is findable before PET refresh (settings/cache/persistent state/PATH only, no PET).
@@ -123,8 +128,13 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                     title: CondaStrings.condaDiscovering,
                 },
                 async () => {
-                    this.collection =
-                        (await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this)) ?? [];
+                    const refreshed = await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this);
+                    if (refreshed === undefined) {
+                        discoveryFailed = true;
+                        await this.loadEnvMapPreservingCollection();
+                        return;
+                    }
+                    this.collection = refreshed;
                     await this.loadEnvMap();
 
                     this._onDidChangeEnvironments.fire(
@@ -173,7 +183,10 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 toolSource,
                 errorType,
             });
-            this._initialized.resolve();
+            deferred.resolve();
+            if (discoveryFailed && this._initialized === deferred) {
+                this._initialized = undefined;
+            }
         }
     }
 
@@ -314,14 +327,37 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 },
                 async () => {
                     this.log.info('Refreshing Conda Environments');
+                    const refreshed = await refreshCondaEnvs(true, this.nativeFinder, this.api, this.log, this);
+                    if (refreshed === undefined) {
+                        await this.loadEnvMapPreservingCollection();
+                        return;
+                    }
                     const discard = this.collection.map((c) => c);
-                    this.collection = (await refreshCondaEnvs(true, this.nativeFinder, this.api, this.log, this)) ?? [];
+                    const discovered = refreshed.map((c) => c);
+                    this.collection = refreshed;
+                    const appended = await this.loadEnvMap();
 
-                    await this.loadEnvMap();
+                    const resolvedEnvs = [...discovered, ...appended];
+                    const resolvedByPath = new Map(
+                        resolvedEnvs.map((env) => [normalizePath(env.environmentPath.fsPath), env] as const),
+                    );
+                    const discardedByPath = new Map(
+                        discard.map((env) => [normalizePath(env.environmentPath.fsPath), env] as const),
+                    );
 
                     const args = [
-                        ...discard.map((env) => ({ kind: EnvironmentChangeKind.remove, environment: env })),
-                        ...this.collection.map((env) => ({ kind: EnvironmentChangeKind.add, environment: env })),
+                        ...discard
+                            .filter((env) => {
+                                const current = resolvedByPath.get(normalizePath(env.environmentPath.fsPath));
+                                return !current || !isEquivalentEnvironment(env, current);
+                            })
+                            .map((env) => ({ kind: EnvironmentChangeKind.remove, environment: env })),
+                        ...resolvedEnvs
+                            .filter((env) => {
+                                const previous = discardedByPath.get(normalizePath(env.environmentPath.fsPath));
+                                return !previous || !isEquivalentEnvironment(previous, env);
+                            })
+                            .map((env) => ({ kind: EnvironmentChangeKind.add, environment: env })),
                     ];
 
                     this._onDidChangeEnvironments.fire(args);
@@ -342,15 +378,21 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
             resolve: (p) => resolveCondaPath(p, this.nativeFinder, this.api, this.log, this),
             startBackgroundInit: () =>
                 withProgress({ location: ProgressLocation.Window, title: CondaStrings.condaDiscovering }, async () => {
-                    this.collection =
-                        (await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this)) ?? [];
-                    await this.loadEnvMap();
-                    this._onDidChangeEnvironments.fire(
-                        this.collection.map((e) => ({
-                            environment: e,
-                            kind: EnvironmentChangeKind.add,
-                        })),
-                    );
+                    const refreshed = await refreshCondaEnvs(false, this.nativeFinder, this.api, this.log, this);
+                    if (refreshed === undefined) {
+                        await this.loadEnvMapPreservingCollection();
+                        throw new Error('Conda background discovery failed');
+                    }
+                    this.collection = refreshed;
+                    const refreshedAdds = refreshed.map((environment) => ({
+                        environment,
+                        kind: EnvironmentChangeKind.add,
+                    }));
+                    const appended = await this.loadEnvMap();
+                    this._onDidChangeEnvironments.fire([
+                        ...refreshedAdds,
+                        ...appended.map((environment) => ({ environment, kind: EnvironmentChangeKind.add })),
+                    ]);
                 }),
         });
         if (fastResult) {
@@ -486,7 +528,18 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
         await clearCondaCache();
     }
 
-    private async loadEnvMap() {
+    private async loadEnvMapPreservingCollection(): Promise<void> {
+        const added = await this.loadEnvMap();
+        const present = added.filter((environment) => this.collection.includes(environment));
+        if (present.length > 0) {
+            this._onDidChangeEnvironments.fire(
+                present.map((environment) => ({ kind: EnvironmentChangeKind.add, environment })),
+            );
+        }
+    }
+
+    private async loadEnvMap(): Promise<PythonEnvironment[]> {
+        const appended: PythonEnvironment[] = [];
         this.globalEnv = undefined;
         this.fsPathToEnv.clear();
 
@@ -498,11 +551,18 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
 
             // If the environment is not found, resolve the fsPath. Could be portable conda.
             if (!this.globalEnv) {
-                this.globalEnv = await resolveCondaPath(fsPath, this.nativeFinder, this.api, this.log, this);
+                const resolved = await resolveCondaPath(fsPath, this.nativeFinder, this.api, this.log, this);
 
                 // If the environment is resolved, add it to the collection
-                if (this.globalEnv) {
-                    this.collection.push(this.globalEnv);
+                if (resolved) {
+                    const existing = this.findByExactPath(resolved.environmentPath.fsPath);
+                    if (existing) {
+                        this.globalEnv = existing;
+                    } else {
+                        this.globalEnv = resolved;
+                        this.collection.push(resolved);
+                        appended.push(resolved);
+                    }
                 }
             }
         }
@@ -544,8 +604,14 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
 
                     if (resolved) {
                         // If resolved add it to the collection
-                        this.fsPathToEnv.set(normalizedPath, resolved);
-                        this.collection.push(resolved);
+                        const existing = this.findByExactPath(resolved.environmentPath.fsPath);
+                        if (existing) {
+                            this.fsPathToEnv.set(normalizedPath, existing);
+                        } else {
+                            this.fsPathToEnv.set(normalizedPath, resolved);
+                            this.collection.push(resolved);
+                            appended.push(resolved);
+                        }
                     } else {
                         this.log.error(`Failed to resolve conda environment: ${env}`);
                     }
@@ -568,6 +634,7 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
                 }
             }
         }
+        return appended;
     }
 
     private fromEnvMap(uri: Uri): PythonEnvironment | undefined {
@@ -612,9 +679,180 @@ export class CondaEnvManager implements EnvironmentManager, Disposable {
         });
     }
 
+    private findByExactPath(fsPath: string): PythonEnvironment | undefined {
+        const normalized = normalizePath(fsPath);
+        return this.collection.find((e) => normalizePath(e.environmentPath.fsPath) === normalized);
+    }
+
     private findEnvironmentByName(name: string): PythonEnvironment | undefined {
         return this.collection.find((e) => {
             return e.name === name;
         });
     }
+}
+
+function isEquivalentEnvironment(a: PythonEnvironment, b: PythonEnvironment): boolean {
+    return (
+        a.envId.managerId === b.envId.managerId &&
+        a.name === b.name &&
+        a.displayName === b.displayName &&
+        a.shortDisplayName === b.shortDisplayName &&
+        a.displayPath === b.displayPath &&
+        a.version === b.version &&
+        a.description === b.description &&
+        a.sysPrefix === b.sysPrefix &&
+        a.error === b.error &&
+        isSameMarkdownLike(a.tooltip, b.tooltip) &&
+        isSameIconPath(a.iconPath, b.iconPath) &&
+        isSameGroup(a.group, b.group) &&
+        isSameExecInfo(a.execInfo, b.execInfo)
+    );
+}
+
+function isSameExecInfo(a: PythonEnvironmentExecutionInfo, b: PythonEnvironmentExecutionInfo): boolean {
+    return (
+        isSameRunConfig(a.run, b.run) &&
+        isSameRunConfig(a.activatedRun, b.activatedRun) &&
+        isSameRunConfigArray(a.activation, b.activation) &&
+        isSameRunConfigArray(a.deactivation, b.deactivation) &&
+        isSameShellMap(a.shellActivation, b.shellActivation) &&
+        isSameShellMap(a.shellDeactivation, b.shellDeactivation)
+    );
+}
+
+function isSameShellMap(
+    a: Map<string, PythonCommandRunConfiguration[]> | undefined,
+    b: Map<string, PythonCommandRunConfiguration[]> | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined || a.size !== b.size) {
+        return false;
+    }
+    for (const [key, value] of a) {
+        const other = b.get(key);
+        if (other === undefined || !isSameRunConfigArray(value, other)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function isSameRunConfigArray(
+    a: PythonCommandRunConfiguration[] | undefined,
+    b: PythonCommandRunConfiguration[] | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined || a.length !== b.length) {
+        return false;
+    }
+    return a.every((value, index) => isSameRunConfig(value, b[index]));
+}
+
+function isSameRunConfig(
+    a: PythonCommandRunConfiguration | undefined,
+    b: PythonCommandRunConfiguration | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+    return a.executable === b.executable && isSameStringArray(a.args, b.args);
+}
+
+function isSameStringArray(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined || a.length !== b.length) {
+        return false;
+    }
+    return a.every((value, index) => value === b[index]);
+}
+
+function isSameGroup(
+    a: string | EnvironmentGroupInfo | undefined,
+    b: string | EnvironmentGroupInfo | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+    if (typeof a === 'string' || typeof b === 'string') {
+        return a === b;
+    }
+    return (
+        a.name === b.name &&
+        a.description === b.description &&
+        isSameMarkdownLike(a.tooltip, b.tooltip) &&
+        isSameIconPath(a.iconPath, b.iconPath)
+    );
+}
+
+function isSameIconPath(a: IconPath | undefined, b: IconPath | undefined): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+    if ('id' in a || 'id' in b) {
+        return 'id' in a && 'id' in b && a.id === b.id;
+    }
+    if ('light' in a || 'light' in b) {
+        return 'light' in a && 'light' in b && isSameUri(a.light, b.light) && isSameUri(a.dark, b.dark);
+    }
+    return isSameUri(a, b);
+}
+
+function isSameMarkdownLike(
+    a: string | MarkdownString | undefined,
+    b: string | MarkdownString | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+    if (typeof a === 'string' || typeof b === 'string') {
+        return a === b;
+    }
+    return (
+        a.value === b.value &&
+        a.supportThemeIcons === b.supportThemeIcons &&
+        a.supportHtml === b.supportHtml &&
+        isSameTrusted(a.isTrusted, b.isTrusted) &&
+        isSameUri(a.baseUri, b.baseUri)
+    );
+}
+
+function isSameTrusted(
+    a: boolean | { readonly enabledCommands: readonly string[] } | undefined,
+    b: boolean | { readonly enabledCommands: readonly string[] } | undefined,
+): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined || typeof a === 'boolean' || typeof b === 'boolean') {
+        return a === b;
+    }
+    return isSameStringArray(a.enabledCommands, b.enabledCommands);
+}
+
+function isSameUri(a: Uri | undefined, b: Uri | undefined): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+    return a.toString() === b.toString();
 }
