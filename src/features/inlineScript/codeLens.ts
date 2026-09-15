@@ -13,6 +13,7 @@ import {
     TextDocument,
 } from 'vscode';
 import { InlineScriptRoutingRegistry } from '../../common/inlineScript/routingRegistry';
+import { InlineScriptSetupTrigger } from '../../common/telemetry/constants';
 
 /**
  * Shows a single "Set up environment for this script" CodeLens above a `.py` file's PEP 723
@@ -67,11 +68,12 @@ export class InlineScriptCodeLensProvider implements CodeLensProvider, Disposabl
         const offset = metadata.sourceRange?.start ?? metadata.range.start;
         const position = document.positionAt(offset);
         const range = new Range(position, position);
+        const trigger: InlineScriptSetupTrigger = 'codelens';
         return [
             new CodeLens(range, {
                 title: l10n.t('Set up environment for this script'),
                 command: this.setupCommand,
-                arguments: [uri],
+                arguments: [uri, trigger],
             }),
         ];
     }

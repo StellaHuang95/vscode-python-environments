@@ -253,7 +253,28 @@ export enum EventNames {
      * - duration: number (ms between the detection and the first edit)
      */
     INLINE_SCRIPT_EDITED = 'inlineScript.edited',
+    /**
+     * Telemetry event fired once per user-initiated inline-script environment
+     * setup, recording which surface started it. This is the adoption measure
+     * for the unresolved-import quick fix: the CodeLens is hidden while a
+     * document is dirty, so `codeaction` counts setups that the CodeLens alone
+     * could not have produced.
+     * Properties:
+     * - trigger: 'codelens' | 'codeaction' | 'bulk' (which surface invoked setup)
+     * - outcome: 'created' | 'notCreated' | 'error'
+     *
+     * `notCreated` covers every benign or reported non-creation (cancelled,
+     * skipped, no compatible Python, ...); the failure taxonomy itself already
+     * ships on `inlineScript.envError` and is not duplicated here.
+     */
+    INLINE_SCRIPT_SETUP_INVOKED = 'inlineScript.setupInvoked',
 }
+
+/** Surface that started an inline-script environment setup. */
+export type InlineScriptSetupTrigger = 'codelens' | 'codeaction' | 'bulk';
+
+/** Result of one inline-script environment setup attempt, as seen by the invoking surface. */
+export type InlineScriptSetupOutcomeKind = 'created' | 'notCreated' | 'error';
 
 export type InlineScriptEnvErrorCategory =
     | 'compatible-python-declined'
@@ -778,4 +799,15 @@ export interface IEventNamePropertyMapping {
         }
     */
     [EventNames.INLINE_SCRIPT_EDITED]: never | undefined;
+
+    /* __GDPR__
+        "inlineScript.setupInvoked": {
+            "trigger": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "owner": "StellaHuang95" },
+            "outcome": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "owner": "StellaHuang95" }
+        }
+    */
+    [EventNames.INLINE_SCRIPT_SETUP_INVOKED]: {
+        trigger: InlineScriptSetupTrigger;
+        outcome: InlineScriptSetupOutcomeKind;
+    };
 }

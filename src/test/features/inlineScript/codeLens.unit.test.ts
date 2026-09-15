@@ -52,7 +52,7 @@ suite('Inline script CodeLens provider', () => {
 
         assert.strictEqual(lenses.length, 1);
         assert.strictEqual(lenses[0].command?.command, SETUP_COMMAND);
-        assert.deepStrictEqual(lenses[0].command?.arguments, [scriptUri]);
+        assert.deepStrictEqual(lenses[0].command?.arguments, [scriptUri, 'codelens']);
     });
 
     test('shows no CodeLens while the document has unsaved changes', () => {

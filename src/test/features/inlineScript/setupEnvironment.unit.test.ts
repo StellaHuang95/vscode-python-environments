@@ -10,13 +10,17 @@ import { INLINE_SCRIPT_MANAGER_ID } from '../../../common/constants';
 import { InlineScriptMetadata } from '../../../common/inlineScript/metadata';
 import * as metadataApi from '../../../common/inlineScript/metadata';
 import { InlineScriptRoutingRegistry } from '../../../common/inlineScript/routingRegistry';
+import { EventNames } from '../../../common/telemetry/constants';
+import * as telemetrySender from '../../../common/telemetry/sender';
 import * as winapi from '../../../common/window.apis';
 import * as wapi from '../../../common/workspace.apis';
 import {
     notifyInlineScriptSetupOutcome,
     setUpInlineScriptEnvironment,
     setUpInlineScriptEnvironmentsInWorkspace,
+    setupInlineScriptEnvironmentHandler,
 } from '../../../features/inlineScript/setupEnvironment';
+import * as extensionVersionCheck from '../../../features/inlineScript/extensionVersionCheck';
 import { EnvironmentManagers, InternalEnvironmentManager } from '../../../internal.api';
 
 function makeEnv(): PythonEnvironment {
@@ -310,6 +314,176 @@ suite('notifyInlineScriptSetupOutcome', () => {
         notifyInlineScriptSetupOutcome(scriptUri, routing);
 
         sinon.assert.calledTwice(infoStub);
+        sinon.assert.notCalled(errorStub);
+    });
+});
+
+suite('setupInlineScriptEnvironmentHandler', () => {
+    const scriptUri = Uri.file('/workspace/app.py');
+    let em: typemoq.IMock<EnvironmentManagers>;
+    let manager: typemoq.IMock<InternalEnvironmentManager>;
+    let routing: InlineScriptRoutingRegistry;
+    let readMetadataStub: sinon.SinonStub;
+    let openDocumentsStub: sinon.SinonStub;
+    let sendTelemetryStub: sinon.SinonStub;
+    let errorStub: sinon.SinonStub;
+    let saveStub: sinon.SinonStub;
+    let promptStub: sinon.SinonStub;
+
+    setup(() => {
+        em = typemoq.Mock.ofType<EnvironmentManagers>();
+        manager = typemoq.Mock.ofType<InternalEnvironmentManager>();
+        routing = new InlineScriptRoutingRegistry();
+        em.setup((m) => m.getEnvironmentManager(INLINE_SCRIPT_MANAGER_ID)).returns(() => manager.object);
+        readMetadataStub = sinon.stub(metadataApi, 'readInlineScriptMetadataFromFile').resolves(undefined);
+        openDocumentsStub = sinon.stub(wapi, 'getOpenTextDocuments').returns([]);
+        sendTelemetryStub = sinon.stub(telemetrySender, 'sendTelemetryEvent');
+        errorStub = sinon.stub(winapi, 'showErrorMessage').resolves(undefined);
+        sinon.stub(winapi, 'showInformationMessage').resolves(undefined);
+        sinon.stub(winapi, 'showWarningMessage').resolves(undefined);
+        promptStub = sinon.stub(extensionVersionCheck, 'promptUpdateExtensionsForInlineScripts').resolves();
+        saveStub = sinon.stub().resolves(true);
+    });
+
+    teardown(() => {
+        routing.dispose();
+        sinon.restore();
+    });
+
+    function openDirtyDocument(isDirty = true): void {
+        openDocumentsStub.returns([{ uri: scriptUri, isDirty, save: saveStub }]);
+    }
+
+    function setupInvokedCalls(): sinon.SinonSpyCall[] {
+        return sendTelemetryStub
+            .getCalls()
+            .filter((call) => call.args[0] === EventNames.INLINE_SCRIPT_SETUP_INVOKED);
+    }
+
+    function expectEnvironmentCreated(): PythonEnvironment {
+        const env = makeEnv();
+        manager.setup((m) => m.create(scriptUri, undefined)).returns(() => Promise.resolve(env));
+        em.setup((m) => m.setEnvironment(scriptUri, env)).returns(() => Promise.resolve());
+        return env;
+    }
+
+    test('saves a dirty document before setup, because setup reads the block from disk', async () => {
+        openDirtyDocument();
+        expectEnvironmentCreated();
+
+        await setupInlineScriptEnvironmentHandler(em.object, routing)(scriptUri, 'codeaction');
+
+        sinon.assert.calledOnce(saveStub);
+        em.verify((m) => m.setEnvironment(scriptUri, typemoq.It.isAny()), typemoq.Times.once());
+    });
+
+    test('seeds routing metadata from the saved file so setup does not misread it as a mid-setup edit', async () => {
+        // The detector's own save handler runs asynchronously relative to `save()`. Without this
+        // seeding, a block the user just typed goes `undefined` -> identity while `create` runs,
+        // which `setUpInlineScriptEnvironment` treats as a concurrent edit and silently skips.
+        openDirtyDocument();
+        const metadata = makeMetadata(['requests']);
+        readMetadataStub.resolves(metadata);
+        const env = makeEnv();
+        manager
+            .setup((m) => m.create(scriptUri, undefined))
+            .returns(async () => {
+                // The detector catches up mid-setup and republishes the same saved metadata.
+                routing.setMetadata(scriptUri, makeMetadata(['requests']));
+                return env;
+            });
+        em.setup((m) => m.setEnvironment(scriptUri, env)).returns(() => Promise.resolve());
+
+        await setupInlineScriptEnvironmentHandler(em.object, routing)(scriptUri, 'codeaction');
+
+        assert.deepStrictEqual(routing.getMetadata(scriptUri), metadata);
+        em.verify((m) => m.setEnvironment(scriptUri, env), typemoq.Times.once());
+    });
+
+    test('does not save a document that has no unsaved changes', async () => {
+        openDirtyDocument(false);
+        expectEnvironmentCreated();
+
+        await setupInlineScriptEnvironmentHandler(em.object, routing)(scriptUri, 'codelens');
+
+        sinon.assert.notCalled(saveStub);
+    });
+
+    test('does not run setup when the document could not be saved', async () => {
+        openDirtyDocument();
+        saveStub.resolves(false);
+
+        await setupInlineScriptEnvironmentHandler(em.object, routing)(scriptUri, 'codeaction');
+
+        em.verify((m) => m.setEnvironment(typemoq.It.isAny(), typemoq.It.isAny()), typemoq.Times.never());
+        sinon.assert.calledOnce(errorStub);
+        assert.deepStrictEqual(setupInvokedCalls()[0].args[2], { trigger: 'codeaction', outcome: 'error' });
+    });
+
+    test('records the invoking surface and a created outcome', async () => {
+        expectEnvironmentCreated();
+
+        await setupInlineScriptEnvironmentHandler(em.object, routing)(scriptUri, 'codeaction');
+
+        assert.strictEqual(setupInvokedCalls().length, 1);
+        assert.deepStrictEqual(setupInvokedCalls()[0].args[2], { trigger: 'codeaction', outcome: 'created' });
+    });
+
+    test('records the CodeLens surface separately', async () => {
+        expectEnvironmentCreated();
+
+        await setupInlineScriptEnvironmentHandler(em.object, routing)(scriptUri, 'codelens');
+
+        assert.deepStrictEqual(setupInvokedCalls()[0].args[2], { trigger: 'codelens', outcome: 'created' });
+    });
+
+    test('records a notCreated outcome when setup produces no environment', async () => {
+        manager.setup((m) => m.create(scriptUri, undefined)).returns(() => Promise.resolve(undefined));
+
+        await setupInlineScriptEnvironmentHandler(em.object, routing)(scriptUri, 'codeaction');
+
+        assert.deepStrictEqual(setupInvokedCalls()[0].args[2], { trigger: 'codeaction', outcome: 'notCreated' });
+    });
+
+    test('records an error outcome when setup throws', async () => {
+        manager.setup((m) => m.create(scriptUri, undefined)).returns(() => Promise.reject(new Error('boom')));
+
+        await setupInlineScriptEnvironmentHandler(em.object, routing)(scriptUri, 'codeaction');
+
+        assert.deepStrictEqual(setupInvokedCalls()[0].args[2], { trigger: 'codeaction', outcome: 'error' });
+        sinon.assert.calledOnce(errorStub);
+    });
+
+    test('coerces an unknown trigger so the telemetry property stays low-cardinality', async () => {
+        expectEnvironmentCreated();
+
+        await setupInlineScriptEnvironmentHandler(em.object, routing)(
+            scriptUri,
+            'something-else' as never,
+        );
+
+        assert.deepStrictEqual(setupInvokedCalls()[0].args[2], { trigger: 'codelens', outcome: 'created' });
+    });
+
+    test('emits exactly one setup event per invocation', async () => {
+        expectEnvironmentCreated();
+
+        await setupInlineScriptEnvironmentHandler(em.object, routing)(scriptUri, 'codeaction');
+
+        assert.strictEqual(setupInvokedCalls().length, 1);
+    });
+
+    test('does not report a failing companion-extension prompt as a setup failure', async () => {
+        // The environment is already set up by then, so a failure in the follow-up version check
+        // must not surface an error or count as a second attempt.
+        expectEnvironmentCreated();
+        promptStub.rejects(new Error('boom'));
+
+        await setupInlineScriptEnvironmentHandler(em.object, routing)(scriptUri, 'codeaction');
+
+        assert.deepStrictEqual(setupInvokedCalls().map((call) => call.args[2]), [
+            { trigger: 'codeaction', outcome: 'created' },
+        ]);
         sinon.assert.notCalled(errorStub);
     });
 });

@@ -26,6 +26,19 @@ export namespace WorkbenchStrings {
 export namespace InlineScriptStrings {
     export const updateExtension = l10n.t('Update Extension');
 
+    /**
+     * Quick fix title offered on an unresolved import in a PEP 723 script.
+     *
+     * Deliberately describes what the action *does* (set the environment up) rather than promising
+     * to fix the import: setup installs the block's declared `dependencies` verbatim, which may not
+     * include the module that is actually unresolved.
+     */
+    export const setUpScriptEnvironment = l10n.t("Set up this script's Python environment");
+
+    export const saveFailedBeforeSetup = l10n.t(
+        'Could not save this script, so its environment was not set up. Save the file and try again.',
+    );
+
     export const updatePythonExtension = l10n.t(
         'The environment for this script was created. Update the Python extension for the full inline script experience.',
     );
