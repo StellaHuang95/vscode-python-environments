@@ -28,6 +28,18 @@ export function isTimeoutErrorType(errorType: DiscoveryErrorType): boolean {
 }
 
 /**
+ * True when `ex` is a lost PET JSON-RPC connection — an {@link rpc.ConnectionError} or a
+ * {@link rpc.ResponseError} with {@link rpc.ErrorCodes.PendingResponseRejected}. Pure classifier:
+ * it cannot tell an intentional disposal from a crash, so callers must gate on lifecycle state.
+ */
+export function isPetConnectionLostError(ex: unknown): boolean {
+    return (
+        ex instanceof rpc.ConnectionError ||
+        (ex instanceof rpc.ResponseError && ex.code === rpc.ErrorCodes.PendingResponseRejected)
+    );
+}
+
+/**
  * Classifies an error into a telemetry-safe category for the `errorType` property.
  * Does NOT include raw error messages — only the category.
  */
@@ -49,8 +61,7 @@ export function classifyError(ex: unknown): DiscoveryErrorType {
         }
     }
 
-    // JSON-RPC connection errors (e.g., PET process died mid-request, connection closed/disposed)
-    if (ex instanceof rpc.ConnectionError) {
+    if (isPetConnectionLostError(ex)) {
         return 'connection_error';
     }
 
