@@ -255,6 +255,63 @@ suite('CondaEnvManager.initialize - lazy registration flow', () => {
         assert.strictEqual(refreshCondaEnvsStub.callCount, 1);
     });
 
+    test('error path is retryable: a failed run clears state so a later call retries and succeeds', async () => {
+        getCondaStub.resolves('/usr/bin/conda');
+        constructSourcingStub.resolves({ toString: () => '' } as any);
+        refreshCondaEnvsStub.onFirstCall().rejects(new Error('boom'));
+        refreshCondaEnvsStub
+            .onSecondCall()
+            .resolves([makeEnv('base', Uri.file('/opt/miniconda3').fsPath, '3.11.0')]);
+
+        const mgr = createManager();
+
+        await assert.doesNotReject(mgr.initialize(), 'initialize() must never throw to its caller');
+        assert.strictEqual(refreshCondaEnvsStub.callCount, 1);
+
+        await mgr.initialize();
+        assert.strictEqual(refreshCondaEnvsStub.callCount, 2, 'a later call must retry after a failed run');
+
+        const lazyInitCalls = sendTelemetryStub.getCalls().filter((c) => c.args[0] === EventNames.MANAGER_LAZY_INIT);
+        assert.strictEqual(lazyInitCalls.length, 2);
+        assert.strictEqual(lazyInitCalls[0].args[2].result, 'error');
+        assert.strictEqual(lazyInitCalls[1].args[2].result, 'success');
+
+        await mgr.initialize();
+        assert.strictEqual(refreshCondaEnvsStub.callCount, 2, 'no re-discovery after a successful init');
+    });
+
+    test('error path settles concurrent waiters without rejecting, then permits a retry', async () => {
+        getCondaStub.resolves('/usr/bin/conda');
+        constructSourcingStub.resolves({ toString: () => '' } as any);
+        refreshCondaEnvsStub.onFirstCall().rejects(new Error('boom'));
+        refreshCondaEnvsStub.onSecondCall().resolves([]);
+
+        const mgr = createManager();
+
+        const results = await Promise.allSettled([mgr.initialize(), mgr.initialize(), mgr.initialize()]);
+        assert.ok(
+            results.every((r) => r.status === 'fulfilled'),
+            'all concurrent waiters must settle without rejecting',
+        );
+        assert.strictEqual(refreshCondaEnvsStub.callCount, 1, 'concurrent callers share one discovery run');
+
+        await mgr.initialize();
+        assert.strictEqual(refreshCondaEnvsStub.callCount, 2, 'a fresh call retries after failure');
+    });
+
+    test('tool_not_found is treated as completed init and is not retried', async () => {
+        getCondaStub.rejects(new Error('Conda not found'));
+
+        const mgr = createManager();
+        await mgr.initialize();
+        await mgr.initialize();
+
+        assert.strictEqual(refreshCondaEnvsStub.callCount, 1, 'tool_not_found must not cause repeated discovery');
+        const lazyInitCalls = sendTelemetryStub.getCalls().filter((c) => c.args[0] === EventNames.MANAGER_LAZY_INIT);
+        assert.strictEqual(lazyInitCalls.length, 1);
+        assert.strictEqual(lazyInitCalls[0].args[2].result, 'tool_not_found');
+    });
+
     test('no PET refresh is triggered before initialize(): construction alone does no work', () => {
         // Simply constructing the manager must not call into discovery.
         createManager();

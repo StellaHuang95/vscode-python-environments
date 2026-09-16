@@ -81,7 +81,8 @@ export class PyEnvManager implements EnvironmentManager, Disposable {
         if (this._initialized) {
             return this._initialized.promise;
         }
-        this._initialized = createDeferred();
+        const initialized = createDeferred<void>();
+        this._initialized = initialized;
         const stopWatch = new StopWatch();
         let result: 'success' | 'tool_not_found' | 'error' = 'success';
         let envCount = 0;
@@ -128,6 +129,9 @@ export class PyEnvManager implements EnvironmentManager, Disposable {
             result = 'error';
             errorType = classifyError(ex);
             traceError('Pyenv lazy initialization failed', ex);
+            if (this._initialized === initialized) {
+                this._initialized = undefined;
+            }
         } finally {
             sendTelemetryEvent(EventNames.MANAGER_LAZY_INIT, stopWatch.elapsedTime, {
                 managerName: 'pyenv',
@@ -136,7 +140,7 @@ export class PyEnvManager implements EnvironmentManager, Disposable {
                 toolSource,
                 errorType,
             });
-            this._initialized.resolve();
+            initialized.resolve();
         }
     }
 
