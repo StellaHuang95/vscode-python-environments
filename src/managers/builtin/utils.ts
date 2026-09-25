@@ -66,7 +66,8 @@ function getKindName(kind: NativePythonEnvironmentKind | undefined): string | un
     }
 }
 
-function getPythonInfo(env: NativeEnvInfo): PythonEnvironmentInfo {
+/** Create the ordinary System-manager presentation and execution contract from resolved runtime metadata. */
+export function getSystemPythonInfo(env: NativeEnvInfo): PythonEnvironmentInfo {
     if (env.executable && env.version && env.prefix) {
         const kindName = getKindName(env.kind);
         const sv = shortenVersionString(env.version);
@@ -162,7 +163,7 @@ export async function refreshPythons(
     );
     envs.forEach((env) => {
         try {
-            const envInfo = getPythonInfo(env);
+            const envInfo = getSystemPythonInfo(env);
             const python = api.createPythonEnvironmentItem(envInfo, manager);
             collection.push(python);
         } catch (e) {
@@ -222,7 +223,7 @@ export async function resolveSystemPythonEnvironmentPath(
 
         // This is supposed to handle a python interpreter as long as we know some basic things about it
         if (resolved.executable && resolved.version && resolved.prefix) {
-            const envInfo = getPythonInfo(resolved);
+            const envInfo = getSystemPythonInfo(resolved);
             return api.createPythonEnvironmentItem(envInfo, manager);
         }
     } catch (ex) {

@@ -72,6 +72,7 @@ import { latchInlineScriptFeatureActivation } from './features/inlineScript/acti
 import { registerInlineScriptDiagnostics } from './features/inlineScript/diagnostics';
 import { InlineScriptLazyDetector } from './features/inlineScript/lazyDetector';
 import { registerInlineScriptUx } from './features/inlineScript/setupEnvironment';
+import { registerInstallerTestCommands } from './features/installerTestCommands';
 import {
     applyInitialEnvironmentSelection,
     registerInterpreterSettingsChangeListener,
@@ -262,6 +263,7 @@ export async function activate(context: ExtensionContext): Promise<PythonEnviron
     context.subscriptions.push(terminalEnvVarInjector);
 
     context.subscriptions.push(
+        ...await registerInstallerTestCommands(context, outputChannel),
         shellStartupVarsMgr,
         registerCompletionProvider(envManagers),
         commands.registerCommand('python-envs.terminal.revertStartupScriptChanges', async () => {

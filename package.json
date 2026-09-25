@@ -728,6 +728,7 @@
         "unittest": "mocha --config=./build/.mocha.unittests.json",
         "smoke-test": "vscode-test --label smokeTests",
         "e2e-test": "vscode-test --label e2eTests --install-extensions ms-python.python",
+        "installer-e2e-test": "node ./build/run_installer_e2e.mjs",
         "integration-test": "vscode-test --label integrationTests --install-extensions ms-python.python",
         "integration-test-multiroot": "vscode-test --label integrationTestsMultiRoot --install-extensions ms-python.python",
         "vsce-package": "vsce package -o ms-python-envs-insiders.vsix"
