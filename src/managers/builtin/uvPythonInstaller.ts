@@ -48,7 +48,7 @@ export type PromptInstallPythonViaUvResult =
     | { readonly kind: 'declined' }
     | { readonly kind: 'failed' };
 
-function sanitizePromptDetail(value: string | undefined): string | undefined {
+export function sanitizePromptDetail(value: string | undefined): string | undefined {
     const normalized = value?.replace(PROMPT_CONTROL_CHARACTERS, ' ').replace(/\s+/g, ' ').trim();
     if (!normalized) {
         return undefined;
@@ -79,6 +79,13 @@ export interface UvPythonVersion {
 
 export interface GetAvailablePythonVersionsOptions {
     readonly allVersions?: boolean;
+}
+
+/** Optional suppression of external registrations for explicitly isolated runtime installations. */
+export interface UvPythonInstallationOptions {
+    readonly installExecutables?: boolean;
+    readonly registerInstallation?: boolean;
+    readonly installDirectory?: string;
 }
 
 /**
@@ -233,18 +240,43 @@ export async function ensureUvForInlineScriptVersionLookup(
     return (await ensureUvForInlineScriptVersionLookupDetailed(requiresPython, log)) === 'available';
 }
 
+/** Acquire uv for an explicitly requested global version picker, without implying a script requirement. */
+export async function ensureUvForPythonVersionLookup(log?: LogOutputChannel): Promise<EnsureUvForInlineScriptVersionLookupResult> {
+    if (await isUvInstalled(log)) {
+        return 'available';
+    }
+    const selection = await showInformationMessage(
+        UvInstallStrings.installUvForVersionLookup,
+        { modal: true },
+        UvInstallStrings.installUv,
+    );
+    if (selection !== UvInstallStrings.installUv) {
+        return 'declined';
+    }
+    if (!(await installUv(log))) {
+        return 'failed';
+    }
+    if (await isUvInstalled(log)) {
+        return 'available';
+    }
+    showErrorMessage(UvInstallStrings.uvInstallRestartRequired);
+    return 'failed';
+}
+
 /**
  * Gets the path to the uv-managed Python installation.
  * Uses `uv python list --only-installed --managed-python` to find only uv-installed Pythons.
  * @param version Optional Python version to find (e.g., "3.12"). If not specified, returns the latest.
  * @returns Promise that resolves to the Python path, or undefined if not found
  */
-export async function getUvPythonPath(version?: string): Promise<string | undefined> {
+export async function getUvPythonPath(version?: string, installDirectory?: string): Promise<string | undefined> {
     return new Promise((resolve) => {
         const chunks: string[] = [];
         // Use --only-installed --managed-python to find only uv-managed Pythons
         const args = ['python', 'list', '--only-installed', '--managed-python', '--output-format', 'json'];
-        const proc = spawnProcess('uv', args);
+        const proc = installDirectory
+            ? spawnProcess('uv', args, { env: { UV_PYTHON_INSTALL_DIR: installDirectory } })
+            : spawnProcess('uv', args);
         proc.stdout?.on('data', (data) => chunks.push(data.toString()));
         proc.on('error', () => resolve(undefined));
         proc.on('exit', (code) => {
@@ -388,8 +420,21 @@ export async function selectPythonVersionToInstall(): Promise<string | undefined
  * @param version Optional Python version to install (e.g., "3.12"). If not specified, installs the latest.
  * @returns Promise that resolves to true if Python was installed successfully
  */
-export async function installPythonViaUv(_log?: LogOutputChannel, version?: string): Promise<boolean> {
+export async function installPythonViaUv(
+    _log?: LogOutputChannel,
+    version?: string,
+    options: UvPythonInstallationOptions = {},
+): Promise<boolean> {
     const args = ['python', 'install'];
+    if (options.installDirectory) {
+        args.push('--install-dir', options.installDirectory);
+    }
+    if (options.installExecutables === false) {
+        args.push('--no-bin');
+    }
+    if (options.registerInstallation === false) {
+        args.push('--no-registry');
+    }
     if (version) {
         args.push(version);
     }
@@ -497,7 +542,11 @@ export async function promptInstallPythonViaUv(
  * @param version Optional Python version to install (e.g., "3.12")
  * @returns Promise that resolves to the installed Python path, or undefined on failure
  */
-export async function installPythonWithUv(log?: LogOutputChannel, version?: string): Promise<string | undefined> {
+export async function installPythonWithUv(
+    log?: LogOutputChannel,
+    version?: string,
+    options?: UvPythonInstallationOptions,
+): Promise<string | undefined> {
     const uvInstalled = await isUvInstalled(log);
 
     sendTelemetryEvent(EventNames.UV_PYTHON_INSTALL_STARTED, undefined, { uvAlreadyInstalled: uvInstalled });
@@ -531,7 +580,7 @@ export async function installPythonWithUv(log?: LogOutputChannel, version?: stri
             }
 
             // Step 2: Install Python via uv
-            const pythonSuccess = await installPythonViaUv(log, version);
+            const pythonSuccess = await installPythonViaUv(log, version, options);
             if (!pythonSuccess) {
                 sendTelemetryEvent(EventNames.UV_PYTHON_INSTALL_FAILED, undefined, { stage: 'pythonInstall' });
                 showErrorMessage(UvInstallStrings.installFailed);
@@ -539,7 +588,7 @@ export async function installPythonWithUv(log?: LogOutputChannel, version?: stri
             }
 
             // Step 3: Get the installed Python path using uv-managed Python listing
-            const pythonPath = await getUvPythonPath(version);
+            const pythonPath = await getUvPythonPath(version, options?.installDirectory);
             if (!pythonPath) {
                 traceError('Python installed but could not find the path via uv python list');
                 sendTelemetryEvent(EventNames.UV_PYTHON_INSTALL_FAILED, undefined, { stage: 'findPath' });

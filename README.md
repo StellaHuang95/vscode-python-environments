@@ -52,7 +52,7 @@ The following environment managers are supported out of the box:
 | conda               | ✅                | ✅     | ✅           |
 | pyenv               | ✅                |        |              |
 | poetry              | ✅                |        |              |
-| system              | ✅                |        |              |
+| system              | ✅                | ✅     |              |
 | pipenv              | ✅                |        |              |
 
 **Legend:**
@@ -62,6 +62,35 @@ The following environment managers are supported out of the box:
 -   **Find Environments**: Ability to discover and list existing environments.
 
 Environment managers are responsible for specifying which package manager will be used by default to install and manage Python packages within the environment (`venv` uses `pip` by default). This ensures that packages are managed consistently according to the preferred tools and settings of the chosen environment manager.
+
+#### Installing Python
+
+When a base Python needs to be installed on Windows, the extension first checks for an existing
+[Python Install Manager](https://docs.python.org/3/using/windows.html). If it is not detected, the
+existing uv installation flow is used. macOS and Linux continue to use uv. This decision is based on
+the extension host: a Linux WSL, container, or SSH host uses the Linux flow even when VS Code's
+desktop window is on Windows.
+
+The extension does not install, update, or configure Python Install Manager itself. It uses the
+unambiguous `pymanager` application rather than assuming that `py` is the new manager. A detected
+manager that is blocked or fails is reported as such; cancellation and failure do not silently start
+uv instead.
+Canceling an installation also cancels its runtime-list checks. Any runtime already installed is
+kept, and background downloads may still finish.
+
+The **Global** environment manager can install a selected Python version. Missing-base prompts
+during environment creation and PEP 723 script setup use the same installer policy. Existing
+compatible base interpreters are reused. PyManager's installation prompt explicitly covers updating
+an older runtime in the same managed version family, since other environments may use that runtime.
+Newer runtimes are not automatically downgraded to satisfy an exact pin.
+During an approved update, the extension temporarily releases its package watchers for that
+runtime so they do not prevent Windows from replacing the installation. Other running programs
+can still prevent an update; failures are reported without starting uv.
+
+Installer choice does not change `python-envs.alwaysUseUv` or how virtual environments and their
+packages are managed. A Python installed by PyManager can still be used with uv, `venv`, and pip.
+PyManager runtimes appear under **Global**, including when a pre-existing registry registration
+prevents PyManager from adding its own registration.
 
 ### Package Management
 

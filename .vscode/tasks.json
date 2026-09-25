@@ -39,7 +39,7 @@
         {
             "type": "npm",
             "script": "unittest",
-            "dependsOn": ["tasks: watch-tests"],
+            "dependsOn": ["npm: watch-tests"],
             "problemMatcher": "$tsc",
             "presentation": {
                 "reveal": "never",
