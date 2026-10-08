@@ -1,6 +1,7 @@
 import { ChildProcess } from 'child_process';
 import * as fs from 'fs-extra';
 import * as path from 'path';
+import { performance } from 'perf_hooks';
 import { PassThrough } from 'stream';
 import { CancellationTokenSource, Disposable, ExtensionContext, LogOutputChannel, Uri } from 'vscode';
 import * as rpc from 'vscode-jsonrpc/node';
@@ -15,7 +16,7 @@ import { classifyError, isTimeoutErrorType } from '../../common/telemetry/errorC
 import { sendTelemetryEvent } from '../../common/telemetry/sender';
 import { untildify, untildifyArray } from '../../common/utils/pathUtils';
 import { isWindows } from '../../common/utils/platformUtils';
-import { createRunningWorkerPool, WorkerPool } from '../../common/utils/workerPool';
+import { createRunningWorkerPool, QueuePosition, QueueTaskExpiredError, WorkerPool } from '../../common/utils/workerPool';
 import { getConfiguration, getWorkspaceFolders } from '../../common/workspace.apis';
 import {
     getRefreshTelemetryMeasures,
@@ -89,6 +90,103 @@ export class ConfigureRetryState {
     /** Call after a non-timeout error or process restart. Resets the counter. */
     reset(): void {
         this._timeoutCount = 0;
+    }
+}
+
+export const MIN_STAGE_BUDGET_MS = 1_000;
+
+/** Worst-case wall-clock of a *successful* bounded refresh, so the cap never truncates a valid flow. */
+export function computeRefreshOperationBudgetMs(): number {
+    const maxRestartBackoffMs = RESTART_BACKOFF_BASE_MS * Math.pow(2, MAX_RESTART_ATTEMPTS - 1);
+    const firstFailingAttemptMs = MAX_CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS;
+    const additionalFailingAttemptMs = maxRestartBackoffMs + CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS;
+    const failingAttemptsMs =
+        MAX_REFRESH_RETRIES > 0
+            ? firstFailingAttemptMs + (MAX_REFRESH_RETRIES - 1) * additionalFailingAttemptMs
+            : 0;
+    const succeedingAttemptMs = maxRestartBackoffMs + CONFIGURE_TIMEOUT_MS + REFRESH_TIMEOUT_MS + RESOLVE_TIMEOUT_MS;
+    return failingAttemptsMs + succeedingAttemptMs;
+}
+
+export const REFRESH_OPERATION_BUDGET_MS = computeRefreshOperationBudgetMs();
+
+export type MonotonicClock = () => number;
+
+const defaultMonotonicClock: MonotonicClock = () => performance.now();
+
+/** Absolute, monotonic deadline captured at enqueue; stages clamp their timeouts to {@link remainingMs}. */
+export class Deadline {
+    private readonly deadlineAt: number;
+
+    constructor(
+        budgetMs: number,
+        private readonly now: MonotonicClock = defaultMonotonicClock,
+    ) {
+        this.deadlineAt = this.now() + budgetMs;
+    }
+
+    remainingMs(): number {
+        return this.deadlineAt - this.now();
+    }
+
+    isExhausted(floorMs: number = MIN_STAGE_BUDGET_MS): boolean {
+        return this.remainingMs() < floorMs;
+    }
+
+    get expiresAt(): number {
+        return this.deadlineAt;
+    }
+}
+
+/** Rejects a bounded refresh (or one of its stages) once the operation budget is spent. */
+export class RefreshBudgetExceededError extends Error {
+    constructor(
+        public readonly stage: string,
+        remainingMs: number,
+    ) {
+        super(`Refresh operation budget exceeded at stage '${stage}' (remaining ${Math.round(remainingMs)}ms)`);
+        this.name = this.constructor.name;
+    }
+}
+
+export function clampTimeoutToRemaining(
+    baseTimeoutMs: number,
+    deadline: Deadline | undefined,
+    stage: string,
+    floorMs: number = MIN_STAGE_BUDGET_MS,
+): number {
+    if (deadline === undefined) {
+        return baseTimeoutMs;
+    }
+    const remaining = deadline.remainingMs();
+    if (remaining < floorMs) {
+        throw new RefreshBudgetExceededError(stage, remaining);
+    }
+    return Math.min(baseTimeoutMs, remaining);
+}
+
+export function resolveTimeoutForRefresh(deadline: Deadline | undefined): number | undefined {
+    try {
+        return clampTimeoutToRemaining(RESOLVE_TIMEOUT_MS, deadline, 'refresh_resolve');
+    } catch (ex) {
+        if (ex instanceof RefreshBudgetExceededError) {
+            return undefined;
+        }
+        throw ex;
+    }
+}
+
+/** Awaits a refresh-time resolve and retains the raw incomplete record if it rejects, so a timed-out or failed resolve never silently drops a discovered environment. */
+export async function resolveOrRetainEnv(
+    resolve: Promise<NativeEnvInfo>,
+    rawData: NativeEnvInfo,
+    onError: (ex: unknown) => void,
+): Promise<NativeEnvInfo> {
+    try {
+        return await resolve;
+    } catch (ex) {
+        onError(ex);
+        return rawData;
     }
 }
 
@@ -310,6 +408,49 @@ export async function retryRpcTimeout<T>(
     }
 }
 
+/** Chooses how a failed refresh attempt proceeds; returns `'surface'` when a retryable failure hits an exhausted budget so the caller rethrows the original (already-reported) error instead of minting a new terminal one. */
+export function decideRefreshRetryAction(
+    ex: unknown,
+    attempt: number,
+    deadlineExhausted: boolean,
+    serverExhausted: boolean,
+): 'retry' | 'fallback' | 'surface' {
+    const isRetryable =
+        (ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError;
+    if (isRetryable && attempt < MAX_REFRESH_RETRIES) {
+        return deadlineExhausted ? 'surface' : 'retry';
+    }
+    return serverExhausted ? 'fallback' : 'surface';
+}
+
+/** Single owner of terminal refresh-timeout telemetry: emits one {@link EventNames.PET_REFRESH} event only for queue-expiry / running-budget failures that produced no per-attempt telemetry. */
+export function emitTerminalRefreshTimeout(
+    ex: unknown,
+    durationMs: number,
+    petProperties: { petVersion: string; petBuildId: string; petCommitSha: string },
+): void {
+    if (!(ex instanceof QueueTaskExpiredError || ex instanceof RefreshBudgetExceededError)) {
+        return;
+    }
+    const errorType = classifyError(ex);
+    sendTelemetryEvent(
+        EventNames.PET_REFRESH,
+        getRefreshTelemetryMeasures({
+            duration: durationMs,
+            nativeInfo: [],
+            condaKind: NativePythonEnvironmentKind.conda,
+            unresolvedCount: 0,
+            attempt: 0,
+        }),
+        {
+            result: isTimeoutErrorType(errorType) ? 'timeout' : 'error',
+            errorType,
+            ...petProperties,
+        },
+        ex instanceof Error ? ex : undefined,
+    );
+}
+
 /**
  * Wraps a JSON-RPC sendRequest call with a timeout.
  * @param connection The JSON-RPC connection
@@ -342,9 +483,27 @@ async function sendRequestWithTimeout<T>(
     }
 }
 
+export async function backoffThenCheckBudget(
+    waitMs: number,
+    deadline: Deadline | undefined,
+    sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+): Promise<void> {
+    if (waitMs > 0) {
+        await sleep(waitMs);
+    }
+    if (deadline?.isExhausted()) {
+        throw new RefreshBudgetExceededError('restart', deadline.remainingMs());
+    }
+}
+
+interface RefreshWorkItem {
+    options?: NativePythonEnvironmentKind | Uri[];
+    deadline?: Deadline;
+}
+
 class NativePythonFinderImpl implements NativePythonFinder {
     private connection: rpc.MessageConnection;
-    private readonly pool: WorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>;
+    private readonly pool: WorkerPool<RefreshWorkItem, NativeInfo[]>;
     private cache: Map<string, NativeInfo[]> = new Map();
     /**
      * Tracks in-flight hard refreshes by cache key so concurrent callers share a
@@ -374,10 +533,11 @@ class NativePythonFinderImpl implements NativePythonFinder {
         private readonly cacheDirectory?: Uri,
     ) {
         this.connection = this.start();
-        this.pool = createRunningWorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>(
-            async (options) => await this.doRefresh(options),
+        this.pool = createRunningWorkerPool<RefreshWorkItem, NativeInfo[]>(
+            async (work) => await this.doRefresh(work.options, work.deadline),
             1,
             'NativeRefresh-task',
+            defaultMonotonicClock,
         );
     }
 
@@ -441,7 +601,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * with exponential backoff up to MAX_RESTART_ATTEMPTS times.
      * @throws Error if the process cannot be started after all retry attempts
      */
-    private async ensureProcessRunning(): Promise<void> {
+    private async ensureProcessRunning(deadline?: Deadline): Promise<void> {
         // Process is running fine
         if (!this.startFailed && !this.processExited) {
             return;
@@ -462,36 +622,40 @@ class NativePythonFinderImpl implements NativePythonFinder {
         }
 
         // Attempt restart with exponential backoff
-        await this.restart();
+        await this.restart(deadline);
     }
 
     /**
      * Kills the current PET process (if running) and starts a fresh one.
      * Implements exponential backoff between restart attempts.
      */
-    private async restart(): Promise<void> {
+    private async restart(deadline?: Deadline): Promise<void> {
+        if (deadline?.isExhausted()) {
+            throw new RefreshBudgetExceededError('restart', deadline.remainingMs());
+        }
+
         this.isRestarting = true;
         this.restartAttempts++;
         const attempt = this.restartAttempts;
         const triggerReason = this.processExitReason ?? (this.startFailed ? 'start_failed' : 'unknown');
 
         const backoffMs = RESTART_BACKOFF_BASE_MS * Math.pow(2, this.restartAttempts - 1);
+        const waitMs = deadline ? Math.min(backoffMs, Math.max(0, deadline.remainingMs())) : backoffMs;
         this.outputChannel.warn(
             `[pet] Restarting Python Environment Tools (attempt ${this.restartAttempts}/${MAX_RESTART_ATTEMPTS}, ` +
-                `waiting ${backoffMs}ms)`,
+                `waiting ${waitMs}ms)`,
         );
 
         const sw = new StopWatch();
         try {
+            await backoffThenCheckBudget(waitMs, deadline);
+
             // Kill existing process if still running
             this.killProcess();
 
             // Dispose existing connection and streams
             this.startDisposables.forEach((d) => d.dispose());
             this.startDisposables = [];
-
-            // Wait with exponential backoff before restarting
-            await new Promise((resolve) => setTimeout(resolve, backoffMs));
 
             // Reset state flags
             this.processExited = false;
@@ -517,6 +681,11 @@ class NativePythonFinderImpl implements NativePythonFinder {
             // Reset restart attempts on successful start (process didn't immediately fail)
             // We'll reset this only after a successful request completes
         } catch (ex) {
+            if (ex instanceof RefreshBudgetExceededError) {
+                this.restartAttempts--;
+                this.outputChannel.warn(`[pet] Restart aborted before spawn: ${ex.message}`);
+                throw ex;
+            }
             sendTelemetryEvent(
                 EventNames.PET_PROCESS_RESTART,
                 { duration: sw.elapsedTime, attempt },
@@ -596,11 +765,15 @@ class NativePythonFinderImpl implements NativePythonFinder {
             this.outputChannel.debug(`[Finder] Hard refresh for key: ${key}`);
         }
 
+        // One deadline captured at enqueue: the pool expires the queued item and the same deadline clamps every running stage.
+        const deadline = new Deadline(REFRESH_OPERATION_BUDGET_MS);
+        const sw = new StopWatch();
+
         // .finally clears the in-flight slot on both success AND failure paths so
         // a rejected refresh does not poison the cache — the next call after a
         // failure starts a fresh attempt, matching today's behavior.
         const refreshPromise = this.pool
-            .addToQueue(options)
+            .addToQueue({ options, deadline }, QueuePosition.back, deadline.expiresAt)
             .then((result) => {
                 if (!result || !Array.isArray(result)) {
                     this.outputChannel.warn(`[pet] Worker pool returned invalid result type: ${typeof result}`);
@@ -608,6 +781,10 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 }
                 this.cache.set(key, result);
                 return result;
+            })
+            .catch((ex: unknown) => {
+                emitTerminalRefreshTimeout(ex, sw.elapsedTime, this.getPetInfoProperties());
+                throw ex;
             })
             .finally(() => {
                 this.inFlightRefreshes.delete(key);
@@ -843,39 +1020,54 @@ class NativePythonFinderImpl implements NativePythonFinder {
         };
     }
 
-    private async doRefresh(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
+    private async doRefresh(
+        options?: NativePythonEnvironmentKind | Uri[],
+        deadline?: Deadline,
+    ): Promise<NativeInfo[]> {
         let lastError: unknown;
 
         for (let attempt = 0; attempt <= MAX_REFRESH_RETRIES; attempt++) {
             try {
-                return await this.doRefreshAttempt(options, attempt);
+                return await this.doRefreshAttempt(options, attempt, deadline);
             } catch (ex) {
                 lastError = ex;
 
-                // Retry on timeout or connection errors (PET hung or crashed mid-request)
-                const isRetryable =
-                    (ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError;
-                if (isRetryable) {
-                    if (attempt < MAX_REFRESH_RETRIES) {
-                        const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
-                        this.outputChannel.warn(
-                            `[pet] Refresh ${reason} (attempt ${attempt + 1}/${MAX_REFRESH_RETRIES + 1}), restarting and retrying...`,
-                        );
-                        // Kill and restart for retry
-                        this.killProcess();
-                        this.processExited = true;
-                        this.processExitReason =
-                            ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
-                        continue;
-                    }
-                    // Final attempt failed
+                if (ex instanceof RefreshBudgetExceededError) {
+                    this.outputChannel.warn(`[pet] Refresh operation budget exhausted (${ex.message}), aborting`);
+                    throw ex;
+                }
+
+                const action = decideRefreshRetryAction(
+                    ex,
+                    attempt,
+                    deadline?.isExhausted() ?? false,
+                    this.isServerExhausted(),
+                );
+
+                if (action === 'retry') {
+                    const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
+                    this.outputChannel.warn(
+                        `[pet] Refresh ${reason} (attempt ${attempt + 1}/${MAX_REFRESH_RETRIES + 1}), restarting and retrying...`,
+                    );
+                    this.killProcess();
+                    this.processExited = true;
+                    this.processExitReason =
+                        ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
+                    continue;
+                }
+
+                if (
+                    attempt === MAX_REFRESH_RETRIES &&
+                    ((ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError)
+                ) {
                     this.outputChannel.error(`[pet] Refresh failed after ${MAX_REFRESH_RETRIES + 1} attempts`);
                 }
-                // Non-timeout errors or final timeout — check if server is fully exhausted
-                if (this.isServerExhausted()) {
+
+                if (action === 'fallback') {
                     this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh');
-                    return this.refreshViaJsonCli(options);
+                    return this.refreshViaJsonCli(options, deadline);
                 }
+
                 throw ex;
             }
         }
@@ -883,7 +1075,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
         // Should not reach here, but TypeScript needs this
         if (this.isServerExhausted()) {
             this.outputChannel.warn('[pet] Server mode exhausted, falling back to JSON CLI for refresh (final)');
-            return this.refreshViaJsonCli(options);
+            return this.refreshViaJsonCli(options, deadline);
         }
         throw lastError;
     }
@@ -891,8 +1083,9 @@ class NativePythonFinderImpl implements NativePythonFinder {
     private async doRefreshAttempt(
         options: NativePythonEnvironmentKind | Uri[] | undefined,
         attempt: number,
+        deadline?: Deadline,
     ): Promise<NativeInfo[]> {
-        await this.ensureProcessRunning();
+        await this.ensureProcessRunning(deadline);
         const disposables: Disposable[] = [];
         const unresolved: Promise<void>[] = [];
         const nativeInfo: NativeInfo[] = [];
@@ -905,29 +1098,35 @@ class NativePythonFinderImpl implements NativePythonFinder {
             const configuration = await this.buildConfigurationOptions();
             workspaceDirCount = configuration.workspaceDirectories.length;
             searchPathCount = configuration.environmentDirectories.length;
-            await this.configure(configuration);
+            await this.configure(configuration, deadline);
             const refreshOptions = this.getRefreshOptions(options);
             disposables.push(
                 this.connection.onNotification('environment', (data: NativeEnvInfo) => {
                     this.outputChannel.info(`Discovered env: ${data.executable || data.prefix}`);
                     if (data.executable && (!data.version || !data.prefix)) {
                         unresolvedCount++;
+                        const resolveTimeout = resolveTimeoutForRefresh(deadline);
+                        if (resolveTimeout === undefined) {
+                            nativeInfo.push(data);
+                            return;
+                        }
+                        const resolveRequest = sendRequestWithTimeout<NativeEnvInfo>(
+                            this.connection,
+                            'resolve',
+                            { executable: data.executable },
+                            resolveTimeout,
+                        ).then((environment: NativeEnvInfo) => {
+                            this.outputChannel.info(
+                                `Resolved environment during PET refresh: ${environment.executable}`,
+                            );
+                            return environment;
+                        });
                         unresolved.push(
-                            sendRequestWithTimeout<NativeEnvInfo>(
-                                this.connection,
-                                'resolve',
-                                { executable: data.executable },
-                                RESOLVE_TIMEOUT_MS,
-                            )
-                                .then((environment: NativeEnvInfo) => {
-                                    this.outputChannel.info(
-                                        `Resolved environment during PET refresh: ${environment.executable}`,
-                                    );
-                                    nativeInfo.push(environment);
-                                })
-                                .catch((ex) =>
-                                    this.outputChannel.error(`Error in Resolving ${JSON.stringify(data)}`, ex),
-                                ),
+                            resolveOrRetainEnv(resolveRequest, data, (ex) =>
+                                this.outputChannel.error(`Error in Resolving ${JSON.stringify(data)}`, ex),
+                            ).then((env) => {
+                                nativeInfo.push(env);
+                            }),
                         );
                     } else {
                         nativeInfo.push(data);
@@ -943,11 +1142,12 @@ class NativePythonFinderImpl implements NativePythonFinder {
                     }
                 }),
             );
+            const refreshTimeoutMs = clampTimeoutToRemaining(REFRESH_TIMEOUT_MS, deadline, 'refresh');
             await sendRequestWithTimeout<{ duration: number }>(
                 this.connection,
                 'refresh',
                 refreshOptions,
-                REFRESH_TIMEOUT_MS,
+                refreshTimeoutMs,
             );
             await Promise.all(unresolved);
 
@@ -976,6 +1176,11 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 },
             );
         } catch (ex) {
+            // Budget errors bypass stage-timeout telemetry and retry-counter mutation; the RPC was already cancelled.
+            if (ex instanceof RefreshBudgetExceededError) {
+                this.outputChannel.warn(`[pet] Refresh attempt aborted by operation budget: ${ex.message}`);
+                throw ex;
+            }
             const errorType = classifyError(ex);
             sendTelemetryEvent(
                 EventNames.PET_REFRESH,
@@ -1022,7 +1227,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * Configuration request, this must always be invoked before any other request.
      * Must be invoked when ever there are changes to any data related to the configuration details.
      */
-    private async configure(options?: ConfigurationOptions) {
+    private async configure(options?: ConfigurationOptions, deadline?: Deadline) {
         const configuration = options ?? (await this.buildConfigurationOptions());
         const workspaceDirCount = configuration.workspaceDirectories.length;
         const envDirCount = configuration.environmentDirectories.length;
@@ -1037,8 +1242,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
             return;
         }
         this.outputChannel.info('[pet] configure: Sending configuration update:', JSON.stringify(configuration));
-        // Exponential backoff: 30s, 60s on retry. Capped at REFRESH_TIMEOUT_MS.
-        const timeoutMs = this.configureRetry.getTimeoutMs();
+        const timeoutMs = clampTimeoutToRemaining(this.configureRetry.getTimeoutMs(), deadline, 'configure');
         if (this.configureRetry.timeoutCount > 0) {
             this.outputChannel.info(
                 `[pet] configure: Using extended timeout of ${timeoutMs}ms (retry ${this.configureRetry.timeoutCount})`,
@@ -1057,6 +1261,11 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 { result: 'success' },
             );
         } catch (ex) {
+            if (ex instanceof RefreshBudgetExceededError) {
+                this.lastConfiguration = undefined;
+                this.outputChannel.warn(`[pet] Configure aborted by operation budget: ${ex.message}`);
+                throw ex;
+            }
             const errorType = classifyError(ex);
             sendTelemetryEvent(
                 EventNames.PET_CONFIGURE,
@@ -1205,7 +1414,10 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * @param options Optional kind filter or URI search paths (same semantics as refresh()).
      * @returns NativeInfo[] containing managers and environments, same as server mode.
      */
-    private async refreshViaJsonCli(options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
+    private async refreshViaJsonCli(
+        options?: NativePythonEnvironmentKind | Uri[],
+        deadline?: Deadline,
+    ): Promise<NativeInfo[]> {
         const config = await this.buildConfigurationOptions();
         // venvFolders must be included explicitly as search paths when options is Uri[],
         // mirroring getRefreshOptions() server-mode behaviour (searchPaths may override environmentDirectories).
@@ -1215,15 +1427,20 @@ class NativePythonFinderImpl implements NativePythonFinder {
         this.outputChannel.info(`[pet] JSON CLI fallback refresh: ${this.toolPath} ${args.join(' ')}`);
         const stopWatch = new StopWatch();
 
+        const findTimeout = clampTimeoutToRemaining(CLI_FALLBACK_TIMEOUT_MS, deadline, 'cli_find');
+
         let stdout: string;
         try {
-            stdout = await this.runPetCliProcess(args, CLI_FALLBACK_TIMEOUT_MS);
+            stdout = await this.runPetCliProcess(args, findTimeout);
         } catch (ex) {
             sendTelemetryEvent(EventNames.PET_JSON_CLI_FALLBACK, stopWatch.elapsedTime, {
                 operation: 'refresh',
                 result: 'error',
             });
             this.outputChannel.error('[pet] JSON CLI fallback refresh failed:', ex);
+            if (deadline?.isExhausted()) {
+                throw new RefreshBudgetExceededError('cli_find', deadline.remainingMs());
+            }
             throw ex;
         }
 
@@ -1267,11 +1484,34 @@ class NativePythonFinderImpl implements NativePythonFinder {
         // Each resolveViaJsonCli() spawns a new OS process, unlike server mode where all resolve
         // calls share a single long-lived process — so unbounded parallelism would cause CPU/memory
         // pressure. Process in batches of CLI_RESOLVE_CONCURRENCY.
+        const retainRemainingUnresolved = (fromIndex: number): void => {
+            const remaining = toResolve.slice(fromIndex);
+            this.outputChannel.warn(
+                `[pet CLI] Refresh budget exhausted; retaining ${remaining.length} unresolved env(s) without enrichment`,
+            );
+            for (const env of remaining) {
+                nativeInfo.push(env);
+            }
+        };
         for (let i = 0; i < toResolve.length; i += CLI_RESOLVE_CONCURRENCY) {
+            if (deadline?.isExhausted()) {
+                retainRemainingUnresolved(i);
+                break;
+            }
             const batch = toResolve.slice(i, i + CLI_RESOLVE_CONCURRENCY);
+            let resolveTimeout: number;
+            try {
+                resolveTimeout = clampTimeoutToRemaining(CLI_FALLBACK_TIMEOUT_MS, deadline, 'cli_resolve');
+            } catch (ex) {
+                if (ex instanceof RefreshBudgetExceededError) {
+                    retainRemainingUnresolved(i);
+                    break;
+                }
+                throw ex;
+            }
             await Promise.all(
                 batch.map((env) =>
-                    this.resolveViaJsonCli(env.executable!)
+                    this.resolveViaJsonCli(env.executable!, resolveTimeout)
                         .then((resolved) => {
                             this.outputChannel.info(`[pet CLI] Resolved env: ${resolved.executable}`);
                             nativeInfo.push(resolved);
@@ -1302,7 +1542,10 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * @returns The resolved NativeEnvInfo.
      * @throws Error if PET cannot identify the environment or if the output cannot be parsed.
      */
-    private async resolveViaJsonCli(executable: string): Promise<NativeEnvInfo> {
+    private async resolveViaJsonCli(
+        executable: string,
+        timeoutMs: number = CLI_FALLBACK_TIMEOUT_MS,
+    ): Promise<NativeEnvInfo> {
         const args = ['resolve', executable, '--json'];
         if (this.cacheDirectory) {
             args.push('--cache-directory', this.cacheDirectory.fsPath);
@@ -1313,7 +1556,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
 
         let stdout: string;
         try {
-            stdout = await this.runPetCliProcess(args, CLI_FALLBACK_TIMEOUT_MS);
+            stdout = await this.runPetCliProcess(args, timeoutMs);
         } catch (ex) {
             sendTelemetryEvent(EventNames.PET_JSON_CLI_FALLBACK, stopWatch.elapsedTime, {
                 operation: 'resolve',
