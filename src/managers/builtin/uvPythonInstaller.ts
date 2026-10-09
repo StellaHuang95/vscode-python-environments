@@ -51,7 +51,7 @@ export type PromptInstallPythonViaUvResult =
     | { readonly kind: 'declined' }
     | { readonly kind: 'failed' };
 
-function sanitizePromptDetail(value: string | undefined): string | undefined {
+export function sanitizePromptDetail(value: string | undefined): string | undefined {
     const normalized = value?.replace(PROMPT_CONTROL_CHARACTERS, ' ').replace(/\s+/g, ' ').trim();
     if (!normalized) {
         return undefined;
@@ -259,6 +259,29 @@ export async function ensureUvForInlineScriptVersionLookup(
     log?: LogOutputChannel,
 ): Promise<boolean> {
     return (await ensureUvForInlineScriptVersionLookupDetailed(requiresPython, log)) === 'available';
+}
+
+/** Acquire uv for an explicitly requested global version picker, without implying a script requirement. */
+export async function ensureUvForPythonVersionLookup(log?: LogOutputChannel): Promise<EnsureUvForInlineScriptVersionLookupResult> {
+    if (await isUvInstalled(log)) {
+        return 'available';
+    }
+    const selection = await showInformationMessage(
+        UvInstallStrings.installUvForVersionLookup,
+        { modal: true },
+        UvInstallStrings.installUv,
+    );
+    if (selection !== UvInstallStrings.installUv) {
+        return 'declined';
+    }
+    if (!(await installUv(log))) {
+        return 'failed';
+    }
+    if (await isUvInstalled(log)) {
+        return 'available';
+    }
+    showErrorMessage(UvInstallStrings.uvInstallRestartRequired);
+    return 'failed';
 }
 
 /**
