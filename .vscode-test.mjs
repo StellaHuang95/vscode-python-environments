@@ -28,10 +28,61 @@ fs.writeFileSync(
     }) + '\n',
 );
 
+// Each startup-only treatment needs a fresh host. Developer overrides exercise
+// VS Code's real experiment-to-default mapping without contacting TAS.
+const inlineScriptSettingsConfigs = [
+    { label: 'inlineScriptSettingsDefault', experimentalDefault: undefined },
+    { label: 'inlineScriptSettingsControl', experimentalDefault: false },
+    { label: 'inlineScriptSettingsTreatment', experimentalDefault: true },
+].map(({ label, experimentalDefault }) => {
+    const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vsct-is-'));
+    const settingsUserDataDir = path.join(testRoot, 'ud');
+    const settingsUserDir = path.join(settingsUserDataDir, 'User');
+    const settingsWorkspace = path.join(testRoot, 'workspace');
+    fs.mkdirSync(settingsUserDir, { recursive: true });
+    fs.mkdirSync(settingsWorkspace, { recursive: true });
+    fs.writeFileSync(
+        path.join(settingsUserDir, 'settings.json'),
+        JSON.stringify({
+            'python.useEnvironmentsExtension': true,
+            'workbench.enableExperiments': false,
+            ...(
+                experimentalDefault === undefined
+                    ? {}
+                    : {
+                        'experiments.override./pythonenvs/config.python-envs.inlineScripts.enabled': experimentalDefault,
+                    }
+            ),
+        }) + '\n',
+    );
+    process.once('exit', () =>
+        fs.rmSync(testRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }),
+    );
+    return {
+        label,
+        files: 'out/test/smoke/inlineScriptSettings.smoke.test.js',
+        workspaceFolder: settingsWorkspace,
+        mocha: {
+            ...diagnosticMocha,
+            ui: 'tdd',
+            timeout: 30000,
+        },
+        env: {
+            VSC_PYTHON_SMOKE_TEST: '1',
+            VSC_PYTHON_INLINE_SCRIPTS_DEFAULT: String(experimentalDefault ?? false),
+        },
+        launchArgs: [
+            ...diagnosticArgs,
+            `--user-data-dir=${settingsUserDataDir}`,
+            '--disable-workspace-trust',
+        ],
+    };
+});
+
 export default defineConfig([
     {
         label: 'smokeTests',
-        files: 'out/test/smoke/**/*.smoke.test.js',
+        files: 'out/test/smoke/**/!(inlineScriptSettings).smoke.test.js',
         mocha: {
             ...diagnosticMocha,
             ui: 'tdd',
@@ -51,6 +102,7 @@ export default defineConfig([
         // causes our extension to skip activation. Smoke tests only verify
         // our extension works - we don't need the Python extension.
     },
+    ...inlineScriptSettingsConfigs,
     {
         label: 'e2eTests',
         files: 'out/test/e2e/**/*.e2e.test.js',
@@ -113,7 +165,7 @@ export default defineConfig([
     },
     {
         label: 'extensionTests',
-        files: 'out/test/**/*.test.js',
+        files: 'out/test/**/!(inlineScriptSettings.smoke).test.js',
         mocha: {
             ui: 'tdd',
             timeout: 60000,
