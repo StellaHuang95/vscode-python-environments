@@ -19,6 +19,8 @@ The "Environment Managers" fold shows you all of the environment managers that a
 
 The PEP 723 inline-script preview can create and select cached environments from dependency metadata embedded in standalone Python files. The preview is controlled by `python-envs.inlineScripts.enabled`, defaults to `false`, and requires a window reload after the effective value changes.
 
+VS Code can supply a startup experimental default through `/pythonenvs/config.python-envs.inlineScripts.enabled`. Explicit user or workspace values for `python-envs.inlineScripts.enabled` take precedence; the namespaced flag is not a separate user setting.
+
 <img src="https://raw.githubusercontent.com/microsoft/vscode-python-environments/main/images/python-envs-overview.gif" width=734 height=413>
 
 ### Environment Management
