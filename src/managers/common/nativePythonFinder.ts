@@ -11,7 +11,7 @@ import { getExtension } from '../../common/extension.apis';
 import { traceError, traceVerbose, traceWarn } from '../../common/logging';
 import { StopWatch } from '../../common/stopWatch';
 import { EventNames } from '../../common/telemetry/constants';
-import { classifyError, isTimeoutErrorType } from '../../common/telemetry/errorClassifier';
+import { classifyError, isPetConnectionLostError, isTimeoutErrorType } from '../../common/telemetry/errorClassifier';
 import { sendTelemetryEvent } from '../../common/telemetry/sender';
 import { untildify, untildifyArray } from '../../common/utils/pathUtils';
 import { isWindows } from '../../common/utils/platformUtils';
@@ -342,7 +342,10 @@ async function sendRequestWithTimeout<T>(
     }
 }
 
-class NativePythonFinderImpl implements NativePythonFinder {
+/**
+ * @internal Concrete {@link NativePythonFinder}, exported only as a test seam — not public API.
+ */
+export class NativePythonFinderImpl implements NativePythonFinder {
     private connection: rpc.MessageConnection;
     private readonly pool: WorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>;
     private cache: Map<string, NativeInfo[]> = new Map();
@@ -357,6 +360,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
     private startFailed: boolean = false;
     private restartAttempts: number = 0;
     private isRestarting: boolean = false;
+    private disposed: boolean = false;
     private processExitReason: string | undefined = undefined;
     private readonly configureRetry = new ConfigureRetryState();
     /**
@@ -403,15 +407,16 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 });
                 return environment;
             } catch (ex) {
-                // On resolve timeout or connection error (not configure — configure handles its own timeout),
-                // kill the hung process so next request triggers restart
-                if ((ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError) {
-                    const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
+                if (
+                    (ex instanceof RpcTimeoutError && ex.method !== 'configure') ||
+                    this.isRecoverableConnectionLoss(ex)
+                ) {
+                    const reason = ex instanceof RpcTimeoutError ? 'timed out' : 'crashed';
                     this.outputChannel.warn(`[pet] Resolve request ${reason}, killing process for restart`);
                     this.killProcess();
                     this.processExited = true;
                     this.processExitReason =
-                        ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_resolve_timeout';
+                        ex instanceof RpcTimeoutError ? 'rpc_resolve_timeout' : 'rpc_connection_error';
                 }
                 throw ex;
             }
@@ -434,6 +439,10 @@ class NativePythonFinderImpl implements NativePythonFinder {
             }
             throw ex;
         }
+    }
+
+    private isRecoverableConnectionLoss(ex: unknown): boolean {
+        return !this.disposed && !this.isRestarting && isPetConnectionLostError(ex);
     }
 
     /**
@@ -638,6 +647,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
     }
 
     public dispose() {
+        this.disposed = true;
         this.pool.stop();
         this.startDisposables.forEach((d) => d.dispose());
         this.connection.dispose();
@@ -673,24 +683,49 @@ class NativePythonFinderImpl implements NativePythonFinder {
         const readable = new PassThrough();
         const writable = new PassThrough();
 
-        try {
-            this.proc = spawnProcess(this.toolPath, ['server'], { env: process.env, stdio: 'pipe' });
+        // Owned by THIS child, so a dead child closes only its own resources after a later restart().
+        const localDisposables: Disposable[] = [];
+        this.startDisposables = localDisposables;
 
-            if (!this.proc.stdout || !this.proc.stderr || !this.proc.stdin) {
+        let streamsEnded = false;
+        let childStdout: NodeJS.ReadableStream | undefined;
+        const endStreams = () => {
+            if (streamsEnded) {
+                return;
+            }
+            streamsEnded = true;
+            // Unpipe before ending so buffered stdout can't raise a write-after-end on the ended stream.
+            childStdout?.unpipe(readable);
+            writable.unpipe();
+            readable.end();
+            writable.end();
+        };
+
+        try {
+            const proc = spawnProcess(this.toolPath, ['server'], { env: process.env, stdio: 'pipe' });
+            this.proc = proc;
+
+            if (!proc.stdout || !proc.stderr || !proc.stdin) {
                 throw new Error('Failed to create stdio streams for PET process');
             }
 
-            this.proc.stdout.pipe(readable, { end: false });
-            this.proc.stderr.on('data', (data) => this.outputChannel.error(`[pet] ${data.toString()}`));
-            writable.pipe(this.proc.stdin, { end: false });
+            childStdout = proc.stdout;
+            proc.stdout.pipe(readable, { end: false });
+            proc.stderr.on('data', (data) => this.outputChannel.error(`[pet] ${data.toString()}`));
+            writable.pipe(proc.stdin, { end: false });
 
-            // Handle process exit - mark as exited so pending requests fail fast
-            this.proc.on('exit', (code, signal) => {
-                this.processExited = true;
-                // Preserve a more-specific reason (e.g. rpc_*) if one was already recorded before the kill.
-                if (this.processExitReason === undefined) {
-                    this.processExitReason = `process_exit:${code ?? 'null'}:${signal ?? 'none'}`;
+            const handleChildTermination = (reason: string) => {
+                endStreams();
+                if (this.proc === proc) {
+                    this.processExited = true;
+                    if (this.processExitReason === undefined) {
+                        this.processExitReason = reason;
+                    }
                 }
+            };
+
+            proc.on('exit', (code, signal) => {
+                handleChildTermination(`process_exit:${code ?? 'null'}:${signal ?? 'none'}`);
                 if (code !== 0) {
                     this.outputChannel.error(
                         `[pet] Python Environment Tools exited unexpectedly with code ${code}, signal ${signal}`,
@@ -698,17 +733,12 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 }
             });
 
-            // Handle process errors (e.g., ENOENT if executable not found)
-            this.proc.on('error', (err) => {
-                this.processExited = true;
-                if (this.processExitReason === undefined) {
-                    this.processExitReason = 'process_error';
-                }
+            proc.on('error', (err) => {
+                handleChildTermination('process_error');
                 this.outputChannel.error('[pet] Process error:', err);
             });
 
-            const proc = this.proc;
-            this.startDisposables.push({
+            localDisposables.push({
                 dispose: () => {
                     try {
                         if (proc.exitCode === null) {
@@ -742,12 +772,9 @@ class NativePythonFinderImpl implements NativePythonFinder {
             new rpc.StreamMessageReader(readable),
             new rpc.StreamMessageWriter(writable),
         );
-        this.startDisposables.push(
+        localDisposables.push(
             connection,
-            new Disposable(() => {
-                readable.end();
-                writable.end();
-            }),
+            new Disposable(() => endStreams()),
             connection.onError((ex) => {
                 this.outputChannel.error('[pet] Connection Error:', ex);
             }),
@@ -772,7 +799,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
             }),
             connection.onNotification('telemetry', (data) => this.outputChannel.info('[pet] Telemetry: ', data)),
             connection.onClose(() => {
-                this.startDisposables.forEach((d) => d.dispose());
+                localDisposables.forEach((d) => d.dispose());
             }),
         );
 
@@ -852,12 +879,12 @@ class NativePythonFinderImpl implements NativePythonFinder {
             } catch (ex) {
                 lastError = ex;
 
-                // Retry on timeout or connection errors (PET hung or crashed mid-request)
                 const isRetryable =
-                    (ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError;
+                    (ex instanceof RpcTimeoutError && ex.method !== 'configure') ||
+                    this.isRecoverableConnectionLoss(ex);
                 if (isRetryable) {
                     if (attempt < MAX_REFRESH_RETRIES) {
-                        const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
+                        const reason = ex instanceof RpcTimeoutError ? 'timed out' : 'crashed';
                         this.outputChannel.warn(
                             `[pet] Refresh ${reason} (attempt ${attempt + 1}/${MAX_REFRESH_RETRIES + 1}), restarting and retrying...`,
                         );
@@ -865,7 +892,7 @@ class NativePythonFinderImpl implements NativePythonFinder {
                         this.killProcess();
                         this.processExited = true;
                         this.processExitReason =
-                            ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
+                            ex instanceof RpcTimeoutError ? 'rpc_refresh_timeout' : 'rpc_connection_error';
                         continue;
                     }
                     // Final attempt failed
@@ -997,15 +1024,16 @@ class NativePythonFinderImpl implements NativePythonFinder {
                 },
                 ex instanceof Error ? ex : undefined,
             );
-            // On refresh timeout or connection error (not configure — configure handles its own timeout),
-            // kill the hung process so next request triggers restart
-            if ((ex instanceof RpcTimeoutError && ex.method !== 'configure') || ex instanceof rpc.ConnectionError) {
-                const reason = ex instanceof rpc.ConnectionError ? 'crashed' : 'timed out';
+            if (
+                (ex instanceof RpcTimeoutError && ex.method !== 'configure') ||
+                this.isRecoverableConnectionLoss(ex)
+            ) {
+                const reason = ex instanceof RpcTimeoutError ? 'timed out' : 'crashed';
                 this.outputChannel.warn(`[pet] PET process ${reason}, killing for restart`);
                 this.killProcess();
                 this.processExited = true;
                 this.processExitReason =
-                    ex instanceof rpc.ConnectionError ? 'rpc_connection_error' : 'rpc_refresh_timeout';
+                    ex instanceof RpcTimeoutError ? 'rpc_refresh_timeout' : 'rpc_connection_error';
             }
             this.outputChannel.error('[pet] Error refreshing', ex);
             throw ex;
