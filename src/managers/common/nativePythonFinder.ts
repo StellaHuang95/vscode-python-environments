@@ -42,6 +42,7 @@ const MAX_RESTART_ATTEMPTS = 3;
 const RESTART_BACKOFF_BASE_MS = 1_000; // 1 second base, exponential: 1s, 2s, 4s
 const MAX_CONFIGURE_TIMEOUTS_BEFORE_KILL = 2; // Kill on the 2nd consecutive timeout
 const MAX_REFRESH_RETRIES = 1; // Retry refresh once after timeout
+const KILL_PROCESS_GRACE_PERIOD_MS = 500; // Grace after SIGTERM before escalating to SIGKILL
 
 /**
  * Computes the configure timeout with exponential backoff.
@@ -342,6 +343,35 @@ async function sendRequestWithTimeout<T>(
     }
 }
 
+type KillablePetProcess = Pick<ChildProcess, 'kill' | 'exitCode' | 'signalCode'>;
+
+/**
+ * Terminates a PET child process, capturing it before signalling so the delayed SIGKILL only ever
+ * targets that captured child and never a replacement a concurrent restart may install.
+ */
+export function killPetProcessWithGrace(
+    getProc: () => KillablePetProcess | undefined,
+    clearProc: () => void,
+    outputChannel: Pick<LogOutputChannel, 'info' | 'error'>,
+    graceMs: number = KILL_PROCESS_GRACE_PERIOD_MS,
+): void {
+    const proc = getProc();
+    clearProc();
+    if (proc && proc.exitCode === null && proc.signalCode === null) {
+        try {
+            outputChannel.info('[pet] Killing hung/crashed PET process');
+            proc.kill('SIGTERM');
+            setTimeout(() => {
+                if (proc.exitCode === null && proc.signalCode === null) {
+                    proc.kill('SIGKILL');
+                }
+            }, graceMs);
+        } catch (ex) {
+            outputChannel.error('[pet] Error killing process:', ex);
+        }
+    }
+}
+
 class NativePythonFinderImpl implements NativePythonFinder {
     private connection: rpc.MessageConnection;
     private readonly pool: WorkerPool<NativePythonEnvironmentKind | Uri[] | undefined, NativeInfo[]>;
@@ -542,21 +572,13 @@ class NativePythonFinderImpl implements NativePythonFinder {
      * Attempts to kill the PET process. Used during restart and timeout recovery.
      */
     private killProcess(): void {
-        if (this.proc && this.proc.exitCode === null) {
-            try {
-                this.outputChannel.info('[pet] Killing hung/crashed PET process');
-                this.proc.kill('SIGTERM');
-                // Give it a moment to terminate gracefully, then force kill
-                setTimeout(() => {
-                    if (this.proc && this.proc.exitCode === null) {
-                        this.proc.kill('SIGKILL');
-                    }
-                }, 500);
-            } catch (ex) {
-                this.outputChannel.error('[pet] Error killing process:', ex);
-            }
-        }
-        this.proc = undefined;
+        killPetProcessWithGrace(
+            () => this.proc,
+            () => {
+                this.proc = undefined;
+            },
+            this.outputChannel,
+        );
     }
 
     public async refresh(hardRefresh: boolean, options?: NativePythonEnvironmentKind | Uri[]): Promise<NativeInfo[]> {
